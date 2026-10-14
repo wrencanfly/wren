@@ -1,0 +1,29 @@
+[package]
+name = "wren-vcs"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "wren"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+wren-vcs-core = { version = "0.1.0", path = "../wren-core" }
+futures = "0.3.34"
+hex = "0.4.3"
+rayon = "1.12.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha1 = "0.11.0"
+tokio = { version = "1.53.2", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+serde_json = "1.0.154"
+tempfile = "3.27.0"

@@ -1,0 +1,38 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # Includes differential tests against git and the end-to-end suite.
+      - run: cargo test --release
+
+  # Nightly: the differential fuzz suite over many seeds (git is the oracle).
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fuzz with 8 seeds derived from the run number
+        run: |
+          seeds=$(for i in $(seq 1 8); do echo -n "$(( ${{ github.run_number }} * 100 + i )),"; done)
+          WREN_FUZZ_SEEDS=${seeds%,} cargo test --release -p wren-vcs-core --test differential -- --nocapture
