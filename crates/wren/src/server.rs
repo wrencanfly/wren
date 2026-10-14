@@ -13,11 +13,11 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use wren_core::api::*;
 use wren_core::changes::normalize_path;
 use wren_core::wire::{self, ObjectsRequest};
 use wren_core::{ObjectStore, Oid, Repo};
-use serde::Deserialize;
 
 pub struct ServerState {
     pub store: Arc<ObjectStore>,
@@ -545,25 +545,16 @@ async fn blame(
     State(st): St,
     Path(name): Path<String>,
     Query(q): Query<PathQ>,
-) -> ApiResult<Response> {
+) -> ApiResult<Json<BlameResponse>> {
     let r = repo(&st, &name)?;
-    let b = blocking(move || {
+    blocking(move || {
         let rev = r.resolve(q.rev.as_deref().unwrap_or("HEAD"))?;
         let path = q.path.unwrap_or_default();
         r.blame_response(&rev, &path)?
+            .map(Json)
             .ok_or_else(|| not_found(format!("no file {path:?} at {rev}")))
     })
-    .await?;
-    let exact = b.exact;
-    let mut resp = Json(b).into_response();
-    if !exact {
-        // A time-limited diff is not a pure function of the history.
-        resp.headers_mut().insert(
-            header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("no-store"),
-        );
-    }
-    Ok(resp)
+    .await
 }
 
 async fn tree(

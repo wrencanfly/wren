@@ -121,8 +121,9 @@ flowchart LR
   paths it changed relative to its first parent. The commit graph
   (generation numbers and first-parent skip lists) is derived recursively
   from each changeset's parents. The path index is written atomically with
-  each changeset. Blame is derived lazily, one step per change to the file,
-  and persisted only when exact.
+  each changeset. Blame is derived lazily, one line diff per change to the
+  file, from the file's change chain read in one pass over the path index;
+  the result and a checkpoint every 32 changes are persisted.
 - **Want-only protocol.** `POST /v1/objects {"oids": [...]}`. The client never
   describes what it has. It walks down from the root tree and asks only for
   objects it is missing. Every answer is immutable, so any tier can cache it,
@@ -151,7 +152,7 @@ commit-graph with Bloom filters, and `worktree add` on a warm node.
 | "Which merge brought commit X into HEAD?" | 90 ms | 7 ms | 13× |
 | `log --first-parent -- <path>` | 50 ms | 15 ms | 3.3× |
 | `blame`, warm | 86 ms | 14 ms | 6× |
-| `blame`, first time for a file | 86 ms | 622 ms | **slower** |
+| `blame`, first time for a file | 86 ms | 62 ms | 1.4× |
 
 Full results, method and caveats, including the baseline mistakes an earlier
 version made: [docs/benchmarks.md](docs/benchmarks.md).

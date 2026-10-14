@@ -259,6 +259,30 @@ pub fn decode_changes(b: &[u8]) -> Result<Vec<Change>> {
     Ok(out)
 }
 
+/// The record for exactly `path` in encoded changes, without decoding the
+/// others. A changeset has at most one record per path.
+pub fn find_change(b: &[u8], path: &str) -> Result<Option<Change>> {
+    let mut r = Reader { b, i: 0 };
+    let n = r.u32()? as usize;
+    for _ in 0..n {
+        let status = r.take(1)?[0];
+        let len = r.u32()? as usize;
+        let p = r.take(len)?;
+        let vers = r.take(48)?;
+        if p != path.as_bytes() {
+            continue;
+        }
+        let mut one = Vec::with_capacity(4 + 1 + 4 + len + 48);
+        one.extend(1u32.to_le_bytes());
+        one.push(status);
+        one.extend((len as u32).to_le_bytes());
+        one.extend(p);
+        one.extend(vers);
+        return Ok(decode_changes(&one)?.pop());
+    }
+    Ok(None)
+}
+
 pub(crate) struct Reader<'a> {
     pub b: &'a [u8],
     pub i: usize,
@@ -311,7 +335,12 @@ mod tests {
                 }),
             },
         ];
-        assert_eq!(decode_changes(&encode_changes(&cs)).unwrap(), cs);
+        let enc = encode_changes(&cs);
+        assert_eq!(decode_changes(&enc).unwrap(), cs);
+        assert_eq!(find_change(&enc, "a/b").unwrap().as_ref(), Some(&cs[0]));
+        assert_eq!(find_change(&enc, "c").unwrap().as_ref(), Some(&cs[1]));
+        assert_eq!(find_change(&enc, "a").unwrap(), None);
+        assert!(find_change(&enc[..enc.len() - 1], "c").is_err());
     }
 
     #[test]
