@@ -136,8 +136,9 @@ pub struct BlameResponse {
     pub path: String,
     pub lines: Vec<crate::blame::BlameLine>,
     pub commits: BTreeMap<Oid, BlameCommit>,
-    /// False if a line diff hit its time budget: attributions may then
-    /// differ from git's, and the response is not cacheable.
+    /// Always true. Earlier servers bounded each line diff by time and sent
+    /// false (with `Cache-Control: no-store`) when one was cut short; the
+    /// field stays so that their clients keep working.
     pub exact: bool,
 }
 
@@ -217,7 +218,7 @@ impl Repo {
     }
 
     pub fn blame_response(&self, rev: &Oid, path: &str) -> Result<Option<BlameResponse>> {
-        let Some((lines, exact)) = self.blame_exact(rev, path)? else {
+        let Some(lines) = self.blame(rev, path)? else {
             return Ok(None);
         };
         let mut commits = BTreeMap::new();
@@ -236,7 +237,7 @@ impl Repo {
             path: crate::changes::normalize_path(path),
             lines,
             commits,
-            exact,
+            exact: true,
         }))
     }
 }

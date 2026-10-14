@@ -30,13 +30,21 @@ Reproduce with `bench/run.py`.
 | Same, second job on the same node (`git worktree add` from the node's clone) | 248 ms | 100 ms | 2.5× |
 | **Prerequisite for history queries**: local history to query (blobless bare clone) | 5544 ms, 117 MiB | none | n/a |
 | `blame --first-parent builtin/blame.c`, Wren warm | 86 ms | 14 ms | 6× |
-| `blame --first-parent builtin/blame.c`, Wren cold (first blame of this file) | 86 ms | 622 ms | **0.14× (slower)** |
+| `blame --first-parent builtin/blame.c`, Wren cold (first blame of this file)¹ | 86 ms | 62 ms | 1.4× |
 | `log --first-parent -- builtin/blame.c` | 50 ms | 15 ms | 3.3× |
 | `merge-base --all HEAD HEAD~5000` | 35 ms | 35 ms | 1× |
 | "Which merge brought commit X into HEAD?" | 90 ms | 7 ms | 13× |
 
 The benchmark script asserts that the results agree. Path log, merge-base and
 landed are identical to git's.
+
+¹ Re-measured after the cold-blame rework
+([research/04](research/04-cold-blame.md)), on the same machine and data, the
+way `bench/run.py` measures it: the first `wren blame --json` after the server
+starts, on a metadata database without blame rows (median of 3; 60–73 ms). It
+was 622 ms before (480–611 ms in the same re-measurement). In-process, with
+the database and the object files also out of the page cache, it went from
+604 ms to 75 ms.
 
 ## How to read this
 
@@ -67,10 +75,13 @@ landed are identical to git's.
 
 - Wren is clearly faster on `landed` and path log, comparable on
   merge-base, and much faster on warm blame.
-- **Cold blame is slower than git.** The first blame of a file derives and
-  persists every step of that file's first-parent change history (622 ms for
-  `builtin/blame.c`). After that, each further change to the file costs one
-  line diff.
+- **Cold blame is now a little faster than git.** The first blame of a file
+  derives that file's whole first-parent change history: 189 line diffs for
+  `builtin/blame.c`. The change chain comes from one pass over the path
+  index, blob ids come from the change records (no tree reads), blobs are
+  read in parallel, and only the result plus a checkpoint every 32 changes is
+  persisted. It used to take 622 ms. After that, each further change to the
+  file costs one line diff.
 
 ## Costs
 
@@ -117,10 +128,12 @@ Delta frames and packed storage are on the roadmap.
 - **Renames.** Git blame follows whole-file renames
   (`builtin-blame.c` → `builtin/blame.c`) and Wren does not.
 - **Agreement.** On the 884 lines git did not trace through a rename, Wren
-  agrees on **873 (98.8%)**.
-- **Remaining differences.** These come from alignment heuristics in git's
-  xdiff (e.g. the indent heuristic) that the Rust diff library does not
-  reproduce.
+  agrees on **all 884**. It used to agree on 873 (98.8%), with a minimal Myers
+  diff. It now uses git's own choice of diff: Myers followed by hunk sliding
+  with the indent heuristic (imara-diff).
+- **Remaining differences.** The two implementations can still align a hunk
+  differently in rare cases: 185 of the 188 diffs in this file's history are
+  identical to git's, and the other 3 change no line of the final blame.
 
 ## Corrections
 

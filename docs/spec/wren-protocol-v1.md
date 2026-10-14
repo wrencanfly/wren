@@ -209,7 +209,7 @@ exactly one upstream, which is a server or another cache.
   the `tier` field of `/v1/capabilities`; and transport headers such as `Date`
   and `Content-Length`. A cache MUST preserve `Cache-Control` when it contains
   `immutable`. It SHOULD preserve other `Cache-Control` values (for example
-  `no-store` on an inexact blame, [§4.11](#411-blame)). The reference cache
+  `no-store`). The reference cache
   drops them ([Open issues](#13-open-issues), item 21).
 * Errors that originate in the cache itself, rather than being relayed, are
   reported as in [§6.3](#63-errors-at-caches). An upstream failure is `502 Bad Gateway`.
@@ -903,7 +903,7 @@ byte-identical to `git diff` (see [Open issues](#13-open-issues), item 16).
 | `lines[].orig_line` | 1-based line number of this line in the file as of `commit`. |
 | `lines[].content` | The line's text, with all trailing `\n` and `\r` characters removed, decoded as UTF-8 lossily. |
 | `commits` | One entry per distinct attributed commit, keyed by oid (keys sorted ascending): `author` is the author name, `time` is the author time (Unix seconds), and `summary` is the first line of the message. |
-| `exact` | boolean. `true` if every line diff behind this result ran to completion, so the attribution is the minimal-diff answer defined below. `false` if a diff hit the server's time budget: attributions MAY then differ from git's, and the response is not cacheable (see below). |
+| `exact` | boolean. Always `true`. Earlier drafts let a server bound each line diff by time and answer `false` (with `Cache-Control: no-store`) when a diff was cut short. The field is kept so that existing clients keep working; clients SHOULD ignore it. |
 
 Lines are split after each `\n`. A final line without a newline counts as a
 line. An empty file has `"lines": []`.
@@ -912,32 +912,27 @@ line. An empty file has `"lines": []`.
 The commits that changed `path` are exactly those that `log?rev=<rev>&path=<path>`
 returns. Starting from the commit that created the file (or the oldest change
 reachable without the file disappearing), each successive change is compared
-with the previous version using a **minimal** Myers line diff. Unchanged lines
-keep their attribution. Inserted or replaced lines are attributed to the
-changing commit. Consequently:
+with the previous version using git's default line diff: Myers with xdiff's
+cost heuristic, followed by git's hunk sliding with the indent heuristic (the
+reference server uses imara-diff's `Myers` with `postprocess_lines`). Where
+several alignments are equally short, this choice decides which commit a line
+is blamed on. Unchanged lines keep their attribution. Inserted or replaced
+lines are attributed to the changing commit. Consequently:
 
 * A change that arrived through a merge is attributed to the **merge commit**
   (in the example above, line 4 `three` was written on a feature branch, but is
   attributed to the merge `f5a00745`).
 * Renames and copies are **not** followed. A file that was deleted and later
-  re-created starts afresh.
+  re-created starts afresh, and so does a file that replaces a directory or a
+  gitlink. A change of mode or of type (regular file and symlink) is compared
+  like any other change.
 * No whitespace or move detection is performed.
 
-When `exact` is `true`, the result equals
+The result is meant to equal
 `git blame --first-parent --porcelain <rev> -- <path>` in `(commit, orig_line)`
 for every line, provided git does not detect renames (see [§8](#8-conformance)).
-
-**Inexact results.** The reference server bounds each line diff with a 5-second
-budget. A diff that hits the budget may be non-minimal, so the answer is not a
-pure function of the history. When that happens:
-
-* the response has `"exact": false`;
-* the server MUST send `Cache-Control: no-store`, even when the request is
-  pinned. The pinned-query middleware never overrides a `Cache-Control` header
-  that a handler has already set ([§7.2](#72-marking-and-storing)), so such a
-  response is never marked `immutable` and no Wren cache stores it;
-* the server does not persist the result, so a later request MAY return a
-  different (exact) answer.
+The diff is deterministic and has no time budget, so blame is a pure function
+of the history and a pinned blame is as immutable as any other pinned query.
 
 Errors: `404` (`no file "<path>" at <oid>`) if `path` does not exist at `rev`,
 or is a directory or a gitlink. Symlinks are blamed as their target string.
@@ -1241,9 +1236,9 @@ Examples:
   `Cache-Control` header itself, the server MUST add
   `Cache-Control: public, max-age=31536000, immutable`. It MUST NOT add it to
   non-pinned or unsuccessful responses. It MUST NOT override a `Cache-Control`
-  header the handler set: an inexact blame carries `Cache-Control: no-store`
-  even when the request is pinned ([§4.11](#411-blame)), because that answer
-  is not a pure function of the history. `GET /v1/objects/{oid}` with `200` always
+  header the handler set, so a handler whose answer is not a pure function of
+  the history can opt out with `no-store` (no query handler of the reference
+  server needs to). `GET /v1/objects/{oid}` with `200` always
   carries the immutable header ([§3.5](#35-immutability)).
 * **Any cache** (a Wren cache tier, a CDN, or an HTTP client cache) MAY store a
   response marked `immutable` **forever**, and MUST NOT revalidate it.
@@ -1277,8 +1272,8 @@ caching rules above. The reference implementation relies on these properties:
 * derived data is a pure function of immutable inputs;
 * a full 40-hex revision always names that commit and is never looked up as a
   ref ([§5.2](#52-resolving-the-base));
-* the one answer that is not a pure function of the history, an inexact blame,
-  is sent with `no-store` instead of `immutable` ([§4.11](#411-blame)).
+* every computation behind a query answer is deterministic, with no time
+  budget (in particular blame's line diff, [§4.11](#411-blame)).
 
 Answers whose *semantics* changed between drafts of this specification
 (bisect's lower bound, the type of `mode`, blame's new `exact` field) are a
@@ -1330,7 +1325,7 @@ end-to-end test `crates/wren/tests/e2e.rs`.
   every endpoint of §4 with the semantics stated there, §5, the status mapping
   of §6.2 (404 for nonexistent things, 400 for malformed requests, 500 for
   server faults, 401 for authentication failures, ErrorBody for handler errors),
-  and the marking rule of §7.2, including `no-store` for inexact blame. Its query answers
+  and the marking rule of §7.2. Its query answers
   MUST agree with the git oracles of §8.1.
 * **Conforming cache.** It MUST implement the same routes (§2.2), MUST relay
   responses unaltered, MUST NOT serve stored query responses that upstream did
@@ -1473,7 +1468,7 @@ across drafts: resolved items move to §13.1 and their numbers are not reused.
 | 6 | Cache and server gave different status codes and bodies. | `413` for oversized batches on both tiers; a JSON ErrorBody `404` for a missing single object on both; `502` for every upstream failure at a cache (§3.2, §3.3, §6.3). |
 | 7 | Every error that was neither NotFound nor I/O became `400`. | NotFound → `404`, `wren_core::BadRequest` → `400`, everything else → `500` (§6.2). See item 23 for remaining classification questions. |
 | 8 | The cache stored upstream objects without verifying them. | The cache verifies every object on the miss path (`put_raw_verified`) before storing it. A failure is a `502` (§3.4, §6.3). |
-| 9 | An inexact (time-budgeted) blame was still marked `immutable`. | `BlameResponse.exact`. When it is `false`, the server sends `Cache-Control: no-store`, and the pinned middleware never overrides an existing `Cache-Control` (§4.11, §7.2). See item 21 for the cache relay. |
+| 9 | An inexact (time-budgeted) blame was still marked `immutable`. | First fixed with `BlameResponse.exact` and `Cache-Control: no-store` on inexact answers. Then superseded: blame's line diff is now deterministic with no time budget, so every blame is a pure function of the history and `exact` is always `true` (§4.11). The pinned middleware still never overrides an existing `Cache-Control` (§7.2). |
 | 11 | `encode_frame` silently truncated lengths of 4 GiB or more. | `encode_frame` returns an error instead. The request fails (§3.2). See item 24. |
 | 12 | `mode` was a decimal integer in changes but an octal string in tree listings. | Both are six-digit octal strings such as `"100644"` (§4.0.5). |
 | 14 | Bisect assumed `landed(good, bad)` was good, which is wrong when `good` is off the first-parent chain. | The lower bound is the newest commit on `bad`'s first-parent chain that is an ancestor of `good` (`newest_chain_ancestor`). `good` need not be an ancestor of `bad`. The error cases are `400` (§4.9). |
@@ -1530,7 +1525,7 @@ New in this draft:
 
 * ~~**#21. The cache drops `Cache-Control: no-store` when relaying.**~~ **Resolved:** the reference cache now relays the upstream `Cache-Control` value unchanged. The reference
   cache's query proxy relays `Cache-Control` only if it contains `immutable`.
-  The `no-store` that the server puts on an inexact blame (§4.11) is therefore
+  The `no-store` that the server then put on an inexact blame (no longer sent, §4.11) was therefore
   removed. The Wren cache itself still never stores that response, because it is
   not immutable. But HTTP caches or CDNs below a Wren cache no longer see the
   instruction, and could cache the response heuristically. §2.2 says a cache
@@ -1558,7 +1553,9 @@ New in this draft:
   `(good, bad)`. This is by design, since it keeps the endpoint pinned and
   cacheable, but it is worth stating.
 * **#26. Pinned answers changed between drafts.** **Decided:** v1 is a draft and not frozen until the first tagged release (see the header). No deployment predates these changes. Fixes #12 (`mode` type), #9
-  (new `exact` field), and #14 (bisect lower bound) changed the bodies of
+  (new `exact` field), #14 (bisect lower bound), and the switch of blame's line
+  diff from a minimal Myers diff to git's default diff (§4.11, which moves some
+  lines' attribution) changed the bodies of
   already-answerable pinned queries (`commits?changes=true`, `log?changes=true`,
   `diff`, `blame`, `bisect`). Per §1.4 and §7.3, that is a breaking change within
   `/api/v1`. It is acceptable only if no v1 deployment or client predates it.

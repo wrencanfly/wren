@@ -62,7 +62,7 @@ Wren 是 **git 的服务端源码控制查询层**。它部署在任意 git 托�
 | Changeset | `wren-core/src/changes.rs` | 相对第一父的变更；tree diff 的成本与变更大小成正比 |
 | Derived data | `wren-core/src/derived.rs` | 按父提交递归推导的通用框架 |
 | 提交图 | `wren-core/src/graph.rs` | generation 加 skip list：ancestry、merge-base、landed、bisect |
-| Blame | `wren-core/src/blame.rs` | 惰性、增量、只持久化精确结果 |
+| Blame | `wren-core/src/blame.rs` | 惰性、增量；只持久化查询结果和检查点 |
 | 对象协议 | `wren-core/src/wire.rs` | want-only 帧格式 |
 | Sparse | `wren-core/src/sparse.rs` | 与 git cone mode 语义一致 |
 | Index | `wren-core/src/index.rs` | 直接写 git index（v2/v3，skip-worktree 位，sparse 目录条目 + `sdir` 扩展） |
@@ -106,7 +106,7 @@ pub trait Derivable {
 |---|---|---|---|
 | `GraphNode` | `Derivable`：值由父提交的值递归推出 | ingest 时提前算，丢失可重算 | generation、first-parent 深度、parents、skip list（`skip[k]` 是往回 2^k 步的第一父祖先） |
 | `path_index` | ingest 时直接写的索引，和 changeset 同一事务 | ingest 时 | 每个变更路径及其所有父目录 → (generation, commit) |
-| `blame` | 同样是递归思想，但按 (commit, path) 存，沿**该文件的变更链**往回递推，而不是沿父提交 | 查询时再算 | 每行的来源（commit、原行号） |
+| `blame` | 同样是递归思想，但按 (path, commit) 存，沿**该文件的变更链**往回递推，而不是沿父提交；只存查询结果和检查点 | 查询时再算 | 每行的来源（commit、原行号） |
 
 blame 之所以不套 `Derivable`：那样就得为每个 changeset 都推导"所有文件的 blame"，属于过度工程（审阅报告 02 的结论）。
 
@@ -117,7 +117,7 @@ blame 之所以不套 `Derivable`：那样就得为每个 changeset 都推导"�
 - **landed(c, main)**：在 main 的第一父链上用 skip list 做二分（binary lifting），O(log n) 次 ancestry 判断就能找到"第一个包含 c 的 main 提交"。原文的反面例子是"线性扫 commit log 来查合入时间"，这里正是为了避免它。
 - **bisect_step(good, bad)**：在 bad 的第一父链上，以 `landed(good, bad)` 为下界，用 `depth` 直接算出中点。每一步 O(log n)，不扫 log，也不需要 checkout。
 - **log -- path**：用 `path_index` 只访问改过该路径的提交，(generation, oid) keyset 分页，再按"是否在第一父链上"过滤。
-- **blame**：沿该路径的变更链往回找，直到遇到一个已持久化的结果；然后往前逐个做行 diff。行 diff 用最小 Myers（与 git 同一类算法）。如果一次 diff 触及时间预算（5 秒），它的结果以及之后推导出的结果都**不持久化**，因为持久化的值必须是纯函数。
+- **blame**：一次扫 `path_index`，取出该文件在第一父链上的整条变更链，直到遇到一个已持久化的结果（或文件被创建的那次变更）。第一父链只会收缩，所以一批候选可以并行判定。每一步的新旧 blob 直接取自 changeset 的 change 记录，不读树；blob 按批并行读取解压，上一步的新内容就是下一步的旧内容。然后往前逐个做行 diff。行 diff 用 git 的默认算法：Myers（带 xdiff 的代价启发式）加 indent heuristic 的 hunk 滑动（imara-diff），确定性、无时间预算，结果是纯函数。只持久化本次结果和每 32 步一个检查点（同一个事务）；查更老的版本时，从最近的检查点往前推，最多 31 步。存储键是 (path, commit)，一次范围扫描就能找到该文件所有已持久化的结果。
 
 ## 4. 对象协议
 
@@ -206,7 +206,7 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 
 - 每个仓库只有一个权威 server（§1）。
 - 只支持 SHA-1；非 UTF-8 路径在 API 层是有损的；修订语法不支持 `A..B`。
-- 不跟踪重命名（blame 和 log 与 `git --no-renames` 语义一致）。git.git 上，去掉重命名的影响后，blame 与 git 的一致率约为 99%，剩余差异来自 xdiff 的 indent heuristic 等对齐启发式。
+- 不跟踪重命名（blame 和 log 与 `git --no-renames` 语义一致）。git.git 的 `builtin/blame.c` 上，去掉重命名的影响后，blame 与 git 逐行一致（884/884）；行 diff 与 git 一样用 Myers 加 indent heuristic，但不保证每个文件上都与 xdiff 逐行相同。
 - 节点存储和缓存目录目前**只增不减**。要回收空间，必须先确认没有 checkout 还在通过 alternates 引用这些对象，所以这需要单独设计，见路线图。
 - git 在 checkout 里触发的懒拉取直接去源站，绕过了 Wren 的缓存层。正常的 status、commit、push 流程不会触发懒拉取。
 - 缓存层还没有请求合并（singleflight），同一个对象的并发未命中会各自回源。
@@ -218,7 +218,7 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 | 来源 | 问题 | 状态 |
 |---|---|---|
 | 02 M1 | changeset 与路径索引分两个事务写，崩溃后索引永久缺失 | ✅ 已改成同一事务 |
-| 02 S2 | blame 的时间预算破坏"纯函数"不变量 | ✅ 触及预算的结果不再持久化 |
+| 02 S2 | blame 的时间预算破坏"纯函数"不变量 | ✅ 行 diff 改为确定性、无时间预算（imara-diff），不再有不精确结果 |
 | 03 M1–M3 | benchmark 的 git 对照组配置有误（filter 没生效、没有 commit-graph、热节点场景是重新 clone） | ✅ 脚本已修复（filter 静默失效会直接报错），重跑后的数据见 benchmarks.md |
 | 01 M1、02 S4 | `--git` 模式会拉全部 tree，与"只为读到的东西付费"矛盾 | ✅ 改用 sparse index，只拉边界 tree；`--full-index` 保留旧行为 |
 | 01 M2 | server 上有完整 mirror 加 loose 存储，两份副本 | ✅ mirror 只留 refs；server 存储里仍有一份完整对象集，已如实记入 §1 |
@@ -251,7 +251,6 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 | 方向 | 内容 |
 |---|---|
 | 上游 | 发出 sparse/promisor 报告；写一份 git protocol v2 扩展提案：`query` 命令族、want-only 拉取的 `missing-ok`、用 promisor-remote 宣告缓存层。目标是让原生 git 客户端能直接用这些 RPC |
-| 冷 blame | 一次推导整条链、单事务持久化、改用 imara-diff（[research/04](research/04-cold-blame.md)） |
 | 代价 | delta 帧（增量拉取）；pack 化存储；按仓库授权；空间回收（引用计数加 LRU） |
 | 合入后测试 | 基于 `landed` 和 `bisect` 的 `culprit` 工作流 |
 | 扩展 | 只在有真实部署方需要时再做：S3/GCS 对象后端、Postgres 元数据、多个 server、缓存层 singleflight |

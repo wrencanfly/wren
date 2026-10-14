@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS kv(
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Superseded derived-data formats; nothing reads them any more.
+DELETE FROM derived WHERE kind = 'blame';
 "#;
 
 pub struct MetaDb {
@@ -159,6 +161,17 @@ impl MetaDb {
                     })
                 })
                 .optional()?)
+        })
+    }
+
+    /// Just the encoded change records of a changeset (see `changes::encode_changes`).
+    pub fn changeset_changes(&self, oid: &Oid) -> Result<Option<Vec<u8>>> {
+        self.with(|c| {
+            Ok(
+                c.prepare_cached("SELECT changes FROM changesets WHERE oid = ?1")?
+                    .query_row([oid.as_bytes()], |r| r.get(0))
+                    .optional()?,
+            )
         })
     }
 
@@ -318,6 +331,34 @@ impl MetaDb {
                     .query_row(params![kind, key], |r| r.get(0))
                     .optional()?,
             )
+        })
+    }
+
+    /// Keys of every `kind` value whose key starts with `prefix` (values are
+    /// not read).
+    pub fn derived_keys_with_prefix(&self, kind: &str, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        // Keys are compared as blobs (memcmp), so the keys with this prefix
+        // are those in [prefix, prefix + 0xff 0xff ...). Bound the range by
+        // the smallest blob greater than every such key, if there is one.
+        let mut hi = prefix.to_vec();
+        while hi.last() == Some(&0xff) {
+            hi.pop();
+        }
+        self.with(|c| {
+            let keys = if let Some(last) = hi.last_mut() {
+                *last += 1;
+                let mut st = c.prepare_cached(
+                    "SELECT key FROM derived WHERE kind = ?1 AND key >= ?2 AND key < ?3",
+                )?;
+                let rows = st.query_map(params![kind, prefix, hi], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<Vec<u8>>>>()?
+            } else {
+                let mut st =
+                    c.prepare_cached("SELECT key FROM derived WHERE kind = ?1 AND key >= ?2")?;
+                let rows = st.query_map(params![kind, prefix], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<Vec<u8>>>>()?
+            };
+            Ok(keys.into_iter().filter(|k| k.starts_with(prefix)).collect())
         })
     }
 

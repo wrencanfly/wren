@@ -165,8 +165,10 @@ flowchart LR
   relative to its first parent. The path index is written in the same
   transaction.
 - **Derived data.** The commit graph (generation numbers and first-parent
-  skip lists) is derived recursively from parents. Blame is derived lazily,
-  one step per change to the file, and persisted.
+  skip lists) is derived recursively from parents. Blame is derived lazily:
+  the file's change chain is read in one pass over the path index, each
+  change costs one line diff, and the result plus a checkpoint every 32
+  changes are persisted.
 - **Immutable answers.** Objects are content-addressed. A query whose
   revisions are all full commit ids can never change its answer, so it is
   marked `immutable`. Caches keep it, keyed by a query-semantics version
@@ -197,7 +199,7 @@ node.
 | "Which merge brought commit X into HEAD?" | 90 ms | 7 ms | 13× |
 | `log --first-parent -- <path>` | 50 ms | 15 ms | 3.3× |
 | `blame`, warm | 86 ms | 14 ms | 6× |
-| `blame`, first time for a file | 86 ms | 622 ms | **slower** |
+| `blame`, first time for a file | 86 ms | 62 ms | 1.4× |
 
 **Costs.** Wren's object store for git/git is 4.7 GB of loose objects, about
 15× the size of a git pack. An incremental update from `HEAD~15` sends 570 KB
@@ -211,8 +213,6 @@ caveats are in [docs/benchmarks.md](docs/benchmarks.md).
   a `query` command, more `object-info` attributes, and `missing-ok` for
   fetches. Add a `git-upload-pack` v2 front end so that stock git clients can
   use these RPCs.
-- **Cheaper cold blame.** Derive the whole chain in one pass and diff with
-  imara-diff ([research](docs/research/04-cold-blame.md)).
 - **Costs.** Delta frames for incremental fetches, packed storage, and
   per-repository authorization.
 - **Post-merge testing.** Build a `culprit` workflow on `landed` and `bisect`.
