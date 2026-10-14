@@ -437,6 +437,63 @@ fn check_everything(up: &Path, repo: &Repo, rng: &mut Rng) {
         }
     }
 
+    // Grep (patterns that mean the same in POSIX ERE and Rust regex), over
+    // the whole tree and under a directory, at main and an older commit.
+    for rev in [main, older] {
+        let files: Vec<String> = git(up, &["ls-tree", "-r", "--name-only", &rev.to_hex()])
+            .lines()
+            .map(String::from)
+            .collect();
+        let dir = files
+            .get(rng.below(files.len().max(1)))
+            .and_then(|f| f.split('/').next())
+            .unwrap_or("")
+            .to_string();
+        for (pattern, ignore_case) in [
+            ("line-1[0-9]* ", false),
+            ("^line-[0-9]*7 ", false),
+            ("[0-9a-f]{3}E$", true),
+            ("no such text", false),
+        ] {
+            for path in ["", dir.as_str()] {
+                let mut args = vec!["grep", "-n", "-E"];
+                if ignore_case {
+                    args.push("-i");
+                }
+                let hex = rev.to_hex();
+                args.extend([pattern, hex.as_str()]);
+                if !path.is_empty() {
+                    args.extend(["--", path]);
+                }
+                let out = Command::new("git")
+                    .current_dir(up)
+                    .args(&args)
+                    .output()
+                    .unwrap();
+                let expect: Vec<(String, usize)> = String::from_utf8(out.stdout)
+                    .unwrap()
+                    .lines()
+                    .map(|l| {
+                        let l = l.strip_prefix(&format!("{hex}:")).unwrap();
+                        let mut it = l.splitn(3, ':');
+                        let p = it.next().unwrap().to_string();
+                        (p, it.next().unwrap().parse().unwrap())
+                    })
+                    .collect();
+                let ours = repo
+                    .grep(&rev, pattern, path, ignore_case, 100_000)
+                    .unwrap();
+                let got: Vec<(String, usize)> =
+                    ours.matches.into_iter().map(|m| (m.path, m.line)).collect();
+                assert_eq!(got, expect, "grep {pattern:?} -- {path:?} @ {rev}");
+                // The limit keeps a prefix of the same answer.
+                let cut = repo.grep(&rev, pattern, path, ignore_case, 3).unwrap();
+                assert_eq!(cut.truncated, expect.len() > 3);
+                assert_eq!(cut.matches.len(), expect.len().min(3));
+            }
+        }
+    }
+
     // Diffs between random pairs.
     for _ in 0..40 {
         let a = all[rng.below(all.len())];
