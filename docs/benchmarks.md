@@ -23,6 +23,8 @@ Reproduce with `bench/run.py`.
 
 ## Results
 
+Re-run after M3a (packed segments, 2026-10-14): every figure below stayed within run-to-run noise or improved (cold blame 29 ms, warm 10 ms; full checkout 533 ms; sparse 262 / 108 ms).
+
 | Scenario | git (best setup) | Wren | Ratio |
 |---|---:|---:|---:|
 | Full checkout at HEAD, cold node (`clone --depth=1`) | 1466 ms | 650 ms | 2.3× |
@@ -90,13 +92,16 @@ git/git.
 
 | | git | Wren | |
 |---|---:|---:|---:|
-| Object storage | about 313 MiB (one pack) | 4.7 GB (421k loose objects) | about 15× |
+| Object storage | about 313 MiB (one pack) | 331 MiB on disk (one segment: the fetched pack, its index and reverse index) | about 1.06× |
 | Bytes sent, full checkout at HEAD | 13.4 MB | 16.7 MB | 1.25× |
 | Bytes sent, sparse checkout of `Documentation` | 4.6 MB | 5.4 MB | 1.16× |
 | Bytes sent, warm node updating `HEAD~15` → `HEAD` | 14 KB (thin pack) | 570 KB | about 41× |
 | Bytes sent, warm node updating `HEAD~50` → `HEAD` | 1.35 MB | 4.61 MB | 3.4× |
 
-**Why the gap.** Wren stores and sends every object whole, compressed on its
+Storage was 4.7 GB (421k loose objects, about 15×) until M3a, which keeps
+fetched packs whole as immutable segments instead of exploding them.
+
+**Why the gap on the wire.** Wren sends every object whole, compressed on its
 own. Git packs delta-compress objects against each other, and a thin pack
 sends a changed file as a delta against the version the client already has.
 Adding HTTP gzip on top of Wren's frames saves under 1%.
@@ -118,10 +123,10 @@ Delta frames and packed storage are on the roadmap.
 
 | | |
 |---|---|
-| Initial sync (all objects + 85,545 changesets + commit graph + path index) | 173 s |
-| Objects imported | 421,115 |
-| Server-side git mirror after sync | 5.3 MiB (refs only; fetched packs are absorbed into the object store and deleted) |
-| Object store after sync | 4.7 GB on disk (see [Costs](#costs)) |
+| Initial sync (all objects + 85,545 changesets + commit graph + path index) | about 55 s since M3a (fetched pack kept whole); 173–217 s before, when it was exploded into loose objects |
+| Objects imported | 421,115, in one segment |
+| Server-side git mirror after sync | 4.3 MiB (refs only; fetched packs move into the object store as segments) |
+| Object store after sync | 331 MiB on disk (see [Costs](#costs)) |
 
 ## Blame agreement with git
 

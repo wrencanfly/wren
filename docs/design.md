@@ -24,7 +24,7 @@ Wren 是独立项目，与 Anthropic 无关，也没有得到其背书。
 
 - 每个仓库只有**一个权威 server**：元数据是本地 SQLite，同步锁是进程内锁。多个 server 不能共享同一个仓库。
 - 能横向扩展的是对象读取，以及"固定到完整 commit id 的查询"，后者可以被缓存层永久缓存（§6）。其余查询都由权威 server 计算。
-- 权威 server 的对象存储里有一份完整的对象集，并且是 loose 格式：git/git 占 4.7 GB，打成 pack 约 313 MiB，相差约 15 倍（见 benchmarks.md 的 Costs 一节）。
+- 权威 server 的对象存储里有一份完整的对象集。M3a 起以 git pack 格式的不可变段保存：git/git 占 331 MiB，与 git pack 相当（此前是 loose，4.7 GB）。
 - **单一信任域**：token 不区分仓库，对象存储跨仓库共享，force-push 掉的对象仍然可读。每个信任域部署一套 Wren。
 
 **非目标与方向调整**
@@ -39,7 +39,7 @@ Wren 是独立项目，与 Anthropic 无关，也没有得到其背书。
         │  git fetch（只拉 heads/tags）
         ▼
   ┌──────────────────── wren server（每个仓库一个）───────────────────┐
-  │ mirror.git: 只有 refs ──alternates──▶ ObjectStore（loose，无 pack）│  /api/v1/...  查询 API
+  │ mirror.git: 只有 refs ──alternates──▶ ObjectStore（pack 段 + loose）│  /api/v1/...  查询 API
   │   fetch 来的 pack ─absorb─▶ 拆成单个对象 ─▶ 删除 pack              │  /v1/objects  对象协议
   │ MetaDb (SQLite): changesets | refs | path_index | derived | kv     │  /v1/capabilities
   └──────────────────────────────▲─────────────────────────────────────┘
@@ -85,10 +85,10 @@ git 接受一些它自己不会写的对象（如 `100664` 这类旧 mode、头�
 
 mirror 是一个 bare 仓库，通过 `objects/info/alternates` 借用 Wren 的对象存储。每次 fetch 之后：
 
-1. 把 mirror 自己持有的对象（新 pack 和零散的 loose 对象）逐个写入 Wren 存储；
-2. 删除这些 pack 和对象。
+1. 新 pack（连同 `.idx`、`.rev`）整体移进 Wren 存储的 `pack/`，成为一个不可变的段，`.idx` 最后移动，没有 `.idx` 的段不可见；
+2. 零散的 loose 对象逐个写入 Wren 存储后删除。
 
-mirror 因此只剩 refs。git.git 上实测从 326 MB 降到 5.3 MB。
+mirror 因此只剩 refs（git.git 实测 4.3 MiB）。段永不 repack，也不 gc；Wren 用进程内的 pack 读取器（`pack.rs`：idx 二分查找、delta 链还原、按字节上限的基对象缓存）读取，git mirror 通过 alternates 原生读取同一批段。客户端和缓存层仍收发、保存 loose 编码，服务端对段里的对象按需重新编码。
 
 mirror 的增量 fetch 要用 git 自己的 commit 和 tree 做协商，所以在迁移设计 M5（Wren 成为数据源）之前，这些对象仍然导入对象存储。派生出的 tree 与它们逐字节相同，写入时直接跳过。
 

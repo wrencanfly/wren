@@ -1,6 +1,6 @@
 # 设计：Wren 向 Scion 架构迁移
 
-> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14**，其余待做。
+> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14**，其余待做。
 > 范围：用户选择"全面 Scion 化"，即下文 M1–M7 全部纳入路线图。
 > 这推翻了 v0.1 的定位（只读、git 主机是数据源、"不做服务端写入"），也推翻了
 > [reviews/04](reviews/04-positioning-vs-intent.md) 和 [reviews/08](reviews/08-synthesis.md)
@@ -235,24 +235,56 @@ commit 对象；它的哈希必须等于 `changesets.oid`。commit 对象不持�
 
 ## 4. M3：存储可扩展
 
-### 4.1 `BlobStore` 接口
+### 4.0 修订（2026-10-14，实现前）
 
-`get / get_many / has / put / put_many`，后端有三种：
+原设计的段格式是"对象逐个 zstd"。动手前测了 git/git 的对象构成：
 
-- **loose**：现有实现，留给测试和小部署。
-- **segments**：只追加的段文件（每个约 1 GiB），对象逐个用 zstd 压缩；索引是
-  `oid → (段, 偏移, 长度)`。段一旦写满就不再修改，**不需要 repack，也没有 gc**。
-  这符合【原文】"没有 packfile，没有仓库维护"：没有的是 git 那种需要协商和维护的
-  pack，而不是"不许把对象放进同一个文件"。
-- **object storage**：段文件放在 S3 或 GCS 上（用 `object_store` crate），超过
-  阈值的大 blob 单独存。对应【图1】"Cloud Storage：不可变、压缩、按 hash 去重"。
+| 类型 | 解压后 | 在 git pack 里 |
+|---|---:|---:|
+| tree | 5,644 MiB | 123 MiB |
+| blob | 8,102 MiB | 374 MiB |
+| commit | 144 MiB | 80 MiB |
 
-### 4.2 按路径 delta
+（上游含 PR 引用，数量比 Wren 镜像的多，但比例相同。）大头是 tree：每个提交都重写
+根目录和沿途目录，单独压缩时其中的 SHA 几乎压不动，只有对同一目录的上一版本做 delta
+才行。所以逐个压缩达不到门槛。
 
-changeset 已经告诉我们：同一路径的新 blob 对应哪个旧 blob。所以可以把新 blob 存成
-相对旧 blob 的 delta，类似 Mercurial revlog；每 K 个 delta 存一次全量快照，限制
-链长。这个关系也可以直接用在线路上，作为"delta 帧"，解决增量获取比 git thin pack
-大约 41 倍的问题。
+**改为：段 = git pack 格式（`.pack` + `.idx` v2），只追加、写一次、永不 repack。**
+
+- **git mirror 能读**：它通过 alternates 原生读取 `objects/pack/`，fetch 协商和推送
+  不受影响。这避开了 M1 时遇到的同一个约束（mirror 需要看到 commit 和 tree）。
+- **零拷贝吸收**：fetch 来的 pack 已带 git 算好的 delta，整体改名移入即可。
+- **仍符合【原文】"没有 packfile、没有维护"**：原文反对的是按客户端生成 pack、
+  have/want 协商和 repack/gc；这里没有按客户端生成的 pack，段也永不 repack。
+- **按路径 delta（原 4.2）**：git 的 delta 已经覆盖存储侧的需求；线路上的 delta 帧
+  （M3b）由客户端在请求里带上"我已有的同路径旧版本"，服务端据此回 delta，回答仍按
+  `(oid, base)` 不可变、可缓存。
+
+M3 拆成四步：
+
+| 步骤 | 内容 | 状态 |
+|---|---|---|
+| M3a | pack 段存储、进程内 pack 读取器（idx 二分、delta 链、基对象缓存）、整包吸收 | ✅ 2026-10-14 |
+| M3b | 线路 delta 帧：增量获取 ≤ thin pack 的 3 倍 | 待做 |
+| M3c | `MetaStore` 接口与 Postgres；多台无状态 server | 待做 |
+| M3d | 段放到 S3/GCS（段不可变，适合按范围读取），本地磁盘缓存 | 待做 |
+
+**M3a 实测（git/git，85,545 个提交）：**
+
+| | M2（loose） | M3a（段） |
+|---|---:|---:|
+| 对象库 | 4.7 GB，42 万个文件 | **331 MiB**，1 个段（约 1.06 倍 git pack） |
+| 首次摄入 | 约 217 s | **约 55 s** |
+| tree override | 98 | 98 |
+| 冷 / 热 blame | 62 / 14 ms | 29 / 10 ms |
+| 检出与其他查询 | — | 无退步 |
+
+实现中发现并修复的 bug：基对象缓存曾以"pack 在列表中的位置"为键，新段加入后列表
+重排，同一个键指向另一个 pack，读出错误对象。端到端测试（多次 fetch 产生很多小段）
+抓到了它；现在键是每个打开的 pack 的唯一 id。
+
+服务端自己创建的对象（M2 写入）仍以 loose 形式写入，git 可读；把它们定期封成段
+（类似 memtable → segment）留到 M3c 一起做。
 
 ### 4.3 `MetaStore` 接口
 
@@ -268,7 +300,7 @@ changeset 已经告诉我们：同一路径的新 blob 对应哪个旧 blob。�
 
 ### 4.4 门槛
 
-- git/git 的存储量不超过 git pack 的 2 倍（现在约 15 倍）。
+- ✅ git/git 的存储量不超过 git pack 的 2 倍（M3a 后约 1.06 倍，此前约 15 倍）。
 - `HEAD~15` 的增量获取不超过 thin pack 的 3 倍（现在约 41 倍）。
 - 3 台 server 共用 Postgres 时，端到端测试全部通过。
 

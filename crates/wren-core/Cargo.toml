@@ -11,6 +11,7 @@ anyhow = "1.0.104"
 flate2 = "1.1.10"
 hex = "0.4.3"
 imara-diff = { version = "0.2.0", default-features = false }
+memmap2 = "0.9.5"
 rayon = "1.12.0"
 regex = "1.11"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

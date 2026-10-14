@@ -14,6 +14,7 @@ pub mod index;
 pub mod meta;
 pub mod object;
 pub mod oid;
+pub mod pack;
 pub mod repo;
 pub mod sparse;
 pub mod store;

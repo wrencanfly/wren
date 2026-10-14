@@ -121,16 +121,14 @@ impl Repo {
         }
         let mut report = SyncReport::default();
 
-        // Move whatever the fetch brought into the object store (one pass over
-        // the new pack, then the pack is deleted). Fetched objects arrive in
-        // arbitrary order, so the store's "tree present => subtree present"
-        // invariant only holds once this completes; that is why it always runs
-        // before any commit is ingested, and an interrupted absorb is redone.
+        // Move whatever the fetch brought into the object store: its pack
+        // becomes a segment as is. A pack holds everything the fetch
+        // brought, so "tree present => subtree present" holds once it is
+        // in; an interrupted absorb is redone before any commit is ingested.
         let store = self.store.clone();
-        mirror.absorb_objects(|oid, raw| {
+        report.objects_imported += mirror.absorb_objects(&store, |oid, raw| {
             if !store.has(&oid) {
                 store.put_raw(&oid, raw)?;
-                report.objects_imported += 1;
             }
             Ok(())
         })?;

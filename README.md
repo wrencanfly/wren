@@ -77,7 +77,7 @@ principle and says where it still differs.
 | Changesets relative to the first parent; trees are derived data | Changesets keep no tree; trees and commits are derived and checked against git's ids | ✅ M1 |
 | Every commit, rebase and revert happens on the server; refs move by compare-and-swap | Server-side commit, rebase, land and revert; the git host is updated first (write proxy) | ✅ M2 |
 | Want-only object protocol; identical RPCs at every cache tier | `wren cache` tiers, per-object verification, resumable | ✅ |
-| No packfiles and no maintenance; contents in object storage; distributed metadata | Loose objects on one host today; segment storage, object storage and Postgres planned | M3 |
+| No packfiles and no maintenance; contents in object storage; distributed metadata | Immutable segments (git's pack format, never repacked): git/git in 331 MiB. Delta frames, object storage and Postgres next | M3a ✅ |
 | A daemon per node with a bounded cache, seeded from snapshots; strict tiering | Planned, with deterministic simulation tests | M4 |
 | The server is the source of truth; older git clients still work | Planned: a git protocol front end, with the git host as a downstream mirror | M5 |
 | Path history, copy detection and search indexes; directory permissions | Planned | M6 |
@@ -246,9 +246,10 @@ flowchart LR
 - **Git compatibility.** Objects use git's loose format. For `--git`
   checkouts Wren writes git's sparse index directly, configures cone-mode
   sparse checkout, and sets the git host as a promisor remote.
-- **Lean mirror, not a lean store.** The server's git mirror keeps refs
-  only: fetched packs are absorbed into the object store and deleted. That
-  store holds loose objects, which take far more disk than a git pack.
+- **Segments, not loose files.** A fetched pack moves into the object store
+  whole, as an immutable segment with git's deltas, and is never repacked.
+  The git mirror keeps refs only and reads the segments through alternates.
+  git/git takes 331 MiB, about the size of its git pack.
 
 ## Benchmarks
 
@@ -267,8 +268,9 @@ node.
 | `blame`, warm | 86 ms | 14 ms | 6× |
 | `blame`, first time for a file | 86 ms | 62 ms | 1.4× |
 
-**Costs.** Wren's object store for git/git is 4.7 GB of loose objects, about
-15× the size of a git pack. An incremental update from `HEAD~15` sends 570 KB
+**Costs.** Wren's object store for git/git is 331 MiB, about the size of a git
+pack (it was 4.7 GB of loose objects before M3a). An incremental update from
+`HEAD~15` sends 570 KB
 where a git thin pack sends 14 KB. Full results, method, corrections and
 caveats are in [docs/benchmarks.md](docs/benchmarks.md).
 
@@ -277,9 +279,9 @@ caveats are in [docs/benchmarks.md](docs/benchmarks.md).
 The [migration plan](docs/design-scion-migration.md) has the details and the
 gates for each milestone.
 
-- **M3, storage.** Append-only segment storage with per-path deltas,
-  object-storage backends and Postgres metadata, so several stateless
-  servers can share one repository.
+- **M3, storage.** Done: immutable segments (M3a). Next: delta frames on the
+  wire (M3b), Postgres metadata so several stateless servers can share one
+  repository (M3c), object-storage backends (M3d).
 - **M4, node daemon.** A bounded per-node cache seeded from snapshots, strict
   tiering, and deterministic simulation tests with fault injection.
 - **M5, source of truth.** A git protocol front end so stock git can clone,

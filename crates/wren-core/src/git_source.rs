@@ -268,14 +268,19 @@ impl GitMirror {
         })
     }
 
-    /// Move every object the mirror holds itself (fetched packs and any
-    /// loose objects) into `put`, then delete them. Objects reachable through
-    /// alternates are untouched. Files are only deleted after all their
-    /// objects were handed over, so an interrupted absorb is simply redone.
-    pub fn absorb_objects(&self, mut put: impl FnMut(Oid, &[u8]) -> Result<()>) -> Result<usize> {
+    /// Move every object the mirror holds itself into Wren's store, so the
+    /// mirror keeps refs only. Fetched packs move in whole as segments (with
+    /// git's deltas, nothing re-encoded); loose objects go to `put`. Objects
+    /// reachable through alternates are untouched. Returns the number of
+    /// objects moved. An interrupted absorb is simply redone: a pack leaves
+    /// the mirror only once it is a complete segment.
+    pub fn absorb_objects(
+        &self,
+        store: &crate::store::ObjectStore,
+        mut put: impl FnMut(Oid, &[u8]) -> Result<()>,
+    ) -> Result<usize> {
         let objects = self.path.join("objects");
         let mut count = 0;
-        // Loose objects are already in Wren's storage format.
         for fan in std::fs::read_dir(&objects)?.flatten() {
             let name = fan.file_name().to_string_lossy().to_string();
             if name.len() != 2 || !fan.path().is_dir() {
@@ -301,23 +306,10 @@ impl GitMirror {
             Err(_) => Vec::new(),
         };
         for idx in packs {
-            let out = run({
-                let mut c = Command::new("git");
-                c.arg("show-index").stdin(std::fs::File::open(&idx)?);
-                c
-            })?;
-            let oids: Vec<Oid> = String::from_utf8_lossy(&out)
-                .lines()
-                .filter_map(|l| l.split(' ').nth(1).and_then(|o| o.parse().ok()))
-                .collect();
-            let mut cat = self.cat_file()?;
-            for oid in &oids {
-                let (kind, data) = cat.get(oid)?;
-                put(*oid, &crate::object::encode_loose(kind, &data))?;
-            }
-            drop(cat);
-            count += oids.len();
-            for ext in ["pack", "idx", "rev", "promisor", "keep", "bitmap"] {
+            let pack = idx.with_extension("pack");
+            count += crate::pack::Pack::open(&pack)?.count();
+            store.add_pack(&pack)?;
+            for ext in ["promisor", "keep", "bitmap"] {
                 let _ = std::fs::remove_file(idx.with_extension(ext));
             }
         }
