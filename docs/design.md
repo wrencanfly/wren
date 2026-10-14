@@ -2,6 +2,8 @@
 
 Wren 是 **git 的服务端源码控制查询层**。它部署在任意 git 托管（GitHub、GitLab、Gitea、自建）前面，把 Anthropic Scion 的读路径带给 git 用户，不要求迁移。同时，它也是原文建议 forge 提供的"服务端 RPC"的一份可运行实现，可以作为标准化讨论的起点。
 
+Wren 是独立项目，与 Anthropic 无关，也没有得到其背书。
+
 - 背景与动机：[00-overview.md](00-overview.md)
 - 对照 Scion 各条原则：[principles.md](principles.md)
 - API 参考（草案）：[spec/wren-protocol-v1.md](spec/wren-protocol-v1.md)
@@ -192,12 +194,12 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 
 ## 9. 测试
 
-- **`cargo test -p wren-core`**：单元测试，加上 **`tests/differential.rs`**（以 git 为 oracle 的 fuzz）。
+- **`cargo test -p wren-vcs-core`**：单元测试，加上 **`tests/differential.rs`**（以 git 为 oracle 的 fuzz）。
   - 种子由 `WREN_FUZZ_SEEDS` 指定。CI 跑一个种子，可以在夜间任务里跑多个。
   - 随机历史包含分支、merge、tag、mode 变更、删除，以及**大块插入、删除、重写**（这类编辑在 git.git 上暴露过 blame 的 diff bug）。
   - 场景分四轮：首次 ingest、增量 ingest、**force-push 主干并删除分支和 tag**、冷启动。
   - 比对内容：is-ancestor、merge-base --all、rev 语法、first-parent log（整体和按路径）、blame（全部文件）、diff、changeset、landed、refs。每轮还断言 mirror 里没有残留 pack。
-- **`cargo test -p wren --test e2e`**：真实进程拓扑，全程设置 `GIT_NO_LAZY_FETCH=1`。
+- **`cargo test -p wren-vcs --test e2e`**：真实进程拓扑，全程设置 `GIT_NO_LAZY_FETCH=1`。
   - 拓扑是 server → cache → CLI，两层都开启 token。
   - 覆盖 sparse index checkout，以及之后用原生 git commit 并 push；还有 `--full-index` 模式。
   - 覆盖能力声明、`last_sync`、固定查询的缓存命中、bisect 和 MCP。
@@ -213,7 +215,7 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 
 ## 11. 审阅后的修复
 
-三份独立审阅报告见 [reviews/](reviews/)。
+由 AI agent 撰写的内部审阅报告见 [reviews/](reviews/)，不是独立第三方审阅。
 
 | 来源 | 问题 | 状态 |
 |---|---|---|

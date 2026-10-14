@@ -2,8 +2,8 @@
 
 > Status: draft for the maintainers to review. It has not been sent. Before
 > sending, re-test it on the latest git `master`.
-> Context: the Anthropic Scion post asks that git's "sparse and shallow
-> features be made to compose well". Building Wren turned up two concrete
+> Context: the Anthropic Scion post hopes that "the various sparse and
+> shallow features in git can be made to compose well". Building Wren turned up two concrete
 > rough edges.
 
 **Subject:** sparse-checkout + partial clone: `sparse-checkout reapply` fetches out-of-cone blobs; sparse index still needs boundary trees

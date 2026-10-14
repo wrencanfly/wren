@@ -40,7 +40,7 @@ go through `git push`.
 
 ## Why
 
-Anthropic's [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control)
+Anthropic's [Redesigning source control at Anthropic](https://www.anthropic.com/engineering/redesigning-source-control)
 describes how agents running all day broke the assumption that every git
 client is offline and holds a full copy of history. The article does not
 call for replacing git. It suggests that "Git platforms can provide
@@ -101,7 +101,7 @@ wren blame Documentation/git-blame.adoc
 wren grep -i 'first.parent' builtin
 wren landed <commit> --into master        # which merge brought it into master
 wren merge-base master next
-wren diff master~1 master --name-status
+wren diff master --name-status          # what master changed vs its first parent
 wren cat README.md --rev v2.40.0
 ```
 

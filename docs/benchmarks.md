@@ -137,7 +137,7 @@ Delta frames and packed storage are on the roadmap.
 
 ## Corrections
 
-Independent reviews ([reviews/03](reviews/03-strategy-and-claims.md)) found
+Internal AI-assisted reviews ([reviews/03](reviews/03-strategy-and-claims.md)) found
 that the first published version of this page compared Wren against
 misconfigured git baselines.
 

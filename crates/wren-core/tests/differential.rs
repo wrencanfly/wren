@@ -197,6 +197,11 @@ fn build_history(dir: &Path, seed: u64, rounds: usize, g: &mut Option<Gen>) {
     if g.is_none() {
         std::fs::create_dir_all(dir).unwrap();
         git(dir, &["init", "-q", "-b", "main"]);
+        // No background auto-gc: a detached `gc --auto` packing refs while the
+        // next commit reads HEAD makes the generator flaky ("could not parse
+        // HEAD") once a seed's history crosses gc's loose-object threshold.
+        git(dir, &["config", "gc.auto", "0"]);
+        git(dir, &["config", "maintenance.auto", "false"]);
         *g = Some(Gen {
             dir: dir.to_path_buf(),
             rng: Rng(seed),

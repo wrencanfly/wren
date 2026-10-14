@@ -1,6 +1,9 @@
 # Scion 文章精读总览：核心思想与架构
 
-> 原文：Anthropic Engineering，[Redesigning source control for agent-scale development](https://www.anthropic.com/engineering/redesigning-source-control)（2026）。
+> 原文：Anthropic Engineering，[Redesigning source control at Anthropic](https://www.anthropic.com/engineering/redesigning-source-control)（2026）。
+>
+> 本文是对原文的阅读笔记。Wren 是独立项目，与 Anthropic 无关，也没有得到其背书。
+>
 > 本篇是总纲，三份分析各管一个专题：
 > - [01 · 问题与六条原则](research/01-problem-and-principles.md)
 > - [02 · 架构重构（可据此复现）](research/02-architecture.md)
