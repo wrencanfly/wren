@@ -1,25 +1,37 @@
-# Wren Protocol, Version 1
+# Wren HTTP API Reference (protocol v1)
 
 | | |
 |---|---|
-| Protocol major version | **1** |
-| Document status | **Draft, not frozen.** v1 freezes with the first tagged release of Wren. Until then, answers to pinned queries may change between drafts (see open issue 26), and caches filled by pre-release builds must be wiped on upgrade. |
+| Document status | **Unstable draft.** This is not a standard. No forge, git project, or standards body has reviewed it. Routes, fields, and answers may still change. |
+| Protocol major version | **1** (the `wren-protocol` header, [§1.2](#12-protocol-version-and-the-wren-protocol-header)) |
+| Query semantics version | **`1`** (the `wren-semantics` header, [§7.3](#73-the-immutability-contract)) |
 | Reference implementation | `crates/wren` (server, cache, client) and `crates/wren-core` |
 | Reference test suite | `crates/wren-core/tests/differential.rs` (git as oracle), `crates/wren/tests/e2e.rs` |
 | Object format | `sha1` only |
-| Revision | Second draft. It tracks the code after the first round of fixes; see [§13.1](#131-resolved-since-first-draft). |
+| Revision | Third draft. It adds `grep`, error codes, the semantics version, on-demand sync, and the `wren-synced-at` header; see [§13](#13-open-issues). |
 
-This document specifies the HTTP protocol spoken by Wren, a git-compatible
-source-control acceleration layer. It is written so that a git forge (GitHub,
-GitLab, Gitea, ...) or an independent implementation can serve the same API, and
-so that any conforming client can talk to any conforming server or cache.
+This document describes the HTTP API served by Wren, a git-compatible
+source-control acceleration layer that answers history queries on the server.
+It is the reference for Wren's own server, cache, and clients.
+
+It is also meant as a concrete starting point for standardizing server-side
+source-control RPCs across forges (GitHub, GitLab, Gitea, ...). It is written
+precisely enough that an independent implementation could serve the same API,
+and that any client could then talk to any server or cache that follows it.
+[Wren and the Scion principles](../principles.md) explains the motivation, and
+[a draft proposal](../upstream/git-protocol-v2-query.md) sketches the same
+queries as git protocol v2 extensions. Neither has been sent anywhere.
+
+Wren is an independent project. It is not affiliated with, reviewed by, or
+endorsed by Anthropic.
 
 **Source of truth.** Where this document describes behaviour, it describes what
 the reference implementation does. Where the implementation is ambiguous,
 inconsistent, or diverges from git, the behaviour is still documented as-is and
 the problem is listed in [Open issues](#13-open-issues). Sections and
 paragraphs marked *(informative)* or *(non-normative)* do not impose
-requirements.
+requirements. MUST and SHOULD state what an implementation of this draft has
+to do; they do not mean the draft is final.
 
 ---
 
@@ -60,6 +72,7 @@ interpreted as described in RFC 2119.
 | **generation** | 1 for a root commit, otherwise `1 + max(generation of each parent)`. Any proper ancestor has a strictly smaller generation. This equals git's commit-graph "topological level" (generation number v1). |
 | **depth** | The number of first-parent steps from a commit to a root commit. A root commit has depth 0. Two commits on the same first-parent chain are exactly `|depth(a) - depth(b)|` steps apart. |
 | **Pinned query** | A query request whose answer can never change, as defined precisely in [§7.1](#71-pinned-queries). |
+| **Semantics version** | An opaque string naming the version of the query answers' semantics, sent as `wren-semantics`. A pinned answer is fixed for a given semantics version ([§7.3](#73-the-immutability-contract)). |
 
 Byte orders: all multi-byte integers in the object protocol are **big-endian**.
 
@@ -72,16 +85,20 @@ Byte orders: all multi-byte integers in the object protocol are **big-endian**.
 This specification covers:
 
 * the **object protocol**, which fetches git objects by id ([§3](#3-object-protocol));
-* the **query API**, which answers history questions such as log, blame, ancestry, merge-base, "landed" and bisect ([§4](#4-query-api));
-* the **capabilities** document and protocol-version signalling ([§1.3](#13-capabilities-get-v1capabilities));
+* the **query API**, which answers history questions such as log, blame, ancestry, merge-base, "landed", bisect, and grep ([§4](#4-query-api));
+* the **capabilities** document and the version headers ([§1.2](#12-protocol-version-and-the-wren-protocol-header), [§1.3](#13-capabilities-get-v1capabilities));
 * **authentication** and the **tier model** ([§2](#2-authentication-and-tiers));
 * **caching** rules ([§7](#7-caching)).
 
 The following are out of scope: how a server ingests history from its upstream,
 the on-disk storage format, the derived-data indexes, the CLI, and the MCP
 interface (`crates/wren/src/mcp.rs`). The MCP interface is a separate client
-of this protocol: for example, its `wren_bisect_step` tool is a thin wrapper
-over [`bisect`](#49-bisect). The client checkout algorithm is described in
+of this API. Its tools first resolve every revision to a full commit id with
+[`resolve`](#43-resolve), and then send only pinned queries
+([§7.1](#71-pinned-queries)), so any cache tier can answer them. For example,
+`wren_bisect_step` is a thin wrapper over [`bisect`](#49-bisect). Tool output
+is capped (40 000 characters by default, adjustable per call), and a cut
+output says so. The client checkout algorithm is described in
 [§3.7](#37-client-checkout-algorithm-informative) for illustration only.
 
 ### 1.2 Protocol version and the `wren-protocol` header
@@ -94,6 +111,22 @@ The protocol major version defined here is **1**.
 * A client SHOULD check this header, or the `protocol` field of
   `/v1/capabilities`, before relying on any v1 semantics. If the value is not
   `1`, the client SHOULD stop.
+
+Every response also carries a `wren-semantics` header: the version of the
+query answers' semantics, currently `1` (`QUERY_SEMANTICS` in
+`crates/wren-core/src/api.rs`). It is separate from the protocol version. It
+changes when the server changes what it answers, not how it is asked
+([§7.3](#73-the-immutability-contract)). The value is an opaque string.
+Clients and caches MUST compare it only for equality.
+
+* The server MUST send `wren-semantics` on every response, including
+  `/healthz` and errors.
+* A cache MUST relay the upstream's `wren-semantics` value on every forwarded
+  query response, and on a stored response it MUST send the value the
+  response was stored under ([§7.2](#72-marking-and-storing)). On responses it
+  produces itself (objects, capabilities, `/v1/stats`, `/healthz`, its own
+  errors), and on a forwarded response that lacks the header, the reference
+  cache sends its own built-in value ([Open issues](#13-open-issues), item 27).
 
 ### 1.3 Capabilities: `GET /v1/capabilities`
 
@@ -113,8 +146,12 @@ shape is identical on every tier.
     "query-api",
     "bisect",
     "landed",
-    "immutable-pinned-queries"
-  ]
+    "grep",
+    "immutable-pinned-queries",
+    "on-demand-sync",
+    "error-codes"
+  ],
+  "semantics": "1"
 }
 ```
 
@@ -123,7 +160,8 @@ shape is identical on every tier.
 | `protocol` | integer | Protocol major version. MUST be `1` for this specification. |
 | `object_format` | string | The hash algorithm of every oid on this tier. MUST be `"sha1"` in v1 ([§1.5](#15-object-format)). |
 | `tier` | string | `"server"` or `"cache"`: which kind of tier answered. Clients MUST NOT change their behaviour based on this value ([§2.2](#22-tiers)). |
-| `features` | array of strings | Feature flags. The reference implementation advertises exactly the six values above on both tiers. |
+| `features` | array of strings | Feature flags. The reference implementation advertises exactly the nine values above on both tiers (`FEATURES` in `crates/wren/src/server.rs`). |
+| `semantics` | string | The query semantics version ([§1.2](#12-protocol-version-and-the-wren-protocol-header)). A server reports its own. A cache reports the value it last learned from its upstream, or its own built-in value if it has learned none ([§7.2](#72-marking-and-storing)). Clients MUST treat an absent field (older servers) as unknown. |
 
 Feature flags defined in v1:
 
@@ -134,7 +172,10 @@ Feature flags defined in v1:
 | `query-api` | The `/api/v1/...` endpoints of [§4](#4-query-api) |
 | `bisect` | `GET /api/v1/repos/{repo}/bisect` ([§4.9](#49-bisect)) |
 | `landed` | `GET /api/v1/repos/{repo}/landed` ([§4.8](#48-landed)) |
-| `immutable-pinned-queries` | Pinned query responses carry `Cache-Control: immutable` ([§7](#7-caching)) |
+| `grep` | `GET /api/v1/repos/{repo}/grep` ([§4.15](#415-grep)) |
+| `immutable-pinned-queries` | Pinned query responses carry `Cache-Control: ... immutable` ([§7](#7-caching)) |
+| `on-demand-sync` | An unknown revision triggers one sync with upstream before the server answers `404` ([§4.0.7](#407-unknown-revisions-and-on-demand-sync)) |
+| `error-codes` | Errors produced by handlers carry a machine-readable `code` ([§6.1](#61-errorbody)) |
 
 Clients MUST ignore feature flags they do not recognise.
 
@@ -145,11 +186,16 @@ Clients MUST ignore feature flags they do not recognise.
 * A **breaking change** MUST bump the protocol major version and move the
   affected routes to new prefixes: `/v2/...` and `/api/v2/...`. Breaking
   changes include removing or renaming a field or endpoint, changing a field's
-  type or meaning, changing the frame layout, changing the answer to an
-  already-answerable pinned query ([§7.3](#73-the-immutability-contract)), and
-  changing the object format.
+  type or meaning, changing the frame layout, and changing the object format.
+* Changing the **answer** to an already-answerable pinned query is not a
+  protocol break. It MUST instead come with a new query semantics version
+  ([§7.3](#73-the-immutability-contract)).
 * Non-breaking changes MAY be made within v1: new endpoints, new optional query
-  parameters, new JSON fields, new feature flags.
+  parameters, new JSON fields, new feature flags. A new field in the answer to
+  a pinned query changes that answer, so it also needs a new semantics
+  version.
+* While this document is a draft, these rules describe intent. The draft
+  itself may still change v1 in place.
 * Clients MUST ignore unknown JSON fields in responses. (The reference client
   does this, because its serde types do not deny unknown fields.)
 * Servers ignore unknown query parameters ([§4.0.2](#402-query-parameter-encoding)).
@@ -181,8 +227,12 @@ A tier MAY be configured with a single shared secret token. When a tier has a to
   The reference implementation compares in constant time.
 * A request without a valid token MUST be rejected with `401 Unauthorized` and
   the [ErrorBody](#61-errorbody)
-  `{"error":"missing or invalid bearer token"}`. Authentication happens before
-  routing, so an unknown path also gets `401`, not `404`.
+  `{"error":"missing or invalid bearer token","code":"unauthorized"}`.
+  Authentication happens before routing, so an unknown path also gets `401`,
+  not `404`.
+* A tier with a token marks immutable responses `Cache-Control: private, ...`
+  instead of `public, ...`, so that shared HTTP caches and CDNs do not keep
+  them ([§7.2](#72-marking-and-storing)).
 * `GET /healthz` is exempt. It returns `200 OK`, `Content-Type: text/plain;
   charset=utf-8`, body `ok`.
 
@@ -204,18 +254,22 @@ exactly one upstream, which is a server or another cache.
   request syntax and the same response semantics. A client cannot tell, and
   need not know, which tier it is talking to.
 * A cache MUST NOT alter responses. Object bytes MUST be relayed exactly as
-  received from upstream. Query responses MUST be relayed with the same status
-  code, body, and `Content-Type`. The only permitted differences are:
-  the `tier` field of `/v1/capabilities`; and transport headers such as `Date`
-  and `Content-Length`. A cache MUST preserve `Cache-Control` when it contains
-  `immutable`. It SHOULD preserve other `Cache-Control` values (for example
-  `no-store`). The reference cache
-  drops them ([Open issues](#13-open-issues), item 21).
+  received from upstream. Forwarded query responses MUST be relayed with the
+  same status code, body, `Content-Type`, `Cache-Control`, `wren-semantics`,
+  and `wren-synced-at` ([§4.0.8](#408-freshness-the-wren-synced-at-header)).
+  The reference cache relays exactly these headers and no others. The only
+  permitted differences are: the `tier` field of `/v1/capabilities`; transport
+  headers such as `Date` and `Content-Length`; and, on a response served from
+  the cache's own store, a `Cache-Control` value that the cache sets itself
+  (`private` if the cache has a client token, otherwise `public`,
+  [§7.2](#72-marking-and-storing)).
 * Errors that originate in the cache itself, rather than being relayed, are
   reported as in [§6.3](#63-errors-at-caches). An upstream failure is `502 Bad Gateway`.
-* A cache MUST NOT serve a stored query response unless that response was
-  marked immutable by upstream ([§7](#7-caching)). Every other query MUST be
-  forwarded upstream.
+* A cache MUST NOT serve a stored query response unless upstream marked that
+  response immutable, and the response was stored under the semantics version
+  the cache currently believes its upstream serves
+  ([§7.2](#72-marking-and-storing)). Every other query MUST be forwarded
+  upstream.
 * A cache MAY expose additional, cache-specific routes. The reference cache
   serves `GET /v1/stats` (OPTIONAL, not advertised in `features`), which returns:
 
@@ -274,8 +328,8 @@ Content-Type: application/json
   `422` in the reference implementation ([§6](#6-errors)).
 * **Batch limit:** at most **10 000** oids per request (`MAX_BATCH`). Server and
   cache both answer a larger request with `413 Payload Too Large` and
-  `{"error":"at most 10000 oids per request"}`. The reference client sends
-  batches of 1 000.
+  `{"error":"at most 10000 oids per request","code":"too_large"}`. The
+  reference client sends batches of 1 000.
 * An empty array is valid and yields `200` with an empty body.
 * Duplicate oids are allowed. Each occurrence gets its own frame.
 
@@ -333,12 +387,13 @@ it belongs to (see [Open issues](#13-open-issues), item 10).
 
 | Status | Body | Headers |
 |---|---|---|
-| `200` | The object's loose encoding (raw bytes, not framed) | `Content-Type: application/x-git-loose-object`, `Cache-Control: public, max-age=31536000, immutable` |
-| `404` | ErrorBody `{"error":"object <oid> not found"}` (server and cache alike) | `Content-Type: application/json` |
-| `400` | ErrorBody, e.g. `{"error":"oid must be 40 hex chars: \"xyz\""}` | when `{oid}` is not 40 hex characters |
-| `502` | ErrorBody `{"error":"upstream: ..."}` | cache only: the object is not stored locally and the upstream fetch failed ([§6.3](#63-errors-at-caches)) |
+| `200` | The object's loose encoding (raw bytes, not framed) | `Content-Type: application/x-git-loose-object`, `Cache-Control: public, max-age=31536000, immutable` (`private` instead of `public` when the tier has a token) |
+| `404` | ErrorBody `{"error":"object <oid> not found","code":"not_found"}` (server and cache alike) | `Content-Type: application/json` |
+| `400` | ErrorBody, e.g. `{"error":"oid must be 40 hex chars: \"xyz\"","code":"bad_request"}` | when `{oid}` is not 40 hex characters |
+| `502` | ErrorBody `{"error":"upstream: ...","code":"upstream_unavailable"}` | cache only: the object is not stored locally and the upstream fetch failed ([§6.3](#63-errors-at-caches)) |
 
-This route is suitable for plain HTTP caches and CDNs.
+This route is suitable for plain HTTP caches and CDNs, when the tier has no
+token.
 
 ### 3.4 Verification
 
@@ -362,8 +417,9 @@ The answer for a given oid can never change: it is either "missing" or the one
 object that hashes to that oid. Consequently:
 
 * `GET /v1/objects/{oid}` responses with status `200` are marked
-  `Cache-Control: public, max-age=31536000, immutable`, and any HTTP cache MAY
-  store them forever.
+  `Cache-Control: public, max-age=31536000, immutable` (`private, ...` when the
+  tier has a token), and any cache that the marking admits MAY store them
+  forever.
 * A tier MAY keep any found object forever and MUST NOT revalidate it.
 * A *missing* answer is not immutable: the object may arrive later, for example after a sync.
 
@@ -438,7 +494,7 @@ round for blobs.
 
 All query endpoints are under `/api/v1/`. Repository-scoped endpoints are under
 `/api/v1/repos/{repo}/`, where `{repo}` is a single path segment. An unknown
-`{repo}` yields `404` and `{"error":"unknown repo \"<name>\""}`.
+`{repo}` yields `404` and `{"error":"unknown repo \"<name>\"","code":"not_found"}`.
 
 | Method | Path | § |
 |---|---|---|
@@ -456,16 +512,18 @@ All query endpoints are under `/api/v1/`. Repository-scoped endpoints are under
 | GET | `/api/v1/repos/{repo}/tree` | [4.12](#412-tree) |
 | GET | `/api/v1/repos/{repo}/file` | [4.13](#413-file) |
 | POST | `/api/v1/repos/{repo}/sync` | [4.14](#414-sync) |
+| GET | `/api/v1/repos/{repo}/grep` | [4.15](#415-grep) |
 
 A request with the wrong method on a known path gets `405 Method Not Allowed`
-with an `Allow` header and an empty body.
+with an `Allow` header (for example `Allow: GET,HEAD`) and an empty body.
 
 #### 4.0.2 Query-parameter encoding
 
 * Parameters use standard `application/x-www-form-urlencoded` query syntax and
   are percent-decoded by the server.
-* **Booleans** (`changes`, `patch`) accept exactly `true` or `false`. Any other
-  value (for example `1`) is a `400`. An absent boolean is `false`.
+* **Booleans** (`changes`, `patch`, `ignore_case`) accept exactly `true` or
+  `false`. Any other value (for example `1`) is a `400`. An absent boolean is
+  `false`.
 * **Integers** (`limit`) are unsigned decimal. A non-numeric value is a `400`.
 * Unknown parameters are ignored. Repeating a known parameter is a `400`.
 * A missing **required** parameter is a `400`.
@@ -477,7 +535,9 @@ with an `Allow` header and an empty body.
 The parameters `rev`, `a`, `b`, `base`, `head`, `commit`, `ref`, `good`, `bad`, and the
 `{rev}` path segment of `/commits/{rev}`, are **revisions**, resolved by the
 syntax of [§5](#5-revision-syntax). Every revision resolves to a commit oid.
-Where a revision parameter is optional and absent, it defaults to `HEAD`.
+Where a revision parameter is optional and absent, it defaults to `HEAD`. A
+revision the server does not know triggers one on-demand sync before the
+server answers `404` ([§4.0.7](#407-unknown-revisions-and-on-demand-sync)).
 
 #### 4.0.4 Path parameters
 
@@ -563,6 +623,57 @@ the **first** parent only. This equals
 | `depth` | integer | First-parent steps to a root. Root = 0. |
 | `changes` | array of Change, **omitted** unless requested | The changeset's changes (relative to the first parent), when the endpoint was called with `changes=true`. |
 
+#### 4.0.7 Unknown revisions and on-demand sync
+
+A server that advertises `on-demand-sync` gives clients read-your-writes for
+new commits and new refs. The reference server does this in
+`ServerState::resolve` (`crates/wren/src/server.rs`):
+
+1. When resolving a revision parameter fails with `404` (any not-found cause
+   of [§5](#5-revision-syntax): unknown name or id, `~N` past the root, a
+   nonexistent `^N` parent, a missing `HEAD`), and the repository has an
+   upstream, the server syncs the repository once
+   ([§4.14](#414-sync)) and resolves the revision again. The second result is
+   the answer.
+2. At most one on-demand sync of a repository runs at a time. Requests that
+   arrive while one runs wait for it and then reuse its result instead of
+   starting another.
+3. On-demand syncs of one repository are at least 1 s apart. If the previous
+   on-demand sync finished less than 1 s ago, the server resolves again
+   without syncing. Periodic syncs and `POST .../sync` do not count.
+4. A failed on-demand sync is logged and recorded in `last_sync_error`
+   ([§4.1](#41-list-repositories)). The request then gets the result of the
+   second resolution, usually the same `404`.
+
+Only revision resolution triggers this. A missing `path` at a known revision
+does not, and neither do `refs` and `GET /api/v1/repos`. A revision that
+resolves without error is never refreshed: a branch name that upstream has
+moved still names the commit it named at the last sync. So a client that has
+just pushed can ask about the new commit id, or a new branch, immediately. To
+see an existing branch's new position, it has to call
+[`POST .../sync`](#414-sync) or wait for the next periodic sync.
+
+#### 4.0.8 Freshness: the `wren-synced-at` header
+
+Branch-relative answers reflect upstream as of the repository's last
+successful sync. The server makes this visible on every response to a request
+under `/api/v1/repos/{repo}/...` where `{repo}` is a known repository and the
+request is not pinned ([§7.1](#71-pinned-queries)):
+
+```
+wren-synced-at: 1791927298
+```
+
+The value is `last_sync` ([§4.1](#41-list-repositories)): the Unix time
+(seconds) of the last successful sync, read after the request was handled. It
+therefore includes an on-demand sync or `POST .../sync` made by that request.
+The header is sent on errors too, including framework rejections. It is
+omitted when the repository has never synced. It is never sent on pinned
+requests, whose answers do not depend on refs, nor on `GET /api/v1/repos`,
+which reports `last_sync` per repository in its body. A cache relays the
+header on forwarded responses ([§2.2](#22-tiers)). Responses served from a
+cache's store are pinned and never carry it.
+
 ### 4.1 List repositories
 
 `GET /api/v1/repos`. No parameters. Never pinned.
@@ -591,7 +702,9 @@ the **first** parent only. This equals
 | `last_sync` | integer or null | Unix time (seconds) of the last **successful** sync with upstream. `null` if there has never been one. **Every branch-relative answer (refs, `HEAD`, branch names in revisions) reflects upstream as of this moment.** A failed sync leaves it unchanged. |
 | `last_sync_error` | string or null | The error message of the most recent sync attempt if that attempt failed. `null` if it succeeded or none has run. |
 
-A client that needs fresher answers than `last_sync` MAY call
+New commits and new refs are picked up on demand when a request names them
+([§4.0.7](#407-unknown-revisions-and-on-demand-sync)). A client that needs
+existing refs to be fresher than `last_sync` MAY call
 [`POST .../sync`](#414-sync).
 
 ### 4.2 Refs
@@ -631,7 +744,9 @@ ingested.
 
 Errors ([§5.3](#53-applying-suffixes)): `404` for an unknown revision, an
 unknown full commit id, a `~N` past the root, a nonexistent `^N` parent, or a
-missing `HEAD`. `400` for invalid suffix syntax or an ambiguous abbreviated id.
+missing `HEAD`, each after at most one on-demand sync
+([§4.0.7](#407-unknown-revisions-and-on-demand-sync)). `400` for invalid
+suffix syntax or an ambiguous abbreviated id.
 
 Pinned only when `rev` is itself a full lowercase oid. This is useful mainly to
 check that the server knows a commit.
@@ -815,8 +930,9 @@ brought `good` in together with other, untested changes. When `good` lies on
 `wren_bisect_step`):** resolve `good` and `bad` to oids. Then repeat: call
 `bisect`. If `next` is null, report `first_bad`. Otherwise test `next` (for
 example in a checkout), and replace `good` (on pass) or `bad` (on fail) with
-`next`. Because every call after the first uses full oids, those calls are
-pinned queries ([§7](#7-caching)) and are cacheable.
+`next`. Because both drivers resolve `good` and `bad` first, every `bisect`
+call they make uses full oids, so every call is a pinned query
+([§7](#7-caching)) and is cacheable.
 
 ### 4.10 Diff
 
@@ -993,9 +1109,12 @@ a directory, or a gitlink.
 Asks the server to fetch from its upstream git URL now, ingest every new commit,
 and update refs and `HEAD`. Blocks until done. Concurrent syncs of one
 repository are serialised. Servers also sync periodically on their own (the
-reference default is every 30 s). This endpoint only refreshes from upstream.
-It accepts no data from the client and cannot create commits or move refs to
-arbitrary values.
+reference default is every 30 s, and `--poll 0` syncs only at startup and on
+demand), and on demand when a request names an unknown revision
+([§4.0.7](#407-unknown-revisions-and-on-demand-sync)). A client needs this
+endpoint only to refresh refs that already exist. This endpoint only
+refreshes from upstream. It accepts no data from the client and cannot create
+commits or move refs to arbitrary values.
 
 **Response** `200`:
 
@@ -1010,11 +1129,82 @@ arbitrary values.
 | `objects_imported` | Objects added to the store. |
 | `millis` | Wall-clock duration of the sync in milliseconds. |
 
-Errors: `500` if the repository has no upstream (`repo has no upstream`), or if
-the upstream git fetch fails, because neither is classified as a client error
-([§6.2](#62-status-codes), [Open issues](#13-open-issues), item 23). A failed
-attempt is recorded in `last_sync_error` ([§4.1](#41-list-repositories)). A cache
-forwards this request upstream and never caches it.
+The response carries `wren-synced-at` with the time of this sync, if it
+succeeded ([§4.0.8](#408-freshness-the-wren-synced-at-header)).
+
+Errors: `500` with code `internal` if the repository has no upstream
+(`repo has no upstream`), or if the upstream git fetch fails, because neither
+is classified as a client error ([§6.2](#62-status-codes),
+[Open issues](#13-open-issues), item 23). A failed attempt is recorded in
+`last_sync_error` ([§4.1](#41-list-repositories)). A cache forwards this
+request upstream and never caches it.
+
+### 4.15 Grep
+
+`GET /api/v1/repos/{repo}/grep`
+
+Searches file contents at a revision on the server, so a job or an agent
+needs no checkout. Implemented in `crates/wren-core/src/grep.rs`.
+
+| Parameter | Required | Default | Meaning |
+|---|---|---|---|
+| `pattern` | yes | – | A regular expression in the syntax of the Rust `regex` crate. |
+| `rev` | no | `HEAD` | Revision. |
+| `path` | no | `""` (root) | A file or directory to search ([§4.0.4](#404-path-parameters)). |
+| `ignore_case` | no | `false` | Match case-insensitively. |
+| `limit` | no | `100` | Maximum number of matches. Clamped to the range 1 to 10 000, so `0` means 1. |
+
+**Response** `200`, here for `grep?pattern=^t&path=src/a.txt&rev=136c…`:
+
+```json
+{
+  "rev": "136c59eb0d199f2f9181ea4db8f448b4df4d3f32",
+  "matches": [
+    {"path":"src/a.txt","line":3,"text":"two"},
+    {"path":"src/a.txt","line":4,"text":"three"}
+  ],
+  "truncated": false
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `rev` | The resolved commit. |
+| `matches[].path` | Full path of the file from the tree root. Non-UTF-8 bytes are replaced with U+FFFD. |
+| `matches[].line` | 1-based line number. |
+| `matches[].text` | The matching line, without its `\n` and without one trailing `\r`, decoded as UTF-8 lossily. A line longer than 400 bytes is cut at the last character boundary at or before 400 bytes and followed by `…` (U+2026). |
+| `truncated` | `true` iff more matching lines exist than `limit`. |
+
+**Semantics.**
+
+* **Files searched.** If `path` names a directory (or is empty, the root),
+  every file below it, recursively. If it names a file or symlink, that file
+  alone (a symlink is searched as its target string). If it names a gitlink,
+  nothing. Gitlinks below a directory are skipped.
+* **Binary files** are skipped entirely: a file is binary if its first 8000
+  bytes contain a NUL byte, the same test git uses.
+* **Lines** are split on `\n`. A final `\n` ends the last line and does not
+  start another, so a file that is empty or is exactly `\n` has no lines. The
+  pattern is matched against each line's bytes without the `\n`, but with any
+  trailing `\r`.
+* **Order.** Files in git's path order (the order of `git ls-files`), lines in
+  ascending order within a file. The first `limit` matches in this order are
+  returned.
+* The result is a pure function of the history, `pattern`, `path`,
+  `ignore_case`, and `limit`. A request with a full commit id as `rev` is
+  pinned ([§7.1](#71-pinned-queries)).
+
+For patterns that mean the same as a POSIX extended regular expression and in
+Rust `regex` syntax, the `(path, line)` pairs equal those of
+`git grep -n -I -E [-i] <pattern> <rev> -- <path>`, cut to `limit`. Other
+patterns may match differently: git uses basic regular expressions unless
+given `-E`, and the Rust crate has its own syntax, with no backreferences or
+look-around.
+
+Errors: `400` with code `bad_request` (`invalid pattern: ...`) if `pattern`
+does not compile. `400` (`text/plain`, [§4.0.2](#402-query-parameter-encoding))
+if `pattern` is missing. `404` (`no path "<path>" at <oid>`) if `path` does not
+exist at `rev`.
 
 ---
 
@@ -1024,6 +1214,10 @@ Every revision parameter is resolved by the following algorithm (`resolve` in
 `crates/wren-core/src/repo.rs`). The result is always a **commit** oid known to
 the server. **A Wren revision always names a commit**: tags are peeled, and
 there is no syntax for naming a tree, blob, or tag object.
+
+Every `404` in this section is the answer after at most one on-demand sync
+and a second resolution ([§4.0.7](#407-unknown-revisions-and-on-demand-sync)).
+The algorithm itself only reads the server's current state.
 
 ### 5.1 Grammar
 
@@ -1136,14 +1330,46 @@ unknown full id fail ([§8](#8-conformance)).
 
 ### 6.1 ErrorBody
 
-Errors produced by Wren handlers have `Content-Type: application/json` and the body
+Errors produced by Wren handlers and middleware have
+`Content-Type: application/json` and the body
 
 ```json
-{"error": "<human-readable message>"}
+{"error": "<human-readable message>", "code": "<code>"}
 ```
 
-The message is diagnostic text. Clients MUST NOT parse it and SHOULD rely on
-the status code. Messages may contain oids, revision strings, and paths.
+`code` is derived from the HTTP status alone (`ApiError::into_response` in
+`crates/wren/src/server.rs`):
+
+| Status | `code` |
+|---|---|
+| `404` | `not_found` |
+| `400` | `bad_request` |
+| `401` | `unauthorized` |
+| `413` | `too_large` |
+| `502`, `504` | `upstream_unavailable` (no tier sends `504` today) |
+| any other, in practice `500` | `internal` |
+
+The message is diagnostic text. Clients MUST NOT parse it. They SHOULD branch
+on `code` or on the status code. Clients MUST accept unknown codes, and MUST
+treat a missing `code` (servers that predate the `error-codes` feature) like
+the status code alone. Messages may contain oids, revision strings, and paths.
+
+Not every error is an ErrorBody. Rejections produced by the HTTP framework
+before a handler runs have other bodies and no `code`
+([Open issues](#13-open-issues), item 5):
+
+| Status | When | Body |
+|---|---|---|
+| `400` | Query-string parse failure ([§4.0.2](#402-query-parameter-encoding)) | `text/plain; charset=utf-8`, for example ``Failed to deserialize query string: missing field `b` `` |
+| `400`, `415`, `422` | `POST /v1/objects` with malformed JSON (400), without `Content-Type: application/json` (415), or with an invalid oid or wrong shape (422) | `text/plain; charset=utf-8`, for example ``Expected request with `Content-Type: application/json` `` |
+| `404` | Unknown route (after authentication) | empty, no `Content-Type` |
+| `405` | Known path, wrong method | empty, with an `Allow` header |
+
+These responses still carry `wren-protocol` and `wren-semantics`, and, under
+`/api/v1/repos/{repo}/`, `wren-synced-at`
+([§4.0.8](#408-freshness-the-wren-synced-at-header)). A client that fails to
+parse an ErrorBody SHOULD fall back to the raw body as the message, as the
+reference client does.
 
 ### 6.2 Status codes
 
@@ -1156,36 +1382,45 @@ The reference server classifies every handler error by its cause chain:
 | Status | When | Body |
 |---|---|---|
 | `200` | Success. | Endpoint-specific. |
-| `400 Bad Request` | The request is malformed or self-contradictory (`BadRequest`): invalid revision suffix syntax or digit overflow ([§5.3](#53-applying-suffixes)); ambiguous abbreviated id; malformed oid in `/v1/objects/{oid}`; `diff` on a root commit without `base`; `bisect` when `good` shares no history with `bad`'s first-parent chain, or when `bad` is an ancestor of `good`. | ErrorBody |
-| `400 Bad Request` | Query-string parse failure: missing required parameter, non-numeric `limit`, boolean other than `true`/`false`, duplicate parameter. | `text/plain` (framework message, for example `Failed to deserialize query string: missing field `b``) |
-| `401 Unauthorized` | Missing or invalid bearer token ([§2.1](#21-bearer-tokens)). | ErrorBody |
-| `404 Not Found` | The thing named does not exist (`NotFound`): unknown repository; unknown revision or full id; `~N` past the root; nonexistent `^N` parent; repository without `HEAD`, or `HEAD` naming a missing ref; unknown changeset; an object the query needs is not in the store; `path` absent or of the wrong kind for `blame`/`tree`/`file`; `GET /v1/objects/{oid}` for an absent object. | ErrorBody |
+| `400 Bad Request` | The request is malformed or self-contradictory (`BadRequest`): invalid revision suffix syntax or digit overflow ([§5.3](#53-applying-suffixes)); ambiguous abbreviated id; malformed oid in `/v1/objects/{oid}`; `diff` on a root commit without `base`; `bisect` when `good` shares no history with `bad`'s first-parent chain, or when `bad` is an ancestor of `good`; a `grep` pattern that does not compile. | ErrorBody, `bad_request` |
+| `400 Bad Request` | Query-string parse failure: missing required parameter, non-numeric `limit`, boolean other than `true`/`false`, duplicate parameter. | `text/plain` ([§6.1](#61-errorbody)) |
+| `401 Unauthorized` | Missing or invalid bearer token ([§2.1](#21-bearer-tokens)). | ErrorBody, `unauthorized` |
+| `404 Not Found` | The thing named does not exist (`NotFound`): unknown repository; unknown revision or full id, after at most one on-demand sync ([§4.0.7](#407-unknown-revisions-and-on-demand-sync)); `~N` past the root; nonexistent `^N` parent; repository without `HEAD`, or `HEAD` naming a missing ref; unknown changeset; an object the query needs is not in the store; `path` absent or of the wrong kind for `blame`/`tree`/`file`/`grep`; `GET /v1/objects/{oid}` for an absent object. | ErrorBody, `not_found` |
 | `404 Not Found` | Unknown route (after authentication). | empty |
 | `405 Method Not Allowed` | Known path, wrong method. Carries an `Allow` header. | empty |
-| `413 Payload Too Large` | `POST /v1/objects` with more than 10 000 oids (server and cache). | ErrorBody |
+| `413 Payload Too Large` | `POST /v1/objects` with more than 10 000 oids (server and cache). | ErrorBody, `too_large` |
 | `415`, `422`, `400` | `POST /v1/objects` with the wrong `Content-Type` (415), a syntactically valid body with an invalid oid or shape (422), or malformed JSON (400). | `text/plain` |
-| `500 Internal Server Error` | Every other handler error: I/O and database failures; corrupt stored data; an object too large to frame ([§3.2](#32-batch-fetch-post-v1objects)); `sync` without an upstream, or a failed upstream fetch ([§4.14](#414-sync)); a panicked worker task (`task failed: ...`). | ErrorBody |
-| `502 Bad Gateway` | Caches only ([§6.3](#63-errors-at-caches)). | ErrorBody |
+| `500 Internal Server Error` | Every other handler error: I/O and database failures; corrupt stored data; an object too large to frame ([§3.2](#32-batch-fetch-post-v1objects)); `sync` without an upstream, or a failed upstream fetch ([§4.14](#414-sync)); a panicked worker task (`task failed: ...`). | ErrorBody, `internal` |
+| `502 Bad Gateway` | Caches only ([§6.3](#63-errors-at-caches)). | ErrorBody, `upstream_unavailable` |
 
 A `404` from a revision-taking endpoint means the server does not know the
-revision **as of `last_sync`**. A client that has just pushed upstream MAY call
-`sync` and retry. A `500` is a server fault, and a client MAY retry it. A `400` is
-not retryable unchanged.
+revision even after syncing on demand
+([§4.0.7](#407-unknown-revisions-and-on-demand-sync)). Retrying at once does
+not help: on-demand syncs of one repository are at least 1 s apart, and a
+commit that upstream does not have will not appear. A branch that exists but
+has moved upstream does not cause a `404`; it answers with its position as of
+`last_sync`, which `wren-synced-at` reports
+([§4.0.8](#408-freshness-the-wren-synced-at-header)). A client that needs the
+new position calls `sync` first. A `500` is a server fault, and a client MAY
+retry it. A `400` is not retryable unchanged.
 
 ### 6.3 Errors at caches
 
-A cache relays upstream query responses (status, `Content-Type`, body)
-unchanged, including upstream `4xx` and `5xx` answers. Errors that originate in
-the cache itself use the same ErrorBody shape:
+A cache relays upstream query responses (status, `Content-Type`, body, and the
+headers of [§2.2](#22-tiers)) unchanged, including upstream `4xx` and `5xx`
+answers. The reference cache forwards every request under `/api/`, whatever
+its method or path, so framework rejections on query routes (`text/plain`
+`400`, empty `404` and `405`) come from upstream and are relayed. Errors that
+originate in the cache itself use the same ErrorBody shape:
 
-| Status | When (reference cache) |
-|---|---|
-| `502 Bad Gateway` | Object path (`POST /v1/objects` with at least one local miss, or `GET /v1/objects/{oid}` on a local miss): the upstream is unreachable, answers non-2xx (`upstream: upstream returned <status>`), returns a malformed frame stream, or returns an object that fails hash verification ([§3.4](#34-verification)). Body: `{"error":"upstream: ..."}`. |
-| `502 Bad Gateway` | Query path (`/api/...`): the upstream is unreachable (`upstream unreachable: ...`). |
-| `413` | Batch over 10 000 oids, checked before contacting upstream. |
-| `404` | `GET /v1/objects/{oid}` that is neither stored nor returned by upstream. |
-| `400` | Malformed oid in `GET /v1/objects/{oid}`. |
-| `500` | Local faults, for example a store I/O error, or a failure reading a request or upstream response body. |
+| Status | `code` | When (reference cache) |
+|---|---|---|
+| `502 Bad Gateway` | `upstream_unavailable` | Object path (`POST /v1/objects` with at least one local miss, or `GET /v1/objects/{oid}` on a local miss): the upstream is unreachable or times out, answers non-2xx (`upstream: upstream returned <status>`), returns a malformed frame stream, or returns an object that fails hash verification ([§3.4](#34-verification)). Body: `{"error":"upstream: ...","code":"upstream_unavailable"}`. |
+| `502 Bad Gateway` | `upstream_unavailable` | Query path (`/api/...`): the upstream is unreachable or times out (`upstream unreachable: ...`). |
+| `413` | `too_large` | Batch over 10 000 oids, checked before contacting upstream. |
+| `404` | `not_found` | `GET /v1/objects/{oid}` that is neither stored nor returned by upstream. |
+| `400` | `bad_request` | Malformed oid in `GET /v1/objects/{oid}`. |
+| `500` | `internal` | Local faults, for example a store I/O error, or a failure reading a request or upstream response body. |
 
 ---
 
@@ -1201,7 +1436,7 @@ can never change. Precisely, a request is pinned iff **all** of the following ho
 1. The method is `GET`.
 2. The path has the form `/api/v1/repos/{repo}/{endpoint}[/...]`, where
    `{endpoint}` is one of: `commits`, `log`, `merge-base`, `is-ancestor`,
-   `landed`, `diff`, `blame`, `tree`, `file`, `bisect`, `resolve`. (`repos`,
+   `landed`, `diff`, `blame`, `tree`, `file`, `bisect`, `resolve`, `grep`. (`repos`,
    `refs`, `sync`, and anything outside `/api/v1/repos/` are never pinned.)
 3. Build a list *R* of revision strings:
    * for `commits`, the raw path segment after `commits/`;
@@ -1223,6 +1458,7 @@ Examples:
 | `GET .../diff?head=136c…3f32` | yes | `base` defaults to the first parent of a fixed commit, which is itself fixed |
 | `GET .../log?rev=136c…3f32&path=src&limit=10` | yes | |
 | `GET .../landed?commit=3850…6dd3&ref=136c…3f32` | yes | |
+| `GET .../grep?pattern=TODO&rev=136c…3f32` | yes | `pattern` is not a revision parameter |
 | `GET .../landed?commit=3850…6dd3` | no | `ref` defaults to `HEAD` (only 1 revision) |
 | `GET .../blame?path=src/a.txt` | no | `rev` defaults to `HEAD` |
 | `GET .../commits/main` | no | branch name |
@@ -1233,40 +1469,71 @@ Examples:
 ### 7.2 Marking and storing
 
 * **Server.** When a pinned request succeeds (2xx) and the handler has not set a
-  `Cache-Control` header itself, the server MUST add
-  `Cache-Control: public, max-age=31536000, immutable`. It MUST NOT add it to
-  non-pinned or unsuccessful responses. It MUST NOT override a `Cache-Control`
-  header the handler set, so a handler whose answer is not a pure function of
-  the history can opt out with `no-store` (no query handler of the reference
-  server needs to). `GET /v1/objects/{oid}` with `200` always
-  carries the immutable header ([§3.5](#35-immutability)).
-* **Any cache** (a Wren cache tier, a CDN, or an HTTP client cache) MAY store a
-  response marked `immutable` **forever**, and MUST NOT revalidate it.
-* **Wren cache tier (reference behaviour).** For a `GET` under `/api/`, it
-  looks up the exact `path?query` string (not normalised: parameter order and
-  encoding matter). On a hit, it returns `200` with the stored body, the stored
-  `Content-Type`, and `Cache-Control: public, max-age=31536000, immutable`,
-  without contacting upstream. On a miss, it forwards the request. If upstream
-  answers `200` with a `Cache-Control` value containing `immutable`, it stores
-  the body and `Content-Type`, then relays the response. Every other request
-  (non-GET, not marked immutable, non-200) is forwarded and relayed but never
-  stored. When relaying, it keeps `Cache-Control` only when the value is
-  immutable, and drops any other value, including `no-store`
-  ([Open issues](#13-open-issues), item 21). Objects found upstream are verified
-  ([§3.4](#34-verification)) and stored forever. "Missing" answers are never
-  stored.
+  `Cache-Control` header itself, the server MUST add an immutable
+  `Cache-Control` header. The reference server (`fn immutable` in
+  `crates/wren/src/server.rs`) sends
+  `Cache-Control: private, max-age=31536000, immutable` when it has a token
+  ([§2.1](#21-bearer-tokens)), and
+  `Cache-Control: public, max-age=31536000, immutable` otherwise. It MUST NOT
+  add the header to non-pinned or unsuccessful responses. It MUST NOT override
+  a `Cache-Control` header the handler set, so a handler whose answer is not a
+  pure function of the history can opt out with `no-store` (no query handler of
+  the reference server needs to). `GET /v1/objects/{oid}` with `200` always
+  carries the same immutable header ([§3.5](#35-immutability)).
+* **Any cache** that the marking admits MAY store a response marked
+  `immutable` **forever**, and MUST NOT revalidate it. Under HTTP caching rules
+  (RFC 9111), a `private` response may be kept by the client's own cache but
+  not by a shared HTTP cache or CDN. A Wren cache tier authenticates its own
+  clients, and stores immutable responses whether they are `public` or
+  `private`.
+* **Wren cache tier (reference behaviour, `crates/wren/src/cache.rs`).**
+  * *Semantics.* The cache keeps the semantics version
+    ([§7.3](#73-the-immutability-contract)) it believes its upstream serves. At
+    startup it reads `semantics` from the upstream's `/v1/capabilities` (best
+    effort). After that, it adopts the `wren-semantics` header of every
+    forwarded query response. Until it learns a value, it uses its own built-in
+    value.
+  * *Key.* A stored answer is keyed by the pair (semantics version, exact
+    `path?query` string). The string is not normalised: parameter order and
+    encoding matter.
+  * *Hit.* For a `GET` under `/api/`, it looks up the key with the current
+    semantics version. On a hit, it returns `200` with the stored body, the
+    stored `Content-Type`, an immutable `Cache-Control` (`private` if the cache
+    has a client token, otherwise `public`), and `wren-semantics` set to the
+    key's version, without contacting upstream.
+  * *Miss.* It forwards the request. If upstream answers `200` to a `GET` with
+    a `Cache-Control` value containing `immutable`, it stores the body and
+    `Content-Type` under the semantics version named by that response's
+    `wren-semantics` header (or the current one if the header is absent), then
+    relays the response. Every other request (non-GET, not marked immutable,
+    non-200) is forwarded and relayed but never stored. When relaying, it
+    passes `Cache-Control`, `wren-semantics`, and `wren-synced-at` through
+    unchanged.
+  * *Objects.* Objects found upstream are verified ([§3.4](#34-verification))
+    and stored forever. "Missing" answers are never stored.
 * A cache MUST NOT derive "pinned" itself from the URL. It relies on the
-  upstream's `immutable` marking, so a cache needs no knowledge of query
-  semantics.
+  upstream's `immutable` marking and `wren-semantics` header, so a cache needs
+  no knowledge of query semantics.
 
 ### 7.3 The immutability contract
 
-Because caches MAY keep pinned responses forever, a server MUST return the same
-body for the same pinned request for as long as it serves v1. A server
-implementation whose answer to a pinned query would change, for example
-because of a bug fix in blame attribution, can only ship that change under a
-new protocol major version or a new route. This rule is *derived* from the
-caching rules above. The reference implementation relies on these properties:
+A pinned answer is a pure function of two things: immutable inputs (the
+commits named and everything they reach), and the server's **query semantics
+version** (`QUERY_SEMANTICS`, sent as `wren-semantics`,
+[§1.2](#12-protocol-version-and-the-wren-protocol-header)).
+
+* For a given semantics version, a server MUST return the same body for the
+  same pinned request, forever.
+* A server whose answer to any already-answerable pinned query changes MUST
+  send a new semantics version. Examples are a bug fix in blame attribution, a
+  different line-diff heuristic, or a new field in a pinned answer. It does not
+  need a new protocol major version or a new route.
+* Wren cache tiers key stored answers by semantics version
+  ([§7.2](#72-marking-and-storing)). After an upgrade, they stop serving
+  answers stored under the old version and fill again from upstream. Old and
+  new answers never mix.
+
+The reference implementation relies on these properties:
 
 * changesets are append-only and never deleted;
 * derived data is a pure function of immutable inputs;
@@ -1275,9 +1542,12 @@ caching rules above. The reference implementation relies on these properties:
 * every computation behind a query answer is deterministic, with no time
   budget (in particular blame's line diff, [§4.11](#411-blame)).
 
-Answers whose *semantics* changed between drafts of this specification
-(bisect's lower bound, the type of `mode`, blame's new `exact` field) are a
-one-time exception to this contract. See [Open issues](#13-open-issues), item 26.
+Limits *(informative)*. Entries stored under an old version are not deleted;
+they only become unreachable. HTTP caches outside Wren key by URL and do not
+see the semantics version, so with `public` marking they may keep serving an
+old answer until it expires (`max-age` is one year). A tier with a token marks
+answers `private`, which keeps them out of shared HTTP caches. See
+[Open issues](#13-open-issues), item 28.
 
 ---
 
@@ -1312,29 +1582,37 @@ seeds (`WREN_FUZZ_SEEDS`).
 | `bisect` | Convergence. With "bad" defined as "contains commit X" and a random `good` that does not contain X (often off main's first-parent line), the driving loop of §4.9 must end at the oldest commit on main's first-parent chain that contains X. That expectation is computed with `git rev-list --first-parent` and `git rev-list --ancestry-path X..main`. | yes (end result only, not each step's `next`, `candidates`, or `steps_left`) |
 | `tree`, `file` | `git ls-tree REV PATH/`, `git cat-file blob REV:PATH` | **no** |
 | `diff?patch=true` | no byte-exact oracle ([§4.10](#410-diff)) | **no** |
+| `grep` | `git grep -n -E [-i] PATTERN REV [-- PATH]`, comparing `(path, line)` per match, for patterns that mean the same in both dialects ([§4.15](#415-grep)) | yes (whole tree and one directory, at two revisions; also that `limit` keeps a prefix and sets `truncated` correctly). `text` is not compared. |
 
 The differential suite exercises the query engine (`wren-core`) directly, not
-over HTTP. HTTP-level behaviour (authentication, `wren-protocol`, capabilities
-on both tiers, cache hits for pinned blame, no caching of branch-relative
-queries, end-to-end bisect, sparse checkout through a cache) is covered by the
-end-to-end test `crates/wren/tests/e2e.rs`.
+over HTTP. HTTP-level behaviour (authentication, `wren-protocol` and
+`wren-semantics` on capabilities of both tiers, the `not_found` error code,
+read-your-writes through on-demand sync, cache hits for pinned blame, no
+caching of branch-relative queries, grep through the CLI, end-to-end bisect,
+MCP tools pinning revisions, sparse checkout through a cache) is covered by
+the end-to-end test `crates/wren/tests/e2e.rs`.
 
 ### 8.2 Conformance classes
 
-* **Conforming server.** It MUST implement §1.2, §1.3, §2.1, §3.2 to §3.5,
-  every endpoint of §4 with the semantics stated there, §5, the status mapping
-  of §6.2 (404 for nonexistent things, 400 for malformed requests, 500 for
-  server faults, 401 for authentication failures, ErrorBody for handler errors),
-  and the marking rule of §7.2. Its query answers
-  MUST agree with the git oracles of §8.1.
+* **Conforming server.** It MUST implement §1.2 (both headers), §1.3, §2.1,
+  §3.2 to §3.5, every endpoint of §4 with the semantics stated there, §4.0.8,
+  §5, the status mapping of §6.2 (404 for nonexistent things, 400 for
+  malformed requests, 500 for server faults, 401 for authentication failures,
+  ErrorBody with `code` for handler errors), the marking rule of §7.2, and the
+  semantics rule of §7.3. On-demand sync (§4.0.7) is OPTIONAL and signalled by
+  the `on-demand-sync` feature. Its query answers MUST agree with the git
+  oracles of §8.1.
 * **Conforming cache.** It MUST implement the same routes (§2.2), MUST relay
-  responses unaltered, MUST NOT serve stored query responses that upstream did
-  not mark immutable, SHOULD verify objects before storing them, and reports
-  upstream failures as `502` (§6.3).
+  responses unaltered (including `Cache-Control`, `wren-semantics`, and
+  `wren-synced-at`), MUST NOT serve stored query responses that upstream did
+  not mark immutable, MUST key stored query responses by semantics version
+  (§7.2), SHOULD verify objects before storing them, and reports upstream
+  failures as `502` (§6.3).
 * **Conforming client.** It MUST verify object hashes (§3.4), MUST handle
   `missing` frames, MUST NOT send more than 10 000 oids per batch, MUST ignore
-  unknown JSON fields and feature flags, and SHOULD check `wren-protocol` /
-  `protocol`.
+  unknown JSON fields and feature flags, MUST accept unknown error codes, and
+  SHOULD check
+  `wren-protocol` / `protocol`.
 
 A third-party implementation can reuse `differential.rs` as a template: replace
 the in-process `Repo` calls with HTTP calls to the implementation under test.
@@ -1361,7 +1639,8 @@ the existing `object-info`. The query endpoints could similarly become v2
 commands (`merge-base`, `is-ancestor`, `log-first-parent`, `blame-first-parent`,
 `landed`, `bisect-step`), each taking oids and returning oids. That would let
 any git server that implements them act as a Wren server without a separate HTTP
-API.
+API. [A draft proposal](../upstream/git-protocol-v2-query.md), not yet sent to
+the git list, works this out in more detail.
 
 **Forge REST APIs.** A forge could serve the `/api/v1/repos/{repo}/...` endpoints
 directly, with `{repo}` mapped to `owner%2Fname` or a project id. Several
@@ -1369,8 +1648,9 @@ endpoints overlap with what forges already expose. For example, GitHub's
 "compare two commits" returns a merge-base commit, and GitLab has a repository
 `merge_base` endpoint. The distinguishing requirements a forge would need to
 meet are: first-parent semantics for log, blame, and changesets; the
-`landed` and `bisect` operations; `Cache-Control: immutable` on pinned queries;
-and answers that match git exactly (§8). Forge-specific refs (`refs/pull/*`)
+`landed` and `bisect` operations; `Cache-Control: immutable` on pinned queries,
+together with a semantics version (§7.3); and answers that match git exactly
+(§8). Forge-specific refs (`refs/pull/*`)
 are outside v1's ref model. A forge would likely also want per-repository
 object authorization, which v1 does not provide (§13, item 10).
 
@@ -1384,7 +1664,8 @@ object authorization, which v1 does not provide (§13, item 10).
   20-byte oids (§1.5).
 * **Read-only.** There are no server-side writes: no push, no ref updates, no
   commit creation. Writes go to the upstream git host with ordinary git, and
-  reach Wren through `sync` (§4.14). Checkouts created with `--git` are
+  reach Wren through sync: periodic, on demand when a request names an unknown
+  revision (§4.0.7), or explicit (§4.14). Checkouts created with `--git` are
   configured for this.
 * **No rename or copy following.** Rename and copy detection is absent from
   `log?path=`, `blame`, `diff`, and changesets. A rename is a delete plus an add.
@@ -1395,8 +1676,11 @@ object authorization, which v1 does not provide (§13, item 10).
 * **No submodule content.** Gitlinks are reported but never followed.
 * **No objects of 4 GiB or more.** The 32-bit frame length cannot carry them
   (§3.2, §13 item 24).
-* **Lossy text.** Non-UTF-8 paths, messages, and blame content are converted
-  lossily in JSON (§13, item 15).
+* **Lossy text.** Non-UTF-8 paths, messages, blame content, and grep lines are
+  converted lossily in JSON (§13, item 15).
+* **grep is not git grep.** Patterns use Rust `regex` syntax, not POSIX regular
+  expressions. There are no `git grep` options beyond `ignore_case`, and binary
+  files are skipped rather than reported (§4.15).
 
 ---
 
@@ -1412,9 +1696,19 @@ object authorization, which v1 does not provide (§13, item 10).
 * **Transport.** Tokens are sent in clear on plain HTTP. Deployments outside
   loopback SHOULD use TLS. The reference server logs a warning when it listens
   on a non-loopback address without a token.
+* **Caching and tokens.** A tier with a token marks immutable answers
+  `private` (§7.2), so shared HTTP caches and CDNs do not keep them. A Wren
+  cache stores them anyway. A cache without a client token, in front of a
+  server with a token, exposes everything the server serves to anyone who can
+  reach the cache, and marks its stored answers `public`. Such a cache needs
+  its own token.
 * **Denial of service.** `POST .../sync` triggers an upstream fetch and is
-  available to any authenticated client. Batch requests are bounded at 10 000
-  oids, and `log` at 10 000 commits. Blame diffs are time-bounded.
+  available to any authenticated client. So does any query naming an unknown
+  revision (§4.0.7), at most once per second per repository. Batch requests are
+  bounded at 10 000 oids, `log` at 10 000 commits, and `grep` at 10 000
+  matches. Blame and grep have no time bound: a blame walks the file's whole
+  first-parent history, and a grep reads every file under `path` until it has
+  `limit` matches.
 
 ---
 
@@ -1447,6 +1741,7 @@ served by the reference server as `demo`:
 | `bisect?good=c79f…&bad=136c…` | `next = 87f3f060` (depth 1 = 0 + ⌊3/2⌋), `candidates = 2`, `steps_left = 2` |
 | `bisect?good=3850…&bad=136c…` | `next = 87f3f060`, `candidates = 2`. `good` (on the feature branch) only vouches for its own ancestors, so the lower bound is `c79f1816`, the newest main commit it contains, and not the merge `f5a00745` |
 | `bisect?good=136c…&bad=3850…` | `400`: `bad` is an ancestor of `good` |
+| `grep?pattern=^t&path=src/a.txt&rev=136c…` | lines 3 `two` and 4 `three` of `src/a.txt`, `truncated: false` ([§4.15](#415-grep)) |
 
 ---
 
@@ -1457,9 +1752,9 @@ or diverges from git or from this document's intent. The behaviour described in
 the body of this document is the **current** behaviour. Item numbers are stable
 across drafts: resolved items move to §13.1 and their numbers are not reused.
 
-### 13.1 Resolved since first draft
+### 13.1 Resolved
 
-| # | First-draft issue | Resolution in the current code |
+| # | Issue | Resolution in the current code |
 |---|---|---|
 | 1 | Revision suffix parsing accepted garbage (`main~1x` meant `main~1^1`, and `main^{commit}` walked nine parents). | Strict grammar: only `~N`, `^N`, `^{commit}`, `^{}` are accepted after the base. Anything else, or a digit overflow, is `400`. `~N` past the root and a nonexistent `^N` are `404` (§5.1, §5.3). |
 | 2 | A ref named like a 40-hex id could shadow the commit, although `is_pinned` treated the id as immutable. | A full 40-hex revision always names that commit: `404` if it is not a known changeset, and it is never looked up as a ref (§5.2 rule 2). |
@@ -1473,15 +1768,17 @@ across drafts: resolved items move to §13.1 and their numbers are not reused.
 | 12 | `mode` was a decimal integer in changes but an octal string in tree listings. | Both are six-digit octal strings such as `"100644"` (§4.0.5). |
 | 14 | Bisect assumed `landed(good, bad)` was good, which is wrong when `good` is off the first-parent chain. | The lower bound is the newest commit on `bad`'s first-parent chain that is an ancestor of `good` (`newest_chain_ancestor`). `good` need not be an ancestor of `bad`. The error cases are `400` (§4.9). |
 | 13 (part) | Bisect, `depth`, and revision edge cases were untested. | `differential.rs` now checks `depth` against `git rev-list --first-parent --count`, the peeling and strictness edge cases of §5, and bisect convergence against a git-computed expectation (§8.1). The remainder is still open as item 13. |
+| 21 | The cache relayed `Cache-Control` only when it contained `immutable`, and dropped other values such as `no-store`. | The cache relays the upstream `Cache-Control` value unchanged, together with `wren-semantics` and `wren-synced-at` (§2.2, §7.2). |
+| 26 | Pinned answers changed between drafts (#9, #12, #14, blame's switch to git's line diff), which per §7.3 would have needed a new protocol major version, and caches had to be wiped by hand. | Answers now carry a query semantics version (`wren-semantics`, `QUERY_SEMANTICS`). A server that changes answers bumps it instead of the protocol version, and Wren caches key stored answers by it (§7.3). What remains for HTTP caches outside Wren is item 28. |
 
 ### 13.2 Still open
 
 * **#5. Not every error uses ErrorBody.** Framework-generated errors return
-  `text/plain` or empty bodies: query-parameter parse failures (`400`), JSON
-  body rejections on `POST /v1/objects` (`400`/`415`/`422`), unknown routes
-  (`404`, empty), and wrong methods (`405`, empty). Clients that parse
-  `{"error":…}` must fall back to the raw body, which the reference client
-  does.
+  `text/plain` or empty bodies, and carry no `code`: query-parameter parse
+  failures (`400`), JSON body rejections on `POST /v1/objects`
+  (`400`/`415`/`422`), unknown routes (`404`, empty), and wrong methods
+  (`405`, empty). See §6.1. Clients that parse `{"error":…}` must fall back to
+  the raw body and the status code, which the reference client does.
 * **#10. No per-repository object scoping.** `/v1/objects` serves any object in the
   shared store, and tokens are server-wide. This is fine for one trust domain,
   but blocks forge adoption, where repositories have different readers. Fixing it
@@ -1489,15 +1786,17 @@ across drafts: resolved items move to §13.1 and their numbers are not reused.
   therefore a major version.
 * **#13. Remaining conformance gaps.** These are still not compared against git:
   `generation`, `tree`, `file`, CommitInfo field values (signatures, message),
-  the patch text, bisect's per-step fields (`next`, `candidates`,
-  `steps_left`), and the exact status codes of failing revisions.
-  `differential.rs` still calls `wren-core` in-process, not the HTTP layer, so
-  the caching rules, `no-store`, the 400/404/500/502 mapping, and cache
-  behaviour are covered only by smoke tests in `e2e.rs`, if at all.
-* **#15. Lossy text conversion.** Paths, commit messages, names, and blame lines are
-  converted to UTF-8 lossily. Non-UTF-8 file names cannot be addressed through
-  `path`. Unparsable signature times become `0`. The commit `encoding` header is
-  ignored. Blame strips *all* trailing `\r`/`\n` characters from each line.
+  the patch text, grep's `text` field, bisect's per-step fields (`next`,
+  `candidates`, `steps_left`), and the exact status codes of failing
+  revisions. `differential.rs` still calls `wren-core` in-process, not the
+  HTTP layer, so the caching rules, the semantics key, the 400/404/500/502
+  mapping, error codes, `wren-synced-at`, on-demand sync, and cache behaviour
+  are covered only by smoke tests in `e2e.rs`, if at all.
+* **#15. Lossy text conversion.** Paths, commit messages, names, blame lines,
+  and grep lines are converted to UTF-8 lossily. Non-UTF-8 file names cannot be
+  addressed through `path`. Unparsable signature times become `0`. The commit
+  `encoding` header is ignored. Blame strips *all* trailing `\r`/`\n`
+  characters from each line; grep strips one `\r`.
 * **#16. Patch output is not git-compatible.** It has no `index` lines, uses its own
   binary detection, decodes lossily, and may differ for mode-only changes. Either
   specify the format exactly or document it as presentation-only (as §4.10 does
@@ -1506,41 +1805,38 @@ across drafts: resolved items move to §13.1 and their numbers are not reused.
   frame layout and `Oid` type are fixed at 20 bytes. It is undecided whether a
   SHA-256 deployment would be v1 with `object_format: "sha256"` and 32-byte
   frame oids, or necessarily v2.
-* **#18. `/v1/stats` exists only on caches.** That is a deliberate exception to
-  "identical RPCs", but it is not advertised in `features`. Also, a cache
-  advertises the same static `features` and `protocol` as the server without
-  checking its upstream's `wren-protocol` header, so a v1 cache in front of a
+* **#18. `/v1/stats` exists only on caches, and caches advertise static
+  capabilities.** `/v1/stats` is a deliberate exception to "identical RPCs",
+  but it is not advertised in `features`. A cache now learns `semantics` from
+  its upstream (§7.2), but it still advertises its own static `features` and
+  `protocol` without checking the upstream's, so a v1 cache in front of a
   future v2 server would advertise features it cannot relay.
 * **#19. `is_pinned` works on raw strings.** It does not percent-decode, accepts only
   lowercase (uppercase full ids now name the same commit, but are not pinned),
   and counts revision-named parameters even on endpoints that ignore them. All of
   these are conservative: they lose cacheability but never cause wrong caching.
-  Separately, the cache key is the raw `path?query`, so equivalent requests
-  with reordered parameters are cached separately.
+  Separately, the cache key is the semantics version plus the raw
+  `path?query`, so equivalent requests with reordered parameters are cached
+  separately.
 * **#20. `log` limit clamping is silent.** `limit > 10000` is silently reduced, and
   there is no indication that the result was truncated. A cursor or a `truncated`
-  flag would be a non-breaking addition.
+  flag (as `grep` has) would be a non-breaking addition.
 
-New in this draft:
+Added in the second draft:
 
-* ~~**#21. The cache drops `Cache-Control: no-store` when relaying.**~~ **Resolved:** the reference cache now relays the upstream `Cache-Control` value unchanged. The reference
-  cache's query proxy relays `Cache-Control` only if it contains `immutable`.
-  The `no-store` that the server then put on an inexact blame (no longer sent, §4.11) was therefore
-  removed. The Wren cache itself still never stores that response, because it is
-  not immutable. But HTTP caches or CDNs below a Wren cache no longer see the
-  instruction, and could cache the response heuristically. §2.2 says a cache
-  SHOULD preserve other `Cache-Control` values.
 * **#22. Revision error status depends on evaluation order.** The base is resolved,
   and suffixes are applied, before the rest of the string is syntax-checked. So
   `nope~x` and `main~9x` (depth < 9) are `404`, while `main~1x` is `400`. A
   whole-string syntax check before lookup would make malformed revisions
-  consistently `400`.
-* **#23. Some errors may be misclassified as `500`.** Under the new mapping, any
-  error not explicitly tagged becomes `500`. `POST .../sync` on a repository
-  without an upstream (`repo has no upstream`) is a `500`, but is arguably a
-  client error (`400`/`409`). A failed upstream `git fetch` during `sync` is a
-  `500`, but is arguably `502`. Any future client-caused error that is not
-  wrapped in `BadRequest` will also surface as `500`.
+  consistently `400`. Because `404` now triggers an on-demand sync (§4.0.7),
+  such malformed revisions can also cause an upstream fetch.
+* **#23. Some errors may be misclassified as `500`.** Under the current mapping, any
+  error not explicitly tagged becomes `500` (code `internal`). `POST .../sync`
+  on a repository without an upstream (`repo has no upstream`) is a `500`, but
+  is arguably a client error (`400`/`409`). A failed upstream `git fetch`
+  during `sync` is a `500`, but is arguably `502` (`upstream_unavailable`).
+  Any future client-caused error that is not wrapped in `BadRequest` will also
+  surface as `500`.
 * **#24. Objects of 4 GiB or more are unfetchable, and fail whole batches.**
   `encode_frame` now errors instead of truncating, but the error aborts the entire
   `POST /v1/objects` response with `500`. One oversized object therefore makes
@@ -1552,14 +1848,20 @@ New in this draft:
   descendant was marked good, because each step is computed only from
   `(good, bad)`. This is by design, since it keeps the endpoint pinned and
   cacheable, but it is worth stating.
-* **#26. Pinned answers changed between drafts.** **Decided:** v1 is a draft and not frozen until the first tagged release (see the header). No deployment predates these changes. Fixes #12 (`mode` type), #9
-  (new `exact` field), #14 (bisect lower bound), and the switch of blame's line
-  diff from a minimal Myers diff to git's default diff (§4.11, which moves some
-  lines' attribution) changed the bodies of
-  already-answerable pinned queries (`commits?changes=true`, `log?changes=true`,
-  `diff`, `blame`, `bisect`). Per §1.4 and §7.3, that is a breaking change within
-  `/api/v1`. It is acceptable only if no v1 deployment or client predates it.
-  Otherwise, Wren caches (and any HTTP cache) populated earlier will serve the
-  old answers forever, so they must be wiped on upgrade, and integer-`mode`
-  clients will break. This should be decided and recorded explicitly, for
-  example as "v1 is not yet frozen".
+
+Added in the third draft:
+
+* **#27. A cache's own responses carry its built-in semantics version.** The
+  reference cache relays `wren-semantics` on forwarded query responses and
+  sends the key's version on stored ones. On everything it answers itself
+  (`/v1/capabilities`, objects, `/v1/stats`, `/healthz`, its own errors), it
+  sends its own `QUERY_SEMANTICS`. Its `/v1/capabilities` body, by contrast,
+  reports the version learned from upstream. The two differ when the cache and
+  the server are different builds.
+* **#28. Semantics changes are invisible to caches outside Wren.** HTTP caches
+  and CDNs key by URL, not by `wren-semantics`, so after a semantics bump they
+  may serve an old `public` answer until it expires (one year). Wren caches
+  never delete entries stored under an old version; those entries only become
+  unreachable and use disk until the cache directory is cleared. Options:
+  put the semantics version in the URL, send `Vary` on a request header, or
+  use a shorter `max-age`.
