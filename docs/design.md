@@ -199,6 +199,8 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 7. 新的历史查询必须用 derived data 或索引实现，禁止线性扫描 commit log。
 8. 每个查询 API 都必须有对 git 的差分测试。
 9. 派生出的 tree 和 commit 对象必须复现 git 的 id；复现不了的只能写入覆盖值（`tree_override`、`raw_commit`），不能改 id。changeset 的字段按原样字节保存，不做编码转换。
+10. 任何 ref 移动都必须经过 CAS。写代理模式下先对 git 主机做 `--force-with-lease`，主机接受之后 Wren 的 ref 才跟进；land 抢输就重新 rebase，不加锁。
+11. 服务端创建的 changeset，其变更记录必须与两棵树的 diff 完全一致（创建时校验）；每个写 API 都必须有对 git 的差分测试（`git commit`、`git merge-tree`）。
 
 ## 9. 测试
 

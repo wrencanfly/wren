@@ -216,6 +216,21 @@ commit 对象；它的哈希必须等于 `changesets.oid`。commit 对象不持�
   提交，而且每个 CAS 都可线性化。
 - 端到端：agent 只靠 MCP 完成"修改 → commit → land"，全程没有任何检出。
 
+**核心实测（2026-10-14，`crates/wren-core/tests/writes.rs`）：**
+
+| 门槛 | 结果 |
+|---|---|
+| 服务端创建 = `git commit` | ✅ 60 轮随机改动（修改、新增、删除、可执行位、软链接、文件和目录互换），commit id 与 git 完全相同；重复创建是幂等的 |
+| rebase 对 `git merge-tree --merge-base` | ✅ 80 轮重叠修改：47 轮干净（tree 相同），33 轮冲突（冲突路径集合相同） |
+| 并发 land | ✅ 12 个线程同时 land 到 `main`：全部落地，历史线性，git 主机与 Wren 一致，`git fsck` 通过。抢输的一方重新 rebase 后重试，无锁 |
+| 主机被直接推送过 | ✅ 第一次推送 lease 失败，同步后 rebase 到主机的新提交上，第二次成功 |
+| revert | ✅ 与 git 的三方合并结果一致 |
+
+实现时的取舍：
+- 冲突文件的三方合并调用 `git merge-file`，与 git 的合并算法逐字节一致，代价是每个双方都改过的文件启动一次进程。
+- receive-pack 在 ref 事务里抢输时报 `incorrect old value provided`，与客户端 lease 失败一样按"ref 已移动"处理并重试。
+- land 只接受线性的 changeset 串；服务端还不创建 merge 提交。
+
 ---
 
 ## 4. M3：存储可扩展
