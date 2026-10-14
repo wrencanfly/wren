@@ -9,9 +9,14 @@ It also suggests that "Git platforms can provide comprehensive server-side
 RPCs like Scion, perhaps even in a standardized way across forges that the
 git client can learn to talk to."
 
-Wren is an attempt to do that in the open. It adds Scion's read path in front
-of an unmodified git host. Wren is an independent project, and Anthropic has
-not reviewed or endorsed it.
+Wren is an independent, open-source implementation of the Scion
+architecture for git. It follows the migration order the article describes:
+first the server answers metadata queries in front of an unmodified git host,
+then it takes over writes, then storage, caching and the source of truth.
+Wren has Scion's read path and, since M2, its write path (with the git host
+still the source of truth). The [migration plan](design-scion-migration.md)
+covers the rest. Wren is not affiliated with Anthropic, contains no
+Anthropic code, and Anthropic has not reviewed or endorsed it.
 
 This page checks Wren against each principle in the article. **Follows**
 means Wren implements it. **Partial** means it is implemented with a stated

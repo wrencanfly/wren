@@ -27,11 +27,10 @@ Wren 是独立项目，与 Anthropic 无关，也没有得到其背书。
 - 权威 server 的对象存储里有一份完整的对象集，并且是 loose 格式：git/git 占 4.7 GB，打成 pack 约 313 MiB，相差约 15 倍（见 benchmarks.md 的 Costs 一节）。
 - **单一信任域**：token 不区分仓库，对象存储跨仓库共享，force-push 掉的对象仍然可读。每个信任域部署一套 Wren。
 
-**非目标（v0.1）**
+**非目标与方向调整**
 
-- 取代 git 托管，或成为权威源。写入仍然走 `git push` 到源站，Wren 只是只读镜像加计算层。原文的建议是"不偏离 git 的整体模型"，所以这条不做。
-- 服务端提交、无锁合入、目录级 ACL、merge queue、code review。
-- 虚拟文件系统（FUSE / FSKit / ProjFS）。
+- v0.1 曾把"取代 git 托管、成为权威源、服务端提交"列为非目标。2026-10-13 起方向改为全面向 Scion 迁移，见 [design-scion-migration.md](design-scion-migration.md)。M2 已实现服务端提交、rebase、land、revert（写代理模式：git 主机仍是权威源，Wren 先用 `--force-with-lease` 推给它）。
+- 仍然不做：merge queue、code review。虚拟文件系统（M7）可选。
 
 ## 2. 组件
 
@@ -260,10 +259,4 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 
 ## 12. 路线图
 
-| 方向 | 内容 |
-|---|---|
-| 上游 | 发出 sparse/promisor 报告；写一份 git protocol v2 扩展提案：`query` 命令族、want-only 拉取的 `missing-ok`、用 promisor-remote 宣告缓存层。目标是让原生 git 客户端能直接用这些 RPC |
-| 代价 | delta 帧（增量拉取）；pack 化存储；按仓库授权；空间回收（引用计数加 LRU） |
-| 合入后测试 | 基于 `landed` 和 `bisect` 的 `culprit` 工作流 |
-| 扩展 | 只在有真实部署方需要时再做：S3/GCS 对象后端、Postgres 元数据、多个 server、缓存层 singleflight |
-| 不做 | 虚拟文件系统；服务端提交；成为权威源；merge queue；code review |
+见 [design-scion-migration.md](design-scion-migration.md)：M1（派生树）和 M2（服务端写入）已完成；接下来是 M3 存储、M4 节点 daemon、M5 数据源翻转和 git 协议前端、M6 派生数据扩展和权限、M7 虚拟化检出（可选）。上游工作（sparse/promisor 报告、protocol v2 提案）照旧。不做：merge queue、code review。

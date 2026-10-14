@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <b>Server-side source control queries for git, in the style of Anthropic's Scion.</b><br>
-  History, blame, grep and bisect without a clone, for agents and CI.
+  <b>An independent, open-source implementation of the Scion architecture for git.</b><br>
+  Commit, land, blame, grep and bisect on the server, without a clone. Built for agents and CI.
 </p>
 
 <p align="center">
@@ -28,15 +28,32 @@
 
 ---
 
-Wren runs in front of an existing git host and answers source control
-questions on the server. A CI job or an AI agent can ask for log, blame,
-grep, diff, merge-base, "which merge brought this into main?" or a bisect
-step without cloning anything. When a job does need files, it fetches only
-the objects it reads, through cache tiers that all speak the same RPC, and
-gets a normal git working tree.
+Wren implements, in the open, the source control architecture Anthropic
+describes for **Scion**, its in-house system, in
+[Redesigning source control at Anthropic](https://www.anthropic.com/engineering/redesigning-source-control).
+Like Scion, Wren keeps clients thin and puts the work on the server:
 
-Your git host stays the source of truth. Wren is read-only, and writes still
-go through `git push`.
+- **History on the server.** Log, blame, diff, merge-base, "which merge
+  brought this into main?" and bisect are answered from server-side indexes.
+  Nothing is cloned.
+- **Writes on the server.** Commits are created from "parent + changed
+  files", then rebased, landed and reverted on the server, with no checkout
+  and no lock.
+- **Changesets, with derived trees.** A changeset records what changed
+  relative to its first parent; trees and commit objects are derived from it.
+- **Want-only checkouts through cache tiers that all speak the same RPC.**
+  A job fetches only the objects it reads.
+
+Unlike Scion, Wren stays git all the way through. Commit ids are git ids,
+objects are git objects, and checkouts are normal git working trees. Today
+Wren runs in front of your existing git host, which stays the source of truth:
+Wren lands commits on it with `--force-with-lease`. The
+[migration plan](docs/design-scion-migration.md) takes Wren the rest of the
+way to Scion's design, one milestone at a time.
+
+> Wren is an independent project. It is not affiliated with or endorsed by
+> Anthropic and contains no Anthropic code. "Scion" refers to the system
+> described in Anthropic's article.
 
 ## Why
 
@@ -50,21 +67,36 @@ across forges that the git client can learn to talk to."
 Wren is a working, open implementation of those server-side RPCs that you can
 run today, and a concrete starting point for standardizing them.
 [docs/principles.md](docs/principles.md) checks Wren against each Scion
-principle and lists what it deliberately leaves out.
+principle and says where it still differs.
 
-Wren is an independent project. It is not affiliated with or endorsed by
-Anthropic.
+### Progress toward Scion's design
+
+| Scion | Wren | |
+|---|---|---|
+| Metadata queries answered by the server (history, blame, ancestry) | Log, blame, diff, merge-base, `landed`, bisect, grep | ✅ |
+| Changesets relative to the first parent; trees are derived data | Changesets keep no tree; trees and commits are derived and checked against git's ids | ✅ M1 |
+| Every commit, rebase and revert happens on the server; refs move by compare-and-swap | Server-side commit, rebase, land and revert; the git host is updated first (write proxy) | ✅ M2 |
+| Want-only object protocol; identical RPCs at every cache tier | `wren cache` tiers, per-object verification, resumable | ✅ |
+| No packfiles and no maintenance; contents in object storage; distributed metadata | Loose objects on one host today; segment storage, object storage and Postgres planned | M3 |
+| A daemon per node with a bounded cache, seeded from snapshots; strict tiering | Planned, with deterministic simulation tests | M4 |
+| The server is the source of truth; older git clients still work | Planned: a git protocol front end, with the git host as a downstream mirror | M5 |
+| Path history, copy detection and search indexes; directory permissions | Planned | M6 |
+| Virtualized checkouts | Optional | M7 |
 
 |  |  |
 |---|---|
+| **Commit without a checkout** | Send "parent + changed files"; Wren derives the tree, rebases onto the branch tip with git's own three-way merge, and lands with a compare-and-swap. Concurrent lands never take a lock. |
 | **Ask history without a clone** | Log by path, blame, diff, merge-base, ancestry, `landed` and bisect are answered from server-side indexes: changesets, a commit graph with skip lists, a path index, and persisted blame. |
 | **Search and read at any revision** | `grep`, `cat` and `ls` at any commit, with no checkout. |
 | **Bounded, cacheable answers for agents** | MCP tools pin revisions to full commit ids, so answers are immutable and served by caches. Line ranges and output caps keep token use predictable. |
 | **Check out only what you read** | A want-only object protocol through same-RPC cache tiers. `--git` checkouts are stock git working trees with a sparse index, so `git status`, `commit` and `push` work. |
-| **Verified against git** | A seeded differential fuzz suite generates random histories and checks every answer against git itself. |
+| **Verified against git** | A seeded differential fuzz suite checks every answer against git itself. Server-made commits have the ids `git commit` would give them, rebases agree with `git merge-tree`, and all 85,545 commits of git/git round-trip through changesets. |
 
 > [!IMPORTANT]
 > **v0.1, experimental. Read this before you deploy.**
+> - **Writes are off by default.** They need `--write-token` on the server.
+>   In write-proxy mode the git host's branch protections still apply, because
+>   Wren pushes to it like any client.
 > - **One trust domain.** A token can read every repository on a server, and
 >   the object store is shared across repositories. Run one Wren per trust
 >   domain.
@@ -85,6 +117,7 @@ export PATH=$PWD/target/release:$PATH
 
 # 1. Serve a repository mirrored from any git URL (or local path).
 export WREN_TOKEN=$(openssl rand -hex 16)
+export WREN_WRITE_TOKEN=$(openssl rand -hex 16)   # optional: enables writes
 wren server --data ./wren-data --repo git=https://github.com/git/git.git &
 
 # 2. Optional: a cache tier. Same RPCs, so clients can't tell the difference.
@@ -111,7 +144,7 @@ host upstream, the host is updated first with `--force-with-lease`. Writes go
 to the server, not a cache, and need its write token.
 
 ```sh
-export WREN_WRITE_SERVER=http://127.0.0.1:7070 WREN_WRITE_TOKEN=…
+export WREN_WRITE_SERVER=http://127.0.0.1:7070   # the server, not a cache
 export WREN_AUTHOR="Ada Lovelace <ada@example.com>"
 wren commit -m "Fix typo" --land master --set README.md=./README.md
 wren commit -m "Drop script" --parent master --delete ci/old.sh   # prints the commit id
@@ -174,7 +207,9 @@ tells the agent to read them at the branch tip and commit again.
 
 ```mermaid
 flowchart LR
-  host[(git host)] -- fetch --> server["wren server<br/><small>changesets · commit graph<br/>path index · blame</small>"]
+  host[(git host)] -- fetch --> server["wren server<br/><small>changesets · derived trees<br/>commit graph · path index · blame</small>"]
+  server -- "land (--force-with-lease)" --> host
+  mcp -. "commit / land / revert<br/>(control plane)" .-> server
   server -- same RPC --> region["wren cache<br/><small>region</small>"]
   region -- same RPC --> node["wren cache<br/><small>node</small>"]
   node --> cli[wren CLI]
@@ -187,7 +222,15 @@ flowchart LR
   path index is written in the same transaction. A changeset does not point
   to a tree: trees and commit objects are derived from it, and ingest checks
   that they reproduce git's ids.
-- **Derived data.** The commit graph (generation numbers and first-parent
+- **Server-side writes.** A new changeset is "parent + changed files"; its
+  tree is derived by copying only the paths that changed. `land` replays a
+  stack onto the branch tip, looking only at the paths it touched, uses
+  `git merge-file` for files changed on both sides, and moves the branch with
+  a compare-and-swap. With a git host upstream, the host is updated first
+  (`--force-with-lease` is checked inside receive-pack) and Wren's ref
+  follows. A lost race costs one more rebase, never a lock. Caches refuse
+  writes, so a cache's credentials can never be used to write.
+- **Derived data.** Trees are derived from changesets. The commit graph (generation numbers and first-parent
   skip lists) is derived recursively from parents. Blame is derived lazily:
   the file's change chain is read in one pass over the path index, each
   change costs one line diff, and the result plus a checkpoint every 32
@@ -231,23 +274,30 @@ caveats are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Roadmap
 
-- **Upstream.** Send the [sparse/promisor report](docs/upstream/git-sparse-promisor.md)
-  to the git list. Refine the [draft git protocol v2 extensions](docs/upstream/git-protocol-v2-query.md):
-  a `query` command, more `object-info` attributes, and `missing-ok` for
-  fetches. Add a `git-upload-pack` v2 front end so that stock git clients can
-  use these RPCs.
-- **Costs.** Delta frames for incremental fetches, packed storage, and
-  per-repository authorization.
-- **Post-merge testing.** Build a `culprit` workflow on `landed` and `bisect`.
+The [migration plan](docs/design-scion-migration.md) has the details and the
+gates for each milestone.
 
-Not planned: virtual filesystems, server-side commits, becoming the source of
-truth, merge queues and code review.
+- **M3, storage.** Append-only segment storage with per-path deltas,
+  object-storage backends and Postgres metadata, so several stateless
+  servers can share one repository.
+- **M4, node daemon.** A bounded per-node cache seeded from snapshots, strict
+  tiering, and deterministic simulation tests with fault injection.
+- **M5, source of truth.** A git protocol front end so stock git can clone,
+  fetch and push through Wren, with the git host as a downstream mirror.
+- **M6, indexes and permissions.** Path history through the derived-data
+  mechanism, copy and rename detection, search indexes, directory ACLs.
+- **Upstream.** Send the [sparse/promisor report](docs/upstream/git-sparse-promisor.md)
+  to the git list, and refine the [draft git protocol v2 extensions](docs/upstream/git-protocol-v2-query.md).
+
+Not planned: merge queues and code review. Virtualized checkouts (M7) are
+optional.
 
 ## Documentation
 
 | | |
 |---|---|
-| [Scion principles](docs/principles.md) | How Wren maps to each Scion principle, and where it deliberately differs |
+| [Scion principles](docs/principles.md) | How Wren maps to each Scion principle, and where it still differs |
+| [Migration plan](docs/design-scion-migration.md) | Milestones M1–M7 toward Scion's design, decisions and measured results (Chinese) |
 | [API reference](docs/spec/wren-protocol-v1.md) | Endpoints, wire format and caching rules (draft, unstable) |
 | [Benchmarks](docs/benchmarks.md) | Method, results, costs and corrections |
 | [Design](docs/design.md) | Data model, invariants, limitations (Chinese) |
