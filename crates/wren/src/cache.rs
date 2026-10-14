@@ -162,14 +162,31 @@ impl CacheState {
         rb
     }
 
-    /// Fetch `oids` from the upstream tier and store them. Returns the frames.
-    async fn fetch_upstream(&self, oids: &[Oid]) -> Result<Vec<(Oid, Option<Vec<u8>>)>> {
+    /// Fetch `oids` from the upstream tier and store them, verified.
+    /// `bases[i]` is passed on as the delta hint for `oids[i]` only when
+    /// this cache holds that base itself: every tier stores whole objects,
+    /// so a delta from upstream must be applicable here.
+    async fn fetch_upstream(&self, oids: &[Oid], bases: &[Option<Oid>]) -> Result<()> {
         let _permit = self.upstream_permits.acquire().await?;
         self.stats.upstream_requests.fetch_add(1, Ordering::Relaxed);
+        let store = self.store.clone();
+        let bases = bases.to_vec();
+        let bases = tokio::task::spawn_blocking(move || {
+            bases
+                .into_iter()
+                .map(|b| b.filter(|b| store.has(b)))
+                .collect::<Vec<_>>()
+        })
+        .await?;
         let resp = self
             .upstream_request(reqwest::Method::POST, "/v1/objects")
             .json(&ObjectsRequest {
                 oids: oids.to_vec(),
+                bases: if bases.iter().any(Option::is_some) {
+                    bases
+                } else {
+                    Vec::new()
+                },
             })
             .send()
             .await
@@ -182,19 +199,17 @@ impl CacheState {
         let frames = dec.push(&body)?;
         dec.finish()?;
         let store = self.store.clone();
-        let frames = tokio::task::spawn_blocking(move || -> Result<_> {
+        tokio::task::spawn_blocking(move || -> Result<()> {
             // Verify once, on the miss path only (rare in steady state): a
             // corrupt or truncated upstream response must not be cached
             // forever.
-            for (oid, raw) in &frames {
-                if let Some(raw) = raw {
-                    store.put_raw_verified(oid, raw)?;
-                }
+            for (oid, payload) in &frames {
+                wire::store_frame(&store, oid, payload)?;
             }
-            Ok(frames)
+            Ok(())
         })
         .await??;
-        Ok(frames)
+        Ok(())
     }
 }
 
@@ -210,20 +225,17 @@ async fn objects_batch(
     }
     let store = st.store.clone();
     let oids = req.oids.clone();
-    let mut found: Vec<Option<Vec<u8>>> = tokio::task::spawn_blocking(move || {
-        oids.iter()
-            .map(|o| store.get_raw(o))
-            .collect::<Result<Vec<_>>>()
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))??;
-    let missing: Vec<Oid> = req
-        .oids
-        .iter()
-        .zip(&found)
-        .filter(|(_, f)| f.is_none())
-        .map(|(o, _)| *o)
-        .collect();
+    let present: Vec<bool> =
+        tokio::task::spawn_blocking(move || oids.iter().map(|o| store.has(o)).collect::<Vec<_>>())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (mut missing, mut missing_bases) = (Vec::new(), Vec::new());
+    for (i, oid) in req.oids.iter().enumerate() {
+        if !present[i] {
+            missing.push(*oid);
+            missing_bases.push(req.base(i));
+        }
+    }
     st.stats
         .hits
         .fetch_add((req.oids.len() - missing.len()) as u64, Ordering::Relaxed);
@@ -231,22 +243,22 @@ async fn objects_batch(
         .misses
         .fetch_add(missing.len() as u64, Ordering::Relaxed);
     if !missing.is_empty() {
-        let fetched: std::collections::HashMap<Oid, Option<Vec<u8>>> = st
-            .fetch_upstream(&missing)
+        st.fetch_upstream(&missing, &missing_bases)
             .await
-            .map_err(upstream_error)?
-            .into_iter()
-            .collect();
-        for (oid, slot) in req.oids.iter().zip(found.iter_mut()) {
-            if slot.is_none() {
-                *slot = fetched.get(oid).cloned().flatten();
-            }
+            .map_err(upstream_error)?;
+    }
+    // Everything is now whole in this cache (or missing upstream too).
+    // Answer from the store, with deltas against the requester's bases.
+    let store = st.store.clone();
+    let body = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        for (i, oid) in req.oids.iter().enumerate() {
+            wire::encode_from_store(&mut body, &store, oid, req.base(i))?;
         }
-    }
-    let mut body = Vec::new();
-    for (oid, raw) in req.oids.iter().zip(&found) {
-        wire::encode_frame(&mut body, oid, raw.as_deref())?;
-    }
+        Ok(body)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))??;
     Ok(objects_response(body))
 }
 
@@ -261,11 +273,10 @@ async fn object_one(State(st): St, Path(oid): Path<String>) -> Result<Response, 
         }
         None => {
             st.stats.misses.fetch_add(1, Ordering::Relaxed);
-            st.fetch_upstream(&[oid])
+            st.fetch_upstream(&[oid], &[])
                 .await
-                .map_err(upstream_error)?
-                .pop()
-                .and_then(|f| f.1)
+                .map_err(upstream_error)?;
+            st.store.get_raw(&oid)?
         }
     };
     match raw {

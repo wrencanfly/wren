@@ -95,11 +95,18 @@ git/git.
 | Object storage | about 313 MiB (one pack) | 331 MiB on disk (one segment: the fetched pack, its index and reverse index) | about 1.06× |
 | Bytes sent, full checkout at HEAD | 13.4 MB | 16.7 MB | 1.25× |
 | Bytes sent, sparse checkout of `Documentation` | 4.6 MB | 5.4 MB | 1.16× |
-| Bytes sent, warm node updating `HEAD~15` → `HEAD` | 14 KB (thin pack) | 570 KB | about 41× |
-| Bytes sent, warm node updating `HEAD~50` → `HEAD` | 1.35 MB | 4.61 MB | 3.4× |
+| Bytes sent, warm node updating `HEAD~15` → `HEAD` | 14 KB (thin pack) | 13.0 KB with delta frames (640 KB without) | 0.93× |
+| Bytes sent, warm node updating `HEAD~50` → `HEAD` | 1.35 MB | 734 KB with delta frames (5.34 MB without) | 0.54× |
 
 Storage was 4.7 GB (421k loose objects, about 15×) until M3a, which keeps
 fetched packs whole as immutable segments instead of exploding them.
+Incremental updates sent every changed object whole until M3b: the client
+now names the same path in the tree it last checked out as a delta base,
+and each tier answers with a zstd delta against it. Measured with real
+checkouts (`wren checkout --rev master~N`, then `--rev master` into the same
+node store), directly and through a cache, with identical results; the
+incremental rows were 570 KB and 4.61 MB before, from the
+`bench/wire_bytes.py` model.
 
 **Why the gap on the wire.** Wren sends every object whole, compressed on its
 own. Git packs delta-compress objects against each other, and a thin pack

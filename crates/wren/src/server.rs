@@ -382,6 +382,7 @@ pub const FEATURES: &[&str] = &[
     "immutable-pinned-queries",
     "on-demand-sync",
     "error-codes",
+    "object-deltas.v1",
 ];
 
 /// Advertised only by a server started with a write token.
@@ -443,9 +444,8 @@ async fn objects_batch(State(st): St, Json(req): Json<ObjectsRequest>) -> ApiRes
     let store = st.store.clone();
     let body = blocking(move || {
         let mut out = Vec::new();
-        for oid in &req.oids {
-            let raw = store.get_raw(oid)?;
-            wire::encode_frame(&mut out, oid, raw.as_deref())?;
+        for (i, oid) in req.oids.iter().enumerate() {
+            wire::encode_from_store(&mut out, &store, oid, req.base(i))?;
         }
         Ok(out)
     })

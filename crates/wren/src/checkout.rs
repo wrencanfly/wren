@@ -46,6 +46,8 @@ pub struct Report {
     pub files: usize,
     pub trees_walked: usize,
     pub objects_fetched: u64,
+    /// How many of them arrived as deltas.
+    pub deltas: u64,
     pub bytes_fetched: u64,
     pub requests: u64,
     pub millis: u128,
@@ -55,6 +57,30 @@ pub struct FileOut {
     pub path: String,
     pub mode: u32,
     pub oid: Oid,
+    /// The same path in the reference tree (see `LAST_ROOT`), if any: a
+    /// delta base hint for fetching `oid`.
+    pub base: Option<Oid>,
+}
+
+/// File in a node store naming the root tree of the last checkout from it.
+/// The next checkout walks that tree alongside the new one and offers each
+/// path's old version as a delta base, so updating a warm node transfers
+/// roughly the change, not every changed object whole.
+const LAST_ROOT: &str = "wren-last-root";
+
+fn last_root(store: &ObjectStore) -> Option<Oid> {
+    let s = std::fs::read_to_string(store.root().join(LAST_ROOT)).ok()?;
+    let oid: Oid = s.trim().parse().ok()?;
+    store.has(&oid).then_some(oid)
+}
+
+fn set_last_root(store: &ObjectStore, tree: &Oid) -> Result<()> {
+    let tmp = store
+        .root()
+        .join(format!("{LAST_ROOT}.{}", std::process::id()));
+    std::fs::write(&tmp, format!("{tree}\n"))?;
+    std::fs::rename(tmp, store.root().join(LAST_ROOT))?;
+    Ok(())
 }
 
 pub async fn checkout(client: &Client, opts: Options) -> Result<Report> {
@@ -74,46 +100,67 @@ pub async fn checkout(client: &Client, opts: Options) -> Result<Report> {
     // sparse index, pointing at its tree id. Only with --full-index are they
     // walked (trees only, never blobs) to list every file in the index.
     // (git does read each sparse directory's own tree object; see below.)
-    let mut level: Vec<(String, Oid, bool)> = vec![(String::new(), commit.tree, true)];
+    // (path, tree, inside the cone, the same path in the reference tree)
+    let mut level: Vec<(String, Oid, bool, Option<Oid>)> =
+        vec![(String::new(), commit.tree, true, last_root(&store))];
     let mut files: Vec<FileOut> = Vec::new();
     let mut outside: Vec<FileOut> = Vec::new();
     let mut sparse_dirs: Vec<(String, Oid)> = Vec::new();
+    let mut boundary_bases: Vec<Option<Oid>> = Vec::new();
     let walk_outside = opts.git && opts.full_index;
     let mut dirs: Vec<String> = Vec::new();
     let mut trees_walked = 0;
     while !level.is_empty() {
-        let oids: Vec<Oid> = level.iter().map(|l| l.1).collect();
-        client.ensure(&store, &oids).await?;
+        let wants: Vec<(Oid, Option<Oid>)> = level.iter().map(|l| (l.1, l.3)).collect();
+        client.ensure_with_bases(&store, &wants).await?;
         trees_walked += level.len();
         let parsed = {
             let store = store.clone();
             tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
                 level
                     .into_par_iter()
-                    .map(|(path, oid, inside)| Ok((path, inside, store.read_tree(&oid)?)))
+                    .map(|(path, oid, inside, reference)| {
+                        // The reference tree's entries, when this node has
+                        // that tree; a hint only, so absence is fine.
+                        let reference: std::collections::HashMap<Vec<u8>, _> = reference
+                            .filter(|r| store.has(r))
+                            .map(|r| store.read_tree(&r))
+                            .transpose()?
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|e| (e.name.clone(), e))
+                            .collect();
+                        Ok((path, inside, store.read_tree(&oid)?, reference))
+                    })
                     .collect()
             })
             .await??
         };
         let mut next = Vec::new();
-        for (dir, inside, entries) in parsed {
+        for (dir, inside, entries, reference) in parsed {
             for e in entries {
                 let path = join(&dir, &e.name_str());
+                let base = reference
+                    .get(&e.name)
+                    .filter(|r| r.is_tree() == e.is_tree() && r.oid != e.oid)
+                    .map(|r| r.oid);
                 if e.is_tree() {
                     let child_inside = inside && sparse.wants_dir(&path);
                     if child_inside {
                         dirs.push(path.clone());
                     }
                     if child_inside || walk_outside {
-                        next.push((path, e.oid, child_inside));
+                        next.push((path, e.oid, child_inside, base));
                     } else if opts.git && inside {
                         sparse_dirs.push((path, e.oid));
+                        boundary_bases.push(base);
                     }
                 } else {
                     let f = FileOut {
                         path: path.clone(),
                         mode: e.mode,
                         oid: e.oid,
+                        base,
                     };
                     if inside && sparse.wants_file(&path) {
                         files.push(f);
@@ -129,16 +176,20 @@ pub async fn checkout(client: &Client, opts: Options) -> Result<Report> {
     // git's sparse index still reads the tree object of each sparse
     // directory (to compare it with HEAD), but never anything below it, so
     // the boundary trees are fetched and their subtrees are not.
-    let boundary: Vec<Oid> = sparse_dirs.iter().map(|d| d.1).collect();
-    client.ensure(&store, &boundary).await?;
+    let boundary: Vec<(Oid, Option<Oid>)> = sparse_dirs
+        .iter()
+        .zip(&boundary_bases)
+        .map(|(d, b)| (d.1, *b))
+        .collect();
+    client.ensure_with_bases(&store, &boundary).await?;
     trees_walked += boundary.len();
 
-    let blobs: Vec<Oid> = files
+    let blobs: Vec<(Oid, Option<Oid>)> = files
         .iter()
         .filter(|f| f.mode != MODE_GITLINK)
-        .map(|f| f.oid)
+        .map(|f| (f.oid, f.base))
         .collect();
-    client.ensure(&store, &blobs).await?;
+    client.ensure_with_bases(&store, &blobs).await?;
 
     // Materialize the working tree in parallel.
     std::fs::create_dir_all(&opts.dest)?;
@@ -194,10 +245,13 @@ pub async fn checkout(client: &Client, opts: Options) -> Result<Report> {
         serde_json::to_vec_pretty(&cfg)?,
     )?;
 
+    set_last_root(&store, &commit.tree)?;
+
     Ok(Report {
         commit: commit_oid,
         files: files.len(),
         trees_walked,
+        deltas: client.stats.deltas.load(Ordering::Relaxed),
         objects_fetched: client.stats.objects.load(Ordering::Relaxed),
         bytes_fetched: client.stats.bytes.load(Ordering::Relaxed),
         requests: client.stats.requests.load(Ordering::Relaxed),

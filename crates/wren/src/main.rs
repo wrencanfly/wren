@@ -616,7 +616,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             )
             .await?;
             eprintln!(
-                "checked out {} into {}: {} files, {} trees walked, fetched {} objects ({:.1} MiB) in {} requests, {} ms",
+                "checked out {} into {}: {} files, {} trees walked, fetched {} objects ({:.1} MiB) in {} requests, {} as deltas, {} bytes, {} ms",
                 rep.commit.short(),
                 dest.display(),
                 rep.files,
@@ -624,6 +624,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 rep.objects_fetched,
                 rep.bytes_fetched as f64 / (1 << 20) as f64,
                 rep.requests,
+                rep.deltas,
+                rep.bytes_fetched,
                 rep.millis
             );
         }

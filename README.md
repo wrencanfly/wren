@@ -77,7 +77,7 @@ principle and says where it still differs.
 | Changesets relative to the first parent; trees are derived data | Changesets keep no tree; trees and commits are derived and checked against git's ids | ✅ M1 |
 | Every commit, rebase and revert happens on the server; refs move by compare-and-swap | Server-side commit, rebase, land and revert; the git host is updated first (write proxy) | ✅ M2 |
 | Want-only object protocol; identical RPCs at every cache tier | `wren cache` tiers, per-object verification, resumable | ✅ |
-| No packfiles and no maintenance; contents in object storage; distributed metadata | Immutable segments (git's pack format, never repacked): git/git in 331 MiB. Delta frames, object storage and Postgres next | M3a ✅ |
+| No packfiles and no maintenance; contents in object storage; distributed metadata | Immutable segments (git's pack format, never repacked): git/git in 331 MiB. Delta frames on the wire. Postgres and object storage next | M3a, M3b ✅ |
 | A daemon per node with a bounded cache, seeded from snapshots; strict tiering | Planned, with deterministic simulation tests | M4 |
 | The server is the source of truth; older git clients still work | Planned: a git protocol front end, with the git host as a downstream mirror | M5 |
 | Path history, copy detection and search indexes; directory permissions | Planned | M6 |
@@ -242,7 +242,10 @@ flowchart LR
   answers.
 - **Want-only objects.** `POST /v1/objects {"oids": [...]}`. The client walks
   down from the root tree and asks only for objects it is missing. It
-  verifies every hash, and retries resume.
+  verifies every hash, and retries resume. For each object it may name a
+  base it already holds (the same path in the tree it last checked out);
+  a tier then answers with a zstd delta against that base. Every tier still
+  stores whole objects.
 - **Git compatibility.** Objects use git's loose format. For `--git`
   checkouts Wren writes git's sparse index directly, configures cone-mode
   sparse checkout, and sets the git host as a promisor remote.
@@ -269,9 +272,10 @@ node.
 | `blame`, first time for a file | 86 ms | 62 ms | 1.4× |
 
 **Costs.** Wren's object store for git/git is 331 MiB, about the size of a git
-pack (it was 4.7 GB of loose objects before M3a). An incremental update from
-`HEAD~15` sends 570 KB
-where a git thin pack sends 14 KB. Full results, method, corrections and
+pack (it was 4.7 GB of loose objects before M3a). With delta frames (M3b), an
+incremental update from `HEAD~15` sends 13 KB, against 14 KB for a git thin
+pack (640 KB without deltas). A full checkout still sends about 25% more
+than a git pack. Full results, method, corrections and
 caveats are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Roadmap
@@ -279,9 +283,9 @@ caveats are in [docs/benchmarks.md](docs/benchmarks.md).
 The [migration plan](docs/design-scion-migration.md) has the details and the
 gates for each milestone.
 
-- **M3, storage.** Done: immutable segments (M3a). Next: delta frames on the
-  wire (M3b), Postgres metadata so several stateless servers can share one
-  repository (M3c), object-storage backends (M3d).
+- **M3, storage.** Done: immutable segments (M3a) and delta frames on the
+  wire (M3b). Next: Postgres metadata so several stateless servers can
+  share one repository (M3c), object-storage backends (M3d).
 - **M4, node daemon.** A bounded per-node cache seeded from snapshots, strict
   tiering, and deterministic simulation tests with fault injection.
 - **M5, source of truth.** A git protocol front end so stock git can clone,

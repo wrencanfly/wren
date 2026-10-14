@@ -51,7 +51,7 @@ are starting to hit these walls:
 | **Derived data is defined recursively.** For each type, "we can choose whether to compute it eagerly or defer the work" | Trees are derived from changesets (`tree(cs) = apply(tree(p1), changes)`, path copying, git's own serialization), and so is the commit object; ingest checks that both reproduce git's ids. The commit graph (generations and first-parent skip lists) is derived eagerly from parents. Blame is derived lazily and persisted, and is a pure function of history. The path index is maintained at ingest, not through the generic mechanism. | Partial |
 | **No fully materialized copy.** "there is no fully materialized copy of the repo anywhere, even on the server" | The server's git mirror keeps refs only, but the authoritative server's object store holds every object (in packed segments, about the size of a git pack), and the metadata is single-host SQLite. Only object reads and pinned queries scale out, through caches. | Not adopted (v0.1) |
 | **Content-addressed caches; identical RPCs at every tier; strict tiering.** | `wren cache` speaks exactly the server's RPCs and points at one upstream. Objects and pinned queries (all revisions are full commit ids) are immutable. Cached answers are keyed by a query-semantics version, so an algorithm change never mixes old and new answers. | Follows |
-| **Want-only negotiation.** It "operates exclusively on trees and blobs the client wants", and is resumable | Clients ask only for missing objects, every object is verified, and retries resume. The cost is that there are no deltas: an incremental update sends whole objects (see [benchmarks](benchmarks.md#costs)). Git protocol v2 can also express want-only fetches (no `have`, noop negotiation, `filter`). Wren's difference is per-object addressability and HTTP caching. | Partial |
+| **Want-only negotiation.** It "operates exclusively on trees and blobs the client wants", and is resumable | Clients ask only for missing objects, every object is verified, and retries resume. A client may name, per object, a base it already holds (the same path in the tree it last checked out); a tier then answers with a zstd delta against it, and every tier still stores whole objects. Updating a node from `HEAD~15` sends 13 KB (a git thin pack: 14 KB). Git protocol v2 can also express want-only fetches (no `have`, noop negotiation, `filter`). Wren's difference is per-object addressability and HTTP caching. | Follows |
 | **Sparse checkouts.** "the client simply doesn't ask for trees it doesn't want" | Wren-native checkouts fetch only the cone. A `--git` checkout writes git's sparse index, which also needs the trees on the cone's boundary. Stock git reads those trees, but not deeper ones. | Partial |
 | **Virtualized checkouts.** Files "materialize on demand" | Wren does not plan this. It needs a filesystem driver, which is a separate product. | Not adopted |
 | **Post-merge testing instead of a global merge queue.** | `land` joins no queue and takes no global lock: it rebases onto the current tip and retries the CAS if it lost. `landed`, first-parent `bisect` (steps are fresh sparse checkouts) and server-side `revert` are the primitives for finding and backing out a bad change after it merged. Wren is not a testing pipeline. | Partial |
@@ -72,8 +72,10 @@ fairly.
 
 - **Storage.** Fixed in M3a: segments keep git's deltas, so git/git takes
   331 MiB, about its git pack (it was 4.7 GB of loose objects).
-- **Incremental fetches.** Wren has no deltas, so updating a warm node can
-  send many times more bytes than a git thin pack.
+- **Incremental fetches.** Fixed in M3b with delta frames: updating a node
+  from `HEAD~15` sends 13 KB, against 14 KB for a git thin pack. A full
+  checkout still sends about 25% more than a git pack, because each object
+  is compressed on its own.
 - **Trust model.** Wren serves one trust domain. A token can read every
   repository on a server, and the object store is shared across
   repositories. Content removed by a force-push stays readable until the

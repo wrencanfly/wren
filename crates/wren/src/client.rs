@@ -9,7 +9,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use wren_core::api::*;
-use wren_core::wire::{FrameDecoder, ObjectsRequest};
+use wren_core::wire::{self, FrameDecoder, ObjectsRequest, Payload};
 use wren_core::write::Landed;
 use wren_core::{ObjectStore, Oid};
 
@@ -29,6 +29,8 @@ pub struct FetchStats {
     pub objects: AtomicU64,
     pub bytes: AtomicU64,
     pub requests: AtomicU64,
+    /// Objects that arrived as deltas against a base the client named.
+    pub deltas: AtomicU64,
 }
 
 /// Saved in `.wren/config.json` at the root of a checkout, so commands run
@@ -206,13 +208,29 @@ impl Client {
     /// batches are retried, which resumes naturally: a retry asks only for
     /// what is still missing.
     pub async fn ensure(&self, store: &Arc<ObjectStore>, oids: &[Oid]) -> Result<()> {
-        let mut missing: Vec<Oid> = {
+        let wants: Vec<(Oid, Option<Oid>)> = oids.iter().map(|o| (*o, None)).collect();
+        self.ensure_with_bases(store, &wants).await
+    }
+
+    /// `ensure`, naming for each object a similar one this store already
+    /// holds (typically the same path in a tree checked out before). The
+    /// server may then send a delta against it instead of the whole object.
+    /// `WREN_NO_DELTA=1` turns the hints off.
+    pub async fn ensure_with_bases(
+        &self,
+        store: &Arc<ObjectStore>,
+        wants: &[(Oid, Option<Oid>)],
+    ) -> Result<()> {
+        let use_bases = std::env::var_os("WREN_NO_DELTA").is_none();
+        let mut missing: Vec<(Oid, Option<Oid>)> = {
             let store = store.clone();
-            let oids = oids.to_vec();
+            let wants = wants.to_vec();
             tokio::task::spawn_blocking(move || {
                 let mut seen = std::collections::HashSet::new();
-                oids.into_iter()
-                    .filter(|o| seen.insert(*o) && !store.has(o))
+                wants
+                    .into_iter()
+                    .filter(|(o, _)| seen.insert(*o) && !store.has(o))
+                    .map(|(o, b)| (o, b.filter(|b| use_bases && b != &o && store.has(b))))
                     .collect()
             })
             .await?
@@ -222,14 +240,25 @@ impl Client {
                 return Ok(());
             }
             let results: Vec<Result<()>> = stream::iter(missing.chunks(BATCH).map(|c| c.to_vec()))
-                .map(|chunk| self.fetch_batch(store.clone(), chunk))
+                .map(|chunk| {
+                    let (oids, bases): (Vec<Oid>, Vec<Option<Oid>>) = chunk.into_iter().unzip();
+                    let bases = if bases.iter().any(Option::is_some) {
+                        bases
+                    } else {
+                        Vec::new()
+                    };
+                    self.fetch_batch(store.clone(), oids, bases)
+                })
                 .buffer_unordered(PARALLEL)
                 .collect()
                 .await;
             let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
             let store2 = store.clone();
             missing = tokio::task::spawn_blocking(move || {
-                missing.into_iter().filter(|o| !store2.has(o)).collect()
+                missing
+                    .into_iter()
+                    .filter(|(o, _)| !store2.has(o))
+                    .collect()
             })
             .await?;
             if !missing.is_empty() {
@@ -242,7 +271,7 @@ impl Client {
                     bail!(
                         "{} objects could not be fetched (e.g. {}){first}",
                         missing.len(),
-                        missing[0]
+                        missing[0].0
                     );
                 }
                 tracing::warn!(
@@ -255,12 +284,17 @@ impl Client {
         Ok(())
     }
 
-    async fn fetch_batch(&self, store: Arc<ObjectStore>, oids: Vec<Oid>) -> Result<()> {
+    async fn fetch_batch(
+        &self,
+        store: Arc<ObjectStore>,
+        oids: Vec<Oid>,
+        bases: Vec<Option<Oid>>,
+    ) -> Result<()> {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         let resp = self
             .http
             .post(format!("{}/v1/objects", self.server))
-            .json(&ObjectsRequest { oids })
+            .json(&ObjectsRequest { oids, bases })
             .send()
             .await
             .with_context(|| format!("connecting to {}", self.server))?;
@@ -277,18 +311,25 @@ impl Client {
         }
         dec.finish()?;
         self.stats.objects.fetch_add(
-            pending.iter().filter(|f| f.1.is_some()).count() as u64,
+            pending.iter().filter(|f| f.1 != Payload::Missing).count() as u64,
+            Ordering::Relaxed,
+        );
+        self.stats.deltas.fetch_add(
+            pending
+                .iter()
+                .filter(|f| matches!(f.1, Payload::Delta(_)))
+                .count() as u64,
             Ordering::Relaxed,
         );
         // Verify every object against its id before it enters the store.
         tokio::task::spawn_blocking(move || -> Result<()> {
             use rayon::prelude::*;
-            pending.par_iter().try_for_each(|(oid, raw)| -> Result<()> {
-                if let Some(raw) = raw {
-                    store.put_raw_verified(oid, raw)?;
-                }
-                Ok(())
-            })
+            pending
+                .par_iter()
+                .try_for_each(|(oid, payload)| -> Result<()> {
+                    wire::store_frame(&store, oid, payload)?;
+                    Ok(())
+                })
         })
         .await??;
         Ok(())

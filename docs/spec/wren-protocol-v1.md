@@ -328,7 +328,8 @@ because they hash to the oid. A cache relays the bytes it received verbatim.
 POST /v1/objects
 Content-Type: application/json
 
-{"oids": ["136c59eb0d199f2f9181ea4db8f448b4df4d3f32", "..."]}
+{"oids": ["136c59eb0d199f2f9181ea4db8f448b4df4d3f32", "..."],
+ "bases": ["9fceb02d0ae598e95dc970b74767f19372d61af8", null, "..."]}
 ```
 
 * `Content-Type: application/json` is REQUIRED. Without it, the reference
@@ -342,6 +343,12 @@ Content-Type: application/json
   reference client sends batches of 1 000.
 * An empty array is valid and yields `200` with an empty body.
 * Duplicate oids are allowed. Each occurrence gets its own frame.
+* `bases` is OPTIONAL (feature `object-deltas.v1`). When present it has one
+  entry per oid, `null` or an oid the requester **already holds** that is
+  likely similar to the wanted object. The reference client uses the same
+  path in the root tree it last checked out on that node. A base is a hint,
+  not negotiation: the answer for `oids[i]` is always that object, and a tier
+  MAY ignore any base. A tier that does not know the field ignores it.
 
 **Response** `200 OK`, `Content-Type: application/x-wren-objects`. The body is
 the concatenation of exactly *N* frames, where *N* is the length of `oids`. There
@@ -354,9 +361,30 @@ immutable: a frame that is missing now may be found later.
 | Offset | Size (bytes) | Field | Encoding |
 |---:|---:|---|---|
 | 0 | 20 | `oid` | Raw SHA-1 bytes of the requested oid |
-| 20 | 1 | `status` | `0x00` = found, `0x01` = missing. Any other value is invalid and the receiver MUST treat the stream as corrupt. |
+| 20 | 1 | `status` | `0x00` = found, `0x01` = missing, `0x02` = delta. Any other value is invalid and the receiver MUST treat the stream as corrupt. |
 | 21 | 4 | `len` | Unsigned 32-bit **big-endian** length of `data`. MUST be `0` when `status = 0x01`. |
-| 25 | `len` | `data` | The object's loose encoding ([§3.1](#31-object-encoding)). Absent when missing. |
+| 25 | `len` | `data` | `0x00`: the object's loose encoding ([§3.1](#31-object-encoding)). `0x02`: a delta frame, below. Absent when missing. |
+
+**Delta frames** (`status = 0x02`). A tier MAY answer `oids[i]` with a delta
+only if `bases[i]` named a base and the tier holds both objects. `data` is:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 20 | Base oid (equal to `bases[i]`) |
+| 20 | 1 | Object type: 1 commit, 2 tree, 3 blob, 4 tag |
+| 21 | 4 | Size of the object's content, unsigned 32-bit big-endian |
+| 25 | rest | A zstd frame of the object's content, compressed with the base's content (without the git header) as a raw-content dictionary |
+
+The receiver decompresses with the base as dictionary, MUST check that the
+result has the stated size and hashes to the requested oid as an object of
+the stated type ([§3.4](#34-verification)), and stores the object whole.
+Every tier stores whole objects only: a cache passes a requester's base
+upstream only when it holds that base itself, and computes its own deltas
+for the requester. The reference implementation sends a delta only when it
+is under 90% of the loose encoding, never for objects under 64 bytes or over
+32 MiB, and at zstd level 3. On git/git, updating a node from `master~15`
+to `master` took 640 KB without deltas and 13.0 KB with them (git's thin
+pack: 14 KB).
 
 A frame is therefore exactly `25 + len` bytes. Because `len` is 32 bits, an
 object whose loose encoding is 2³² bytes (4 GiB) or larger cannot be framed in
