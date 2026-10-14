@@ -62,6 +62,11 @@ enum Cmd {
         /// it the server is open to anyone who can reach it.
         #[arg(long, env = "WREN_TOKEN", hide_env_values = true)]
         token: Option<String>,
+        /// Enable the write API (changesets, land, refs, revert) for clients
+        /// presenting `Authorization: Bearer <write-token>`. It also grants
+        /// read access. Without it the server is read-only.
+        #[arg(long, env = "WREN_WRITE_TOKEN", hide_env_values = true)]
+        write_token: Option<String>,
     },
     /// Run a caching tier in front of a server or another cache.
     Cache {
@@ -310,7 +315,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             repos,
             poll,
             token,
+            write_token,
         } => {
+            if write_token.is_some() && write_token == token {
+                anyhow::bail!("--write-token must differ from --token");
+            }
             let (objects, repos_dir) = data_layout(&data);
             let store = Arc::new(ObjectStore::open(objects)?);
             let mut map: BTreeMap<String, Arc<Repo>> = BTreeMap::new();
@@ -346,7 +355,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if token.is_none() && !listen.ip().is_loopback() {
                 tracing::warn!("listening on {listen} without --token: every mirrored repository is readable by anyone who can reach this port");
             }
-            let state = Arc::new(server::ServerState::new(store, map, token));
+            let state = Arc::new(server::ServerState::new(store, map, token, write_token));
             server::spawn_pollers(state.clone(), (poll > 0).then(|| Duration::from_secs(poll)));
             let listener = tokio::net::TcpListener::bind(listen).await?;
             tracing::info!(

@@ -167,7 +167,8 @@ pub struct ErrorBody {
     /// Human-readable message.
     pub error: String,
     /// Machine-readable code: `not_found`, `bad_request`, `unauthorized`,
-    /// `too_large`, `upstream_unavailable` or `internal`.
+    /// `forbidden`, `conflict`, `too_large`, `upstream_unavailable` or
+    /// `internal`.
     #[serde(default)]
     pub code: String,
 }
