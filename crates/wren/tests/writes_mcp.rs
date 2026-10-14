@@ -114,9 +114,7 @@ fn subjects(host: &Path) -> Vec<String> {
         .collect()
 }
 
-// Enabled after the server write API merges.
 #[test]
-#[ignore = "enabled after the server write API merges"]
 fn writes_through_mcp_and_cli() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -239,13 +237,16 @@ fn writes_through_mcp_and_cli() {
     assert!(!failed && text.contains("hello"), "{text}");
 
     // A stale edit of the same lines conflicts; nothing lands, and the
-    // agent is told where to look.
+    // agent is told where to look. (Both sides add `two` with a different
+    // body; `git merge-file` reports a conflict. Edits separated by an
+    // unchanged line, like `one`'s body and a new function, merge cleanly
+    // in git and therefore in Wren.)
     let (text, failed) = tool(
         "wren_commit",
         serde_json::json!({
             "message": "agent: stale edit",
             "parent": initial_tip,
-            "changes": [{"path": "src/lib.rs", "content": "pub fn one() -> u32 {\n    100\n}\n\npub fn three() -> u32 {\n    3\n}\n"}],
+            "changes": [{"path": "src/lib.rs", "content": "pub fn one() -> u32 {\n    1\n}\n\npub fn two() -> u32 {\n    22\n}\n"}],
             "onto": "main",
         }),
     );
@@ -344,7 +345,12 @@ fn writes_through_mcp_and_cli() {
     assert!(!git(&host, &["ls-tree", "-r", "--name-only", "main"]).contains("feature.txt"));
 
     // CLI: a conflicting land exits 1 with a readable conflict list.
-    std::fs::write(local.join("lib.rs"), "pub fn one() -> u32 {\n    7\n}\n").unwrap();
+    // (Adds `two` with another body than main's: a real conflict for git.)
+    std::fs::write(
+        local.join("lib.rs"),
+        "pub fn one() -> u32 {\n    1\n}\n\npub fn two() -> u32 {\n    3\n}\n",
+    )
+    .unwrap();
     let before = git(&host, &["rev-parse", "main"]);
     let (code, _, err) = wren(
         &[
