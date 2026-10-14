@@ -668,3 +668,130 @@ fn revert_matches_git() {
         }
     }
 }
+
+// ---- 5. several servers on Postgres -----------------------------------------
+
+/// Two servers share Postgres, the repository directory (git mirror) and the
+/// object store, as stateless servers would. Each has its own process-local
+/// locks and its own view of the store's segments. Agents land through
+/// both at once while someone pushes to the host directly.
+#[test]
+fn concurrent_lands_across_servers_on_postgres() {
+    let Some(pg) = wren_core::testpg::TestPg::start() else {
+        return;
+    };
+    let meta = wren_core::meta::MetaConfig::Postgres(pg.url().to_string());
+    let tmp = tempfile::tempdir().unwrap();
+    let host = tmp.path().join("host.git");
+    let work = tmp.path().join("work");
+    git(
+        tmp.path(),
+        &["init", "-q", "--bare", "-b", "main", host.to_str().unwrap()],
+    );
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            host.to_str().unwrap(),
+            work.to_str().unwrap(),
+        ],
+    );
+    for (k, v) in [("gc.auto", "0"), ("maintenance.auto", "false")] {
+        git(&work, &["config", k, v]);
+    }
+    std::fs::write(work.join("README"), "hello\n").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "root"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+
+    let server = |_: usize| {
+        let store = Arc::new(ObjectStore::open(tmp.path().join("objects")).unwrap());
+        Arc::new(
+            Repo::open_with(
+                tmp.path().join("repo"),
+                "t",
+                store,
+                Some(host.to_str().unwrap()),
+                &meta,
+            )
+            .unwrap(),
+        )
+    };
+    let servers = [server(0), server(1)];
+    servers[0].sync().unwrap();
+    // The second server sees the first one's ingest without syncing.
+    let base = servers[1].resolve("main").unwrap();
+    assert_eq!(base, servers[0].resolve("main").unwrap());
+
+    const N: usize = 12;
+    const OUTSIDE: usize = 3;
+    let work2 = work.clone();
+    let (first_push, pushed) = std::sync::mpsc::channel();
+    let outsider = std::thread::spawn(move || {
+        for i in 0..OUTSIDE {
+            std::fs::create_dir_all(work2.join("outside")).unwrap();
+            std::fs::write(work2.join(format!("outside/{i}")), format!("{i}\n")).unwrap();
+            git(&work2, &["add", "-A"]);
+            git(&work2, &["commit", "-q", "-m", &format!("outside {i}")]);
+            while !git_out(&work2, &["push", "-q", "origin", "main"]).0 {
+                git(&work2, &["pull", "-q", "--rebase", "origin", "main"]);
+            }
+            if i == 0 {
+                first_push.send(()).unwrap();
+            }
+        }
+    });
+    // Neither server has seen the outsider's first push: the first land
+    // must lose the host's lease, sync and replay.
+    pushed.recv().unwrap();
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let repo = servers[i % 2].clone();
+            std::thread::spawn(move || {
+                let blob = put_blob(&repo, format!("agent {i}\n").as_bytes());
+                let cs = repo
+                    .create_changeset(&NewChangeset {
+                        parents: vec![base],
+                        author: SIG.as_bytes().to_vec(),
+                        committer: None,
+                        message: format!("agent {i}").into_bytes(),
+                        edits: vec![FileEdit {
+                            path: format!("agents/{i}"),
+                            new: Some(FileVersion {
+                                mode: MODE_BLOB,
+                                oid: blob,
+                            }),
+                        }],
+                    })
+                    .unwrap();
+                match repo.land(&[cs], "main", None).unwrap() {
+                    Landed::Landed { attempts, .. } => attempts,
+                    other => panic!("agent {i}: {other:?}"),
+                }
+            })
+        })
+        .collect();
+    let attempts: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    outsider.join().unwrap();
+    eprintln!("land attempts across servers: {attempts:?}");
+    assert!(attempts.iter().any(|&a| a > 1), "no land had to retry");
+
+    servers[1].sync().unwrap();
+    let host_main = oid(&git(&host, &["rev-parse", "refs/heads/main"]));
+    for s in &servers {
+        let tip = s.resolve("main").unwrap();
+        assert_eq!(tip, host_main, "both servers agree with the host");
+        let log = s.log(&tip, None, 100).unwrap();
+        assert_eq!(log.len(), N + OUTSIDE + 1);
+        for c in &log[..N + OUTSIDE] {
+            assert_eq!(s.commit(c).unwrap().parents.len(), 1);
+            // Every object of every commit is readable from either server,
+            // whichever one stored it.
+            assert!(s.tree_of(c).is_ok());
+        }
+    }
+    let ls = git(&host, &["ls-tree", "-r", "--name-only", "main", "agents"]);
+    assert_eq!(ls.lines().count(), N);
+    git(&host, &["fsck", "--no-dangling"]);
+}

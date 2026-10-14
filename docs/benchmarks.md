@@ -23,6 +23,8 @@ Reproduce with `bench/run.py`.
 
 ## Results
 
+With Postgres metadata (M3c) instead of SQLite, on the same machine: first ingest about 75 s instead of 55 s; warm / cold blame 14 / 38 ms; path log 16 ms; checkouts unchanged.
+
 Re-run after M3a (packed segments, 2026-10-14): every figure below stayed within run-to-run noise or improved (cold blame 29 ms, warm 10 ms; full checkout 533 ms; sparse 262 / 108 ms).
 
 | Scenario | git (best setup) | Wren | Ratio |

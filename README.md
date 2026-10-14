@@ -77,7 +77,7 @@ principle and says where it still differs.
 | Changesets relative to the first parent; trees are derived data | Changesets keep no tree; trees and commits are derived and checked against git's ids | ✅ M1 |
 | Every commit, rebase and revert happens on the server; refs move by compare-and-swap | Server-side commit, rebase, land and revert; the git host is updated first (write proxy) | ✅ M2 |
 | Want-only object protocol; identical RPCs at every cache tier | `wren cache` tiers, per-object verification, resumable | ✅ |
-| No packfiles and no maintenance; contents in object storage; distributed metadata | Immutable segments (git's pack format, never repacked): git/git in 331 MiB. Delta frames on the wire. Postgres and object storage next | M3a, M3b ✅ |
+| No packfiles and no maintenance; contents in object storage; distributed metadata | Immutable segments (git's pack format, never repacked): git/git in 331 MiB. Delta frames on the wire. Postgres metadata shared by stateless servers. Object storage next | M3a–c ✅ |
 | A daemon per node with a bounded cache, seeded from snapshots; strict tiering | Planned, with deterministic simulation tests | M4 |
 | The server is the source of truth; older git clients still work | Planned: a git protocol front end, with the git host as a downstream mirror | M5 |
 | Path history, copy detection and search indexes; directory permissions | Planned | M6 |
@@ -102,11 +102,15 @@ principle and says where it still differs.
 >   domain.
 > - **Force-pushed content stays readable.** Objects removed from a branch
 >   remain in the store.
-> - **One authoritative server per repository** (SQLite). Object reads and
->   pinned queries scale out through caches; everything else hits that
->   server.
+> - **Several servers need Postgres and a shared data directory.** With the
+>   default SQLite metadata, one server serves each repository. With
+>   `--meta postgres://…`, any number of servers given the same database and
+>   the same `--data` directory serve the same repositories, and any of them
+>   can answer any request. The data directory must be a shared filesystem
+>   until object-storage backends land (M3d).
 > - **No TLS of its own.** Put Wren behind a TLS-terminating proxy.
-> - **Storage and incremental fetches cost more than git.** See
+> - **A full checkout sends about 25% more bytes than a git pack.** Storage
+>   and incremental updates are on par with git. See
 >   [Costs](docs/benchmarks.md#costs).
 
 ## Quick start
@@ -283,9 +287,9 @@ caveats are in [docs/benchmarks.md](docs/benchmarks.md).
 The [migration plan](docs/design-scion-migration.md) has the details and the
 gates for each milestone.
 
-- **M3, storage.** Done: immutable segments (M3a) and delta frames on the
-  wire (M3b). Next: Postgres metadata so several stateless servers can
-  share one repository (M3c), object-storage backends (M3d).
+- **M3, storage.** Done: immutable segments (M3a), delta frames on the wire
+  (M3b), Postgres metadata shared by stateless servers (M3c). Next:
+  object-storage backends (M3d).
 - **M4, node daemon.** A bounded per-node cache seeded from snapshots, strict
   tiering, and deterministic simulation tests with fault injection.
 - **M5, source of truth.** A git protocol front end so stock git can clone,

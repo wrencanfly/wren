@@ -305,7 +305,13 @@ pub struct Packs {
     dir: PathBuf,
     packs: std::sync::RwLock<Vec<Arc<Pack>>>,
     cache: Mutex<BaseCache>,
+    /// When the directory was last listed. Another process sharing the
+    /// store (another server) may add segments; a miss re-lists the
+    /// directory, at most once per `RELIST`.
+    listed: Mutex<std::time::Instant>,
 }
+
+const RELIST: std::time::Duration = std::time::Duration::from_millis(20);
 
 impl Packs {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Packs> {
@@ -318,6 +324,7 @@ impl Packs {
                 bytes: 0,
                 limit: 256 << 20,
             }),
+            listed: Mutex::new(std::time::Instant::now()),
         };
         p.refresh()?;
         Ok(p)
@@ -330,6 +337,7 @@ impl Packs {
     /// Pick up segments added since the last call (only those whose `.idx`
     /// exists, which is written last).
     pub fn refresh(&self) -> Result<usize> {
+        *self.listed.lock().unwrap() = std::time::Instant::now();
         let mut found: Vec<PathBuf> = match std::fs::read_dir(&self.dir) {
             Ok(rd) => rd
                 .flatten()
@@ -364,19 +372,28 @@ impl Packs {
         self.packs.read().unwrap().len()
     }
 
-    fn locate(&self, oid: &Oid) -> Option<(Arc<Pack>, u64)> {
+    fn locate_known(&self, oid: &Oid) -> Option<(Arc<Pack>, u64)> {
         let packs = self.packs.read().unwrap();
         packs
             .iter()
             .find_map(|p| p.find(oid).map(|o| (p.clone(), o)))
     }
 
+    /// Find `oid`, re-listing the directory once if it is not in a known
+    /// segment and the last listing is older than `RELIST`.
+    fn locate(&self, oid: &Oid) -> Option<(Arc<Pack>, u64)> {
+        if let Some(hit) = self.locate_known(oid) {
+            return Some(hit);
+        }
+        let stale = self.listed.lock().unwrap().elapsed() >= RELIST;
+        if stale && self.refresh().unwrap_or(0) > 0 {
+            return self.locate_known(oid);
+        }
+        None
+    }
+
     pub fn has(&self, oid: &Oid) -> bool {
-        self.packs
-            .read()
-            .unwrap()
-            .iter()
-            .any(|p| p.find(oid).is_some())
+        self.locate(oid).is_some()
     }
 
     /// The object, with its delta chain resolved.

@@ -464,11 +464,11 @@ impl Repo {
         expected: Option<Oid>,
         new: Option<Oid>,
     ) -> Result<RefUpdate> {
-        let _guard = self.sync_lock.lock().unwrap();
+        let _guard = self.lock_mirror()?;
         self.update_ref_locked(name, expected, new)
     }
 
-    /// `update_ref` with `sync_lock` held by the caller. A push reads packs
+    /// `update_ref` with the mirror lock held by the caller. A push reads packs
     /// in the mirror that a concurrent sync's absorb would delete, and
     /// holding the lock across push and CAS means Wren's ref has caught up
     /// before the next local writer reads it.
@@ -522,12 +522,13 @@ impl Repo {
         };
         for attempt in 1..=LAND_ATTEMPTS {
             // One attempt (read the tip, rebase, push, CAS) runs under the
-            // repo's sync lock, so local lands onto a branch take turns
+            // mirror lock, so lands onto a branch take turns (on Postgres,
+            // across servers too)
             // instead of invalidating each other's rebases in a retry storm.
             // This is only an optimization within one process: correctness
             // rests on the compare-and-swaps (the host's lease and Wren's
             // ref), which also catch writers this lock cannot see.
-            let guard = self.sync_lock.lock().unwrap();
+            let guard = self.lock_mirror()?;
             let r = self
                 .meta
                 .get_ref(&name)?

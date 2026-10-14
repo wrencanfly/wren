@@ -83,6 +83,12 @@ enum Cmd {
         /// read access. Without it the server is read-only.
         #[arg(long, env = "WREN_WRITE_TOKEN", hide_env_values = true)]
         write_token: Option<String>,
+        /// Keep metadata in Postgres instead of a SQLite file per repository,
+        /// e.g. `postgres://wren@db/wren`. Several servers given the same
+        /// database and the same --data directory serve the same
+        /// repositories, and any of them can answer any request.
+        #[arg(long, env = "WREN_META_URL", hide_env_values = true)]
+        meta: Option<String>,
     },
     /// Run a caching tier in front of a server or another cache.
     Cache {
@@ -509,7 +515,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             poll,
             token,
             write_token,
+            meta,
         } => {
+            let meta = match meta {
+                Some(url) => wren_core::meta::MetaConfig::Postgres(url),
+                None => wren_core::meta::MetaConfig::Sqlite,
+            };
             if write_token.is_some() && write_token == token {
                 anyhow::bail!("--write-token must differ from --token");
             }
@@ -525,11 +536,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 };
                 map.insert(
                     name.into(),
-                    Arc::new(Repo::open(
+                    Arc::new(Repo::open_with(
                         repos_dir.join(name),
                         name,
                         store.clone(),
                         Some(&url),
+                        &meta,
                     )?),
                 );
             }
@@ -537,10 +549,24 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if let Ok(rd) = std::fs::read_dir(&repos_dir) {
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
-                    if !map.contains_key(&name) && e.path().join("meta.sqlite").exists() {
+                    let known = match &meta {
+                        wren_core::meta::MetaConfig::Sqlite => {
+                            e.path().join("meta.sqlite").exists()
+                        }
+                        wren_core::meta::MetaConfig::Postgres(_) => {
+                            e.path().join("mirror.git").exists()
+                        }
+                    };
+                    if !map.contains_key(&name) && known {
                         map.insert(
                             name.clone(),
-                            Arc::new(Repo::open(e.path(), &name, store.clone(), None)?),
+                            Arc::new(Repo::open_with(
+                                e.path(),
+                                &name,
+                                store.clone(),
+                                None,
+                                &meta,
+                            )?),
                         );
                     }
                 }

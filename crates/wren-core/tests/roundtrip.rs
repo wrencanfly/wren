@@ -32,18 +32,8 @@ fn real_repository_roundtrip() {
     );
 
     // Show a few overridden commits and why derivation differed.
-    let overridden: Vec<Vec<u8>> = repo
-        .meta
-        .with(|c| {
-            let mut st = c.prepare(
-                "SELECT oid FROM changesets WHERE tree_override IS NOT NULL ORDER BY seq LIMIT 5",
-            )?;
-            let rows = st.query_map([], |r| r.get(0))?;
-            Ok(rows.collect::<Result<Vec<Vec<u8>>, _>>()?)
-        })
-        .unwrap();
-    for o in overridden {
-        let c = Oid::from_bytes(&o).unwrap();
+    let overridden = repo.meta.overridden_changesets(5).unwrap();
+    for c in overridden {
         let row = repo.meta.changeset(&c).unwrap().unwrap();
         let base = row.parents.first().map(|p| repo.tree_of(p).unwrap());
         let changes = wren_core::changes::decode_changes(&row.changes).unwrap();

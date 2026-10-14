@@ -1,6 +1,6 @@
 # 设计：Wren 向 Scion 架构迁移
 
-> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15**，其余待做。
+> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15**，其余待做。
 > 范围：用户选择"全面 Scion 化"，即下文 M1–M7 全部纳入路线图。
 > 这推翻了 v0.1 的定位（只读、git 主机是数据源、"不做服务端写入"），也推翻了
 > [reviews/04](reviews/04-positioning-vs-intent.md) 和 [reviews/08](reviews/08-synthesis.md)
@@ -266,7 +266,7 @@ M3 拆成四步：
 |---|---|---|
 | M3a | pack 段存储、进程内 pack 读取器（idx 二分、delta 链、基对象缓存）、整包吸收 | ✅ 2026-10-14 |
 | M3b | 线路 delta 帧：增量获取 ≤ thin pack 的 3 倍 | ✅ 2026-10-15 |
-| M3c | `MetaStore` 接口与 Postgres；多台无状态 server | 待做 |
+| M3c | `MetaStore` 接口与 Postgres；多台无状态 server | ✅ 2026-10-15 |
 | M3d | 段放到 S3/GCS（段不可变，适合按范围读取），本地磁盘缓存 | 待做 |
 
 **M3a 实测（git/git，85,545 个提交）：**
@@ -300,6 +300,33 @@ M3 拆成四步：
 | `master~15` | 640 KB | **13.0 KB**（68 个对象中 67 个 delta） | 14 KB |
 | `master~50` | 5.34 MB | **734 KB** | 1.35 MB |
 
+**M3c 实现（Postgres 与多 server）：**
+
+- `meta/` 拆成接口（`MetaDb` 包装一个后端 trait）和两个后端：SQLite（每仓库一个文件）
+  与 Postgres（每仓库一个 schema）。上层只用到这几种语义：单行 CAS、不存在才插入、
+  前缀/范围扫描、一个事务的批量写入（`write_batch`），以及跨 server 的排他锁。
+- Postgres 上：ref 移动是一条条件 `UPDATE`/`INSERT`/`DELETE`；changeset、路径索引、
+  派生值用 `ON CONFLICT DO NOTHING`；mirror 的独占操作（sync、推送、一次 land 尝试）
+  用会话级 advisory lock，持锁连接断了锁就释放，崩溃的 server 不会一直占着。
+- 同步的 `postgres` 客户端自带运行时，放在专用线程池里执行，避开 server 的 async
+  线程；连接错误原样传回调用方。
+- 对象库在多个进程间共享时，别人新加的段在查不到对象时被发现（至多每 20 ms 重新
+  列一次目录）。
+- 测试：两个后端跑同一套一致性测试；差分 fuzz 在 Postgres 上再跑一遍；两个"server"
+  同时 land 加外部推送者（强制走 lease 失败重试）；三个 server 进程共用一个
+  Postgres 和数据目录的端到端测试。CI 的 Linux 任务要求 Postgres 测试必须运行。
+- git/git 实测：
+
+| | SQLite | Postgres |
+|---|---:|---:|
+| 首次摄入 | 约 55 s | 约 75 s |
+| 元数据大小 | 160 MB | 207 MB |
+| 热 / 冷 blame | 10 / 29 ms | 14 / 38 ms |
+| `log -- path` | 12 ms | 16 ms |
+| 检出 | — | 无差别 |
+
+限制：数据目录（对象库和 git mirror）目前要放在共享文件系统上；对象存储后端是 M3d。
+
 服务端自己创建的对象（M2 写入）仍以 loose 形式写入，git 可读；把它们定期封成段
 （类似 memtable → segment）留到 M3c 一起做。
 
@@ -319,7 +346,7 @@ M3 拆成四步：
 
 - ✅ git/git 的存储量不超过 git pack 的 2 倍（M3a 后约 1.06 倍，此前约 15 倍）。
 - ✅ `HEAD~15` 的增量获取不超过 thin pack 的 3 倍：M3b 后 13.0 KB 对 14 KB（0.93 倍；无 delta 时 640 KB）。`HEAD~50`：734 KB 对 1.35 MB。
-- 3 台 server 共用 Postgres 时，端到端测试全部通过。
+- ✅ 3 台 server 共用 Postgres 时，端到端测试全部通过（`crates/wren/tests/multi_server.rs`）。
 
 ---
 

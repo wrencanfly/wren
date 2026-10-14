@@ -22,7 +22,7 @@ Wren 是独立项目，与 Anthropic 无关，也没有得到其背书。
 
 **v0.1 的扩展边界（实话实说）**
 
-- 每个仓库只有**一个权威 server**：元数据是本地 SQLite，同步锁是进程内锁。多个 server 不能共享同一个仓库。
+- 元数据有两种后端（M3c 起）：默认 SQLite，每个仓库一台 server；或 `--meta postgres://…`，多台无状态 server 共用同一个 Postgres 和同一个 `--data` 目录（目前需要共享文件系统，对象存储后端是 M3d）。git mirror 的独占操作（sync、推送、一次 land 尝试）在 Postgres 上用 advisory lock 跨 server 互斥。
 - 能横向扩展的是对象读取，以及"固定到完整 commit id 的查询"，后者可以被缓存层永久缓存（§6）。其余查询都由权威 server 计算。
 - 权威 server 的对象存储里有一份完整的对象集。M3a 起以 git pack 格式的不可变段保存：git/git 占 331 MiB，与 git pack 相当（此前是 loose，4.7 GB）。
 - **单一信任域**：token 不区分仓库，对象存储跨仓库共享，force-push 掉的对象仍然可读。每个信任域部署一套 Wren。
@@ -41,7 +41,7 @@ Wren 是独立项目，与 Anthropic 无关，也没有得到其背书。
   ┌──────────────────── wren server（每个仓库一个）───────────────────┐
   │ mirror.git: 只有 refs ──alternates──▶ ObjectStore（pack 段 + loose）│  /api/v1/...  查询 API
   │   fetch 来的 pack ─absorb─▶ 拆成单个对象 ─▶ 删除 pack              │  /v1/objects  对象协议
-  │ MetaDb (SQLite): changesets | refs | path_index | derived | kv     │  /v1/capabilities
+  │ MetaDb (SQLite | Postgres): changesets | refs | path_index | derived | kv │  /v1/capabilities
   └──────────────────────────────▲─────────────────────────────────────┘
                                  │ 相同 RPC（bearer token 可选）
                      ┌───────────┴───────────┐
@@ -59,7 +59,9 @@ Wren 是独立项目，与 Anthropic 无关，也没有得到其背书。
 | 对象模型 | `wren-core/src/object.rs` | 解析 commit/tree/tag；loose 编码（zlib）同时用作存储格式和传输格式 |
 | 对象存储 | `wren-core/src/store.rs` | 一对象一文件，原子写，与 git `objects/` 目录布局相同 |
 | 源站 | `wren-core/src/git_source.rs` | 只保留 refs 的 mirror；fetch 后吸收并删除 pack |
-| 元数据 | `wren-core/src/meta.rs` | changeset 日志、ref CAS、路径索引、derived 表 |
+| 元数据 | `wren-core/src/meta/`（`mod.rs` 接口，`sqlite.rs`、`pg.rs` 两个后端） | changeset 日志、ref CAS、路径索引、derived 表；Postgres 上另有跨 server 的 advisory lock |
+| 段存储 | `wren-core/src/pack.rs` | git pack 格式的不可变段：idx 查找、delta 链还原、基对象缓存；查不到时重新列目录（其他 server 可能加了段） |
+| 线路 delta | `wren-core/src/wire.rs` | 对象帧，含以请求方 base 为字典的 zstd delta 帧 |
 | Changeset | `wren-core/src/changes.rs` | 相对第一父的变更；tree diff 的成本与变更大小成正比 |
 | Derived data | `wren-core/src/derived.rs` | 按父提交递归推导的通用框架 |
 | 提交图 | `wren-core/src/graph.rs` | generation 加 skip list：ancestry、merge-base、landed、bisect |
@@ -105,7 +107,7 @@ pub trait Derivable {
 }
 ```
 
-`repo.derived::<D>(oid)` 先迭代地推导所有缺值的祖先（不递归，避免深历史栈溢出），再推导自身，结果写入 `derived(kind, key, value)`。值是不可变输入的纯函数，所以 `INSERT OR IGNORE`（首写胜出）是安全的。v0.1 里共享这张表的是同一个 SQLite 文件上的多个连接或进程，还不是多台主机。
+`repo.derived::<D>(oid)` 先迭代地推导所有缺值的祖先（不递归，避免深历史栈溢出），再推导自身，结果写入 `derived(kind, key, value)`。值是不可变输入的纯函数，所以 `INSERT OR IGNORE`（首写胜出）是安全的。在 Postgres 后端上，共享这张表的是多台主机上的多个 server（`ON CONFLICT DO NOTHING`）。
 
 各种派生数据**并非都走同一个框架**，下表如实列出：
 

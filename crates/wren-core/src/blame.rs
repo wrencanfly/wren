@@ -24,7 +24,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::changes::{find_change, normalize_path, FileVersion, Reader};
-use crate::meta::MetaDb;
+use crate::meta::WriteOp;
 use crate::object::{MODE_GITLINK, MODE_TREE};
 use crate::oid::Oid;
 use crate::repo::Repo;
@@ -355,12 +355,15 @@ impl Repo {
             }
             prev_content = contents.last().cloned();
         }
-        self.meta.write(|tx| {
-            for (k, v) in &writes {
-                MetaDb::put_derived_tx(tx, KIND, k, v)?;
-            }
-            Ok(())
-        })?;
+        let ops: Vec<WriteOp> = writes
+            .iter()
+            .map(|(k, v)| WriteOp::Derived {
+                kind: KIND,
+                key: k,
+                value: v,
+            })
+            .collect();
+        self.meta.write_batch(&ops)?;
         let newest = steps.last().map(|s| s.blob).zip(prev_content);
         Ok((prev.context("blame: nothing derived")?, newest))
     }

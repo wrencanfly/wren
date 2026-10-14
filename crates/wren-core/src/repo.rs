@@ -13,7 +13,7 @@ use crate::changes::{self, Change};
 use crate::derived::{Derivable, Memo};
 use crate::git_source::{CatFile, GitMirror};
 use crate::graph::GraphNode;
-use crate::meta::{ChangesetRow, MetaDb, RefRow};
+use crate::meta::{ChangesetRow, MetaConfig, MetaDb, RefRow, WriteOp};
 use crate::object::{self, Commit, Kind, RawCommit, Tag, TreeEntry};
 use crate::oid::Oid;
 use crate::store::ObjectStore;
@@ -31,6 +31,13 @@ pub struct Repo {
     pub(crate) sync_lock: Mutex<()>,
 }
 
+/// Exclusive use of the git mirror: within this process, and (on Postgres)
+/// across every server sharing the repository.
+pub(crate) struct MirrorLock<'a> {
+    _local: std::sync::MutexGuard<'a, ()>,
+    _shared: crate::meta::MetaLock,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SyncReport {
     pub new_changesets: usize,
@@ -40,15 +47,29 @@ pub struct SyncReport {
 }
 
 impl Repo {
+    /// A repository with SQLite metadata in `dir`.
     pub fn open(
         dir: impl Into<PathBuf>,
         name: &str,
         store: Arc<ObjectStore>,
         upstream: Option<&str>,
     ) -> Result<Repo> {
+        Repo::open_with(dir, name, store, upstream, &MetaConfig::Sqlite)
+    }
+
+    /// A repository whose metadata lives where `meta` says. Several servers
+    /// can open the same repository on Postgres, sharing `dir` (the git
+    /// mirror) and the object store.
+    pub fn open_with(
+        dir: impl Into<PathBuf>,
+        name: &str,
+        store: Arc<ObjectStore>,
+        upstream: Option<&str>,
+        meta: &MetaConfig,
+    ) -> Result<Repo> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        let meta = MetaDb::open(dir.join("meta.sqlite"))?;
+        let meta = MetaDb::open_config(meta, &dir, name)?;
         let upstream = match upstream {
             Some(u) => {
                 meta.set_kv("upstream", u)?;
@@ -69,6 +90,16 @@ impl Repo {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Take the mirror lock (see [`MirrorLock`]).
+    pub(crate) fn lock_mirror(&self) -> Result<MirrorLock<'_>> {
+        let local = self.sync_lock.lock().unwrap();
+        let shared = self.meta.lock("mirror")?;
+        Ok(MirrorLock {
+            _local: local,
+            _shared: shared,
+        })
     }
 
     // ---- ingest ---------------------------------------------------------------
@@ -101,7 +132,7 @@ impl Repo {
     }
 
     fn sync_inner(&self) -> Result<SyncReport> {
-        let _guard = self.sync_lock.lock().unwrap();
+        let _guard = self.lock_mirror()?;
         let start = Instant::now();
         let url = self.upstream.as_deref().context("repo has no upstream")?;
         let mirror = GitMirror::open(self.dir.join("mirror.git"), url, self.store.root())?;
@@ -315,16 +346,20 @@ impl Repo {
             }
         }
         let oid = &row.oid;
-        self.meta.write(|tx| {
-            MetaDb::insert_changeset(tx, row)?;
-            for p in &paths {
-                MetaDb::insert_path_index(tx, p, generation, oid)?;
-            }
-            // The tree is derived data, but descendants derive theirs from
-            // it, so it is persisted with the changeset.
-            MetaDb::put_derived_tx(tx, GitTree::KIND, oid.as_bytes(), tree.as_bytes())?;
-            Ok(())
-        })?;
+        let mut ops = vec![WriteOp::Changeset(row)];
+        ops.extend(paths.iter().map(|p| WriteOp::PathIndex {
+            path: p,
+            generation,
+            oid,
+        }));
+        // The tree is derived data, but descendants derive theirs from it,
+        // so it is persisted with the changeset.
+        ops.push(WriteOp::Derived {
+            kind: GitTree::KIND,
+            key: oid.as_bytes(),
+            value: tree.as_bytes(),
+        });
+        self.meta.write_batch(&ops)?;
         // Derived eagerly, but safe to lose: recomputed on demand if missing.
         let node = self.derived::<GraphNode>(oid)?;
         debug_assert_eq!(node.generation, generation);

@@ -1,6 +1,4 @@
-//! Metadata database (SQLite). Plays the role Spanner plays for Scion: the
-//! append-only changeset log, refs (moved only by compare-and-swap), the path
-//! index, and the generic derived-data table.
+//! SQLite backend: one file per repository, for a single server.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -8,6 +6,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
+use super::{decode_oids, encode_oids, Backend, ChangesetRow, MetaLock, RefRow, WriteOp};
 use crate::oid::Oid;
 
 const SCHEMA: &str = r#"
@@ -56,54 +55,9 @@ DELETE FROM derived WHERE kind = 'blame';
 /// Bumped when the schema changes incompatibly; older databases are rebuilt.
 const SCHEMA_VERSION: i64 = 2;
 
-pub struct MetaDb {
+pub struct SqliteMeta {
     path: std::path::PathBuf,
     pool: Mutex<Vec<Connection>>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ChangesetRow {
-    pub seq: i64,
-    pub oid: Oid,
-    pub parents: Vec<Oid>,
-    /// Header values as git writes them: `Name <email> 1700000000 +0100`.
-    pub author: Vec<u8>,
-    /// `None` means "same as the author".
-    pub committer: Option<Vec<u8>>,
-    /// Further commit headers (`encoding`, `mergetag`, `gpgsig`, ...),
-    /// verbatim; see `object::RawCommit`.
-    pub extra_headers: Vec<u8>,
-    pub message: Vec<u8>,
-    pub commit_time: i64,
-    /// Encoded change records relative to the first parent.
-    pub changes: Vec<u8>,
-    /// The git tree, for an ingested commit whose tree is not what
-    /// `treegen::apply` derives (non-canonical trees).
-    pub tree_override: Option<Oid>,
-    /// The git commit bytes, for an ingested commit that does not split
-    /// canonically into the fields above.
-    pub raw_commit: Option<Vec<u8>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RefRow {
-    pub name: String,
-    /// What the ref points at (a commit, or an annotated tag object).
-    pub target: Oid,
-    /// The commit it ultimately names.
-    pub peeled: Oid,
-}
-
-pub fn encode_oids(oids: &[Oid]) -> Vec<u8> {
-    oids.iter().flat_map(|o| o.0).collect()
-}
-
-pub fn decode_oids(b: &[u8]) -> Vec<Oid> {
-    b.as_chunks::<20>()
-        .0
-        .iter()
-        .map(|c| Oid::from_bytes(c).unwrap())
-        .collect()
 }
 
 fn oid_col(b: Vec<u8>) -> rusqlite::Result<Oid> {
@@ -112,9 +66,9 @@ fn oid_col(b: Vec<u8>) -> rusqlite::Result<Oid> {
     })
 }
 
-impl MetaDb {
-    pub fn open(path: impl AsRef<Path>) -> Result<MetaDb> {
-        let db = MetaDb {
+impl SqliteMeta {
+    pub fn open(path: impl AsRef<Path>) -> Result<SqliteMeta> {
+        let db = SqliteMeta {
             path: path.as_ref().to_path_buf(),
             pool: Mutex::new(Vec::new()),
         };
@@ -470,5 +424,93 @@ impl MetaDb {
             )?;
             Ok(())
         })
+    }
+}
+
+impl Backend for SqliteMeta {
+    fn changeset(&self, oid: &Oid) -> Result<Option<ChangesetRow>> {
+        SqliteMeta::changeset(self, oid)
+    }
+    fn override_counts(&self) -> Result<(i64, i64)> {
+        SqliteMeta::override_counts(self)
+    }
+    fn overridden_changesets(&self, limit: usize) -> Result<Vec<Oid>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT oid FROM changesets WHERE tree_override IS NOT NULL ORDER BY seq LIMIT ?1",
+            )?;
+            let rows = st.query_map([limit as i64], |r| oid_col(r.get(0)?))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+    fn changeset_changes(&self, oid: &Oid) -> Result<Option<Vec<u8>>> {
+        SqliteMeta::changeset_changes(self, oid)
+    }
+    fn parents(&self, oid: &Oid) -> Result<Option<Vec<Oid>>> {
+        SqliteMeta::parents(self, oid)
+    }
+    fn has_changeset(&self, oid: &Oid) -> Result<bool> {
+        SqliteMeta::has_changeset(self, oid)
+    }
+    fn changeset_count(&self) -> Result<i64> {
+        SqliteMeta::changeset_count(self)
+    }
+    fn resolve_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<Oid>> {
+        SqliteMeta::resolve_prefix(self, prefix, limit)
+    }
+    fn path_changes(
+        &self,
+        path: &str,
+        after: (u32, Option<Oid>),
+        limit: usize,
+    ) -> Result<Vec<(u32, Oid)>> {
+        SqliteMeta::path_changes(self, path, after, limit)
+    }
+    fn refs(&self) -> Result<Vec<RefRow>> {
+        SqliteMeta::refs(self)
+    }
+    fn get_ref(&self, name: &str) -> Result<Option<RefRow>> {
+        SqliteMeta::get_ref(self, name)
+    }
+    fn cas_ref(&self, name: &str, expected: Option<Oid>, new: Option<(Oid, Oid)>) -> Result<bool> {
+        SqliteMeta::cas_ref(self, name, expected, new)
+    }
+    fn get_derived(&self, kind: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        SqliteMeta::get_derived(self, kind, key)
+    }
+    fn derived_keys_with_prefix(&self, kind: &str, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        SqliteMeta::derived_keys_with_prefix(self, kind, prefix)
+    }
+    fn put_derived(&self, kind: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        SqliteMeta::put_derived(self, kind, key, value)
+    }
+    fn write_batch(&self, ops: &[WriteOp]) -> Result<()> {
+        self.write(|tx| {
+            for op in ops {
+                match op {
+                    WriteOp::Changeset(cs) => SqliteMeta::insert_changeset(tx, cs)?,
+                    WriteOp::PathIndex {
+                        path,
+                        generation,
+                        oid,
+                    } => SqliteMeta::insert_path_index(tx, path, *generation, oid)?,
+                    WriteOp::Derived { kind, key, value } => {
+                        SqliteMeta::put_derived_tx(tx, kind, key, value)?
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+    fn get_kv(&self, key: &str) -> Result<Option<String>> {
+        SqliteMeta::get_kv(self, key)
+    }
+    fn set_kv(&self, key: &str, value: &str) -> Result<()> {
+        SqliteMeta::set_kv(self, key, value)
+    }
+    /// One server per SQLite database: the repository's in-process lock is
+    /// all the exclusion there is to have.
+    fn lock(&self, _name: &str) -> Result<MetaLock> {
+        Ok(MetaLock::none())
     }
 }

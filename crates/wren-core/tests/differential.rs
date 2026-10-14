@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use wren_core::meta::MetaConfig;
 use wren_core::{ObjectStore, Oid, Repo};
 
 struct Rng(u64);
@@ -708,18 +709,33 @@ fn wren_agrees_with_git() {
     }
 }
 
+/// The same checks with metadata in Postgres instead of SQLite.
+#[test]
+fn wren_agrees_with_git_on_postgres() {
+    let Some(pg) = wren_core::testpg::TestPg::start() else {
+        return;
+    };
+    let meta = MetaConfig::Postgres(pg.url().to_string());
+    scenario_with(seeds()[0], &meta);
+}
+
 fn scenario(seed: u64) {
+    scenario_with(seed, &MetaConfig::Sqlite);
+}
+
+fn scenario_with(seed: u64, meta: &MetaConfig) {
     let tmp = tempfile::tempdir().unwrap();
     let up = tmp.path().join("upstream");
     let mut gen = None;
     build_history(&up, seed, 120, &mut gen);
 
     let store = Arc::new(ObjectStore::open(tmp.path().join("objects")).unwrap());
-    let repo = Repo::open(
+    let repo = Repo::open_with(
         tmp.path().join("repo"),
         "test",
         store.clone(),
         Some(up.to_str().unwrap()),
+        meta,
     )
     .unwrap();
     let report = repo.sync().unwrap();
@@ -750,7 +766,7 @@ fn scenario(seed: u64) {
 
     // A fresh process (empty memo) over the same data agrees too.
     drop(repo);
-    let repo = Repo::open(tmp.path().join("repo"), "test", store, None).unwrap();
+    let repo = Repo::open_with(tmp.path().join("repo"), "test", store, None, meta).unwrap();
     check_everything(&up, &repo, &mut rng);
 }
 

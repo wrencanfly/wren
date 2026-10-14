@@ -18,6 +18,8 @@ pub mod pack;
 pub mod repo;
 pub mod sparse;
 pub mod store;
+#[doc(hidden)]
+pub mod testpg;
 pub mod treegen;
 pub mod wire;
 pub mod write;
