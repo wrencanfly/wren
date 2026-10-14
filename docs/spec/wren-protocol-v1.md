@@ -688,7 +688,9 @@ cache's store are pinned and never carry it.
     "head": "refs/heads/main",
     "changesets": 5,
     "last_sync": 1791927298,
-    "last_sync_error": null
+    "last_sync_error": null,
+    "tree_overrides": 0,
+    "commit_overrides": 0
   }
 ]
 ```
@@ -701,6 +703,8 @@ cache's store are pinned and never carry it.
 | `changesets` | integer | Number of changesets the server holds. This counts every commit ever ingested, which can exceed the number of commits currently reachable from refs (for example after a force-push). |
 | `last_sync` | integer or null | Unix time (seconds) of the last **successful** sync with upstream. `null` if there has never been one. **Every branch-relative answer (refs, `HEAD`, branch names in revisions) reflects upstream as of this moment.** A failed sync leaves it unchanged. |
 | `last_sync_error` | string or null | The error message of the most recent sync attempt if that attempt failed. `null` if it succeeded or none has run. |
+| `tree_overrides` | integer | Ingested commits whose tree the server could not derive from the changeset, because git accepted a non-canonical tree (for example a legacy `100664` mode). The server stores git's tree for them. Commit ids are never affected. Older servers omit it; read a missing value as 0. |
+| `commit_overrides` | integer | Ingested commits whose object the server could not rebuild from the changeset fields (for example headers in a non-standard order). The server stores the original bytes. Older servers omit it; read a missing value as 0. |
 
 New commits and new refs are picked up on demand when a request names them
 ([§4.0.7](#407-unknown-revisions-and-on-demand-sync)). A client that needs

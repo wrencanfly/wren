@@ -299,6 +299,11 @@ fn check_everything(up: &Path, repo: &Repo, rng: &mut Rng) {
         .collect();
     assert_eq!(git_refs, wren_refs, "refs differ");
 
+    // Trees and commit objects are derived from changesets; for git-made
+    // history they must reproduce git's ids without any override.
+    assert_roundtrip(up, repo);
+    assert_eq!(repo.meta.override_counts().unwrap(), (0, 0), "overrides");
+
     let all: Vec<Oid> = git(up, &["rev-list", "--all"]).lines().map(oid).collect();
     // Every reachable commit is a changeset. (Wren may hold more: commits
     // orphaned by a force-push stay in the immutable log.)
@@ -664,6 +669,22 @@ fn check_everything(up: &Path, repo: &Repo, rng: &mut Rng) {
     }
 }
 
+/// Every commit's derived tree and derived commit object match git's.
+fn assert_roundtrip(up: &Path, repo: &Repo) {
+    let lines = git(up, &["log", "--all", "--format=%H %T"]);
+    for l in lines.lines() {
+        let (c, t) = l.split_once(' ').unwrap();
+        let c = oid(c);
+        assert_eq!(repo.tree_of(&c).unwrap(), oid(t), "derived tree of {c}");
+        let obj = repo.commit_object(&c).unwrap();
+        assert_eq!(
+            Oid::hash_object("commit", &obj),
+            c,
+            "derived commit object of {c}"
+        );
+    }
+}
+
 /// Seeds from WREN_FUZZ_SEEDS (comma-separated, decimal or 0x-hex), so CI can
 /// run one quickly and a nightly job can run many.
 fn seeds() -> Vec<u64> {
@@ -731,4 +752,106 @@ fn scenario(seed: u64) {
     drop(repo);
     let repo = Repo::open(tmp.path().join("repo"), "test", store, None).unwrap();
     check_everything(&up, &repo, &mut rng);
+}
+
+fn write_literally(dir: &Path, kind: &str, data: &[u8]) -> String {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["hash-object", "-t", kind, "--literally", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(data).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Objects git accepts but would never write itself: a legacy `100664` mode,
+/// a zero-padded directory mode, headers out of order, a non-UTF-8 message.
+/// Ingest must keep every id; derivation records overrides for exactly the
+/// objects it cannot reproduce, and descendants derive normally again.
+#[test]
+fn noncanonical_objects_keep_their_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let up = tmp.path().join("upstream");
+    std::fs::create_dir_all(&up).unwrap();
+    git(&up, &["init", "-q", "-b", "main"]);
+    let blob = |s: &str| oid(&write_literally(&up, "blob", s.as_bytes()));
+    let entry = |mode: &str, name: &str, o: Oid| {
+        let mut e = format!("{mode} {name}\0").into_bytes();
+        e.extend_from_slice(o.as_bytes());
+        e
+    };
+    let sub = write_literally(&up, "tree", &entry("100644", "x", blob("x\n")));
+    let mut root = entry("100664", "a", blob("a\n"));
+    root.extend(entry("040000", "d", oid(&sub)));
+    let root = write_literally(&up, "tree", &root);
+
+    let sig = "T <t@wren.dev> 1700000000 +0000";
+    // 1. Canonical layout over a non-canonical tree.
+    let c1 = write_literally(
+        &up,
+        "commit",
+        format!("tree {root}\nauthor {sig}\ncommitter {sig}\n\nlegacy modes\n").as_bytes(),
+    );
+    // 2. Canonical, with extra headers and a Latin-1 message: no override.
+    let mut c2 = format!(
+        "tree {root}\nparent {c1}\nauthor {sig}\ncommitter {sig}\nencoding ISO-8859-1\n\
+         x-custom first\n continued\n\ncaf"
+    )
+    .into_bytes();
+    c2.extend_from_slice(b"\xe9\n");
+    let c2 = write_literally(&up, "commit", &c2);
+    // 3. Committer before author: cannot be split, kept verbatim.
+    let c3 = write_literally(
+        &up,
+        "commit",
+        format!("tree {root}\nparent {c2}\ncommitter {sig}\nauthor {sig}\n\nodd order\n")
+            .as_bytes(),
+    );
+    git(&up, &["update-ref", "refs/heads/main", &c3]);
+    // 4. A normal git commit on top: git rewrites the root canonically.
+    git(&up, &["checkout", "-q", "-f", "main"]);
+    std::fs::write(up.join("d/y"), "y\n").unwrap();
+    git(&up, &["add", "d/y"]);
+    git(&up, &["commit", "-q", "-m", "normal"]);
+    std::fs::write(up.join("a"), "a2\n").unwrap();
+    git(&up, &["commit", "-q", "-am", "edit the legacy-mode file"]);
+
+    let store = Arc::new(ObjectStore::open(tmp.path().join("objects")).unwrap());
+    let repo = Repo::open(
+        tmp.path().join("repo"),
+        "test",
+        store.clone(),
+        Some(up.to_str().unwrap()),
+    )
+    .unwrap();
+    repo.sync().unwrap();
+    assert_roundtrip(&up, &repo);
+    let (trees, commits) = repo.meta.override_counts().unwrap();
+    // Only c1 needs a tree override: c2 and c3 change nothing, so they
+    // inherit c1's tree, and the git commits on top are canonical again.
+    // c3 alone is out of order.
+    assert_eq!((trees, commits), (1, 1));
+    assert!(repo
+        .meta
+        .changeset(&oid(&c2))
+        .unwrap()
+        .unwrap()
+        .raw_commit
+        .is_none());
+    assert_eq!(repo.commit(&oid(&c3)).unwrap().summary(), "odd order");
+    let log = repo
+        .log(&repo.resolve("main").unwrap(), Some("a"), 10)
+        .unwrap();
+    assert_eq!(log.len(), 2, "the edit and the root touch `a`");
+
+    // A fresh process derives the same from the stored changesets alone.
+    drop(repo);
+    let repo = Repo::open(tmp.path().join("repo"), "test", store, None).unwrap();
+    assert_roundtrip(&up, &repo);
 }

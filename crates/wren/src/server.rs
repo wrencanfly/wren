@@ -438,7 +438,10 @@ async fn list_repos(State(st): St) -> ApiResult<Json<Vec<RepoInfo>>> {
     blocking(move || {
         let mut out = Vec::new();
         for r in st2.repos.values() {
+            let (tree_overrides, commit_overrides) = r.meta.override_counts()?;
             out.push(RepoInfo {
+                tree_overrides,
+                commit_overrides,
                 name: r.name.clone(),
                 upstream: r.upstream.clone(),
                 head: r.head_ref()?,

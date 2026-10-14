@@ -11,13 +11,22 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::oid::Oid;
 
 const SCHEMA: &str = r#"
+-- A changeset is what a git commit says, minus the tree: the tree (and the
+-- commit object itself) are derived from it. Byte fields are kept verbatim
+-- so that the derived commit hashes to `oid`.
 CREATE TABLE IF NOT EXISTS changesets(
-    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
-    oid         BLOB NOT NULL UNIQUE,
-    tree        BLOB NOT NULL,
-    parents     BLOB NOT NULL,
-    commit_time INTEGER NOT NULL,
-    changes     BLOB NOT NULL
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    oid           BLOB NOT NULL UNIQUE,
+    parents       BLOB NOT NULL,
+    author        BLOB NOT NULL,
+    committer     BLOB,
+    extra_headers BLOB NOT NULL,
+    message       BLOB NOT NULL,
+    commit_time   INTEGER NOT NULL,
+    changes       BLOB NOT NULL,
+    -- Set only for ingested commits that derivation cannot reproduce.
+    tree_override BLOB,
+    raw_commit    BLOB
 );
 CREATE TABLE IF NOT EXISTS path_index(
     path TEXT NOT NULL,
@@ -44,6 +53,9 @@ CREATE TABLE IF NOT EXISTS kv(
 DELETE FROM derived WHERE kind = 'blame';
 "#;
 
+/// Bumped when the schema changes incompatibly; older databases are rebuilt.
+const SCHEMA_VERSION: i64 = 2;
+
 pub struct MetaDb {
     path: std::path::PathBuf,
     pool: Mutex<Vec<Connection>>,
@@ -53,10 +65,24 @@ pub struct MetaDb {
 pub struct ChangesetRow {
     pub seq: i64,
     pub oid: Oid,
-    pub tree: Oid,
     pub parents: Vec<Oid>,
+    /// Header values as git writes them: `Name <email> 1700000000 +0100`.
+    pub author: Vec<u8>,
+    /// `None` means "same as the author".
+    pub committer: Option<Vec<u8>>,
+    /// Further commit headers (`encoding`, `mergetag`, `gpgsig`, ...),
+    /// verbatim; see `object::RawCommit`.
+    pub extra_headers: Vec<u8>,
+    pub message: Vec<u8>,
     pub commit_time: i64,
+    /// Encoded change records relative to the first parent.
     pub changes: Vec<u8>,
+    /// The git tree, for an ingested commit whose tree is not what
+    /// `treegen::apply` derives (non-canonical trees).
+    pub tree_override: Option<Oid>,
+    /// The git commit bytes, for an ingested commit that does not split
+    /// canonically into the fields above.
+    pub raw_commit: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,7 +118,21 @@ impl MetaDb {
             path: path.as_ref().to_path_buf(),
             pool: Mutex::new(Vec::new()),
         };
-        db.with(|c| Ok(c.execute_batch(SCHEMA)?))?;
+        db.with(|c| {
+            let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version < SCHEMA_VERSION {
+                // v0.1 stored a tree pointer in each changeset. Everything
+                // below is re-ingested from the object store on the next
+                // sync; `kv` (upstream, HEAD) survives.
+                c.execute_batch(
+                    "DROP TABLE IF EXISTS changesets; DROP TABLE IF EXISTS path_index;
+                     DROP TABLE IF EXISTS refs; DROP TABLE IF EXISTS derived;",
+                )?;
+            }
+            c.execute_batch(SCHEMA)?;
+            c.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+            Ok(())
+        })?;
         Ok(db)
     }
 
@@ -132,35 +172,62 @@ impl MetaDb {
 
     // ---- changesets ---------------------------------------------------------
 
-    pub fn insert_changeset(
-        tx: &rusqlite::Transaction,
-        oid: &Oid,
-        tree: &Oid,
-        parents: &[Oid],
-        commit_time: i64,
-        changes: &[u8],
-    ) -> Result<()> {
+    pub fn insert_changeset(tx: &rusqlite::Transaction, cs: &ChangesetRow) -> Result<()> {
         tx.prepare_cached(
-            "INSERT OR IGNORE INTO changesets(oid, tree, parents, commit_time, changes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO changesets(oid, parents, author, committer, extra_headers,
+                 message, commit_time, changes, tree_override, raw_commit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?
-        .execute(params![oid.as_bytes(), tree.as_bytes(), encode_oids(parents), commit_time, changes])?;
+        .execute(params![
+            cs.oid.as_bytes(),
+            encode_oids(&cs.parents),
+            cs.author,
+            cs.committer,
+            cs.extra_headers,
+            cs.message,
+            cs.commit_time,
+            cs.changes,
+            cs.tree_override.as_ref().map(|t| t.as_bytes().to_vec()),
+            cs.raw_commit,
+        ])?;
         Ok(())
     }
 
     pub fn changeset(&self, oid: &Oid) -> Result<Option<ChangesetRow>> {
         self.with(|c| {
-            Ok(c.prepare_cached("SELECT seq, oid, tree, parents, commit_time, changes FROM changesets WHERE oid = ?1")?
-                .query_row([oid.as_bytes()], |r| {
-                    Ok(ChangesetRow {
-                        seq: r.get(0)?,
-                        oid: oid_col(r.get(1)?)?,
-                        tree: oid_col(r.get(2)?)?,
-                        parents: decode_oids(&r.get::<_, Vec<u8>>(3)?),
-                        commit_time: r.get(4)?,
-                        changes: r.get(5)?,
-                    })
+            Ok(c.prepare_cached(
+                "SELECT seq, parents, author, committer, extra_headers, message,
+                            commit_time, changes, tree_override, raw_commit
+                     FROM changesets WHERE oid = ?1",
+            )?
+            .query_row([oid.as_bytes()], |r| {
+                Ok(ChangesetRow {
+                    seq: r.get(0)?,
+                    oid: *oid,
+                    parents: decode_oids(&r.get::<_, Vec<u8>>(1)?),
+                    author: r.get(2)?,
+                    committer: r.get(3)?,
+                    extra_headers: r.get(4)?,
+                    message: r.get(5)?,
+                    commit_time: r.get(6)?,
+                    changes: r.get(7)?,
+                    tree_override: r.get::<_, Option<Vec<u8>>>(8)?.map(oid_col).transpose()?,
+                    raw_commit: r.get(9)?,
                 })
-                .optional()?)
+            })
+            .optional()?)
+        })
+    }
+
+    /// How many changesets carry a tree override and a raw-commit override:
+    /// commits from git that derivation could not reproduce on its own.
+    pub fn override_counts(&self) -> Result<(i64, i64)> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(tree_override), COUNT(raw_commit) FROM changesets",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
         })
     }
 

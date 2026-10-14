@@ -23,6 +23,12 @@ pub struct RepoInfo {
     pub last_sync: Option<i64>,
     /// Error from the most recent sync attempt, if it failed.
     pub last_sync_error: Option<String>,
+    /// Ingested commits whose tree (or commit object) derivation could not
+    /// reproduce, so git's own is stored instead. Ids are unaffected.
+    #[serde(default)]
+    pub tree_overrides: i64,
+    #[serde(default)]
+    pub commit_overrides: i64,
 }
 
 /// `GET /v1/capabilities`: what this tier speaks. Identical shape on every

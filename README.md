@@ -162,8 +162,10 @@ flowchart LR
 ```
 
 - **Changesets.** Each commit is ingested as the list of paths it changed
-  relative to its first parent. The path index is written in the same
-  transaction.
+  relative to its first parent, plus its author, committer and message. The
+  path index is written in the same transaction. A changeset does not point
+  to a tree: trees and commit objects are derived from it, and ingest checks
+  that they reproduce git's ids.
 - **Derived data.** The commit graph (generation numbers and first-parent
   skip lists) is derived recursively from parents. Blame is derived lazily:
   the file's change chain is read in one pass over the path index, each

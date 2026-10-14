@@ -10,13 +10,14 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::changes::{self, Change};
-use crate::derived::Memo;
+use crate::derived::{Derivable, Memo};
 use crate::git_source::{CatFile, GitMirror};
 use crate::graph::GraphNode;
-use crate::meta::{MetaDb, RefRow};
-use crate::object::{Commit, Kind, Tag, TreeEntry};
+use crate::meta::{ChangesetRow, MetaDb, RefRow};
+use crate::object::{self, Commit, Kind, RawCommit, Tag, TreeEntry};
 use crate::oid::Oid;
 use crate::store::ObjectStore;
+use crate::treegen::GitTree;
 
 pub struct Repo {
     pub name: String,
@@ -218,20 +219,60 @@ impl Repo {
         Ok(())
     }
 
+    /// Ingest one git commit as a changeset. The changeset keeps everything
+    /// the commit says except its tree; the tree and the commit object are
+    /// derived from it. Both are checked here against git's own: what
+    /// derivation cannot reproduce is stored as an override, so ids never
+    /// change (see `treegen`).
     fn ingest_commit(&self, cat: &mut CatFile, oid: &Oid, report: &mut SyncReport) -> Result<()> {
         let data = self.import_object(cat, oid, report)?;
         let commit = Commit::parse(&data)?;
+        // The git mirror still reads its history from the object store, so
+        // git's trees are kept there; the derived ones are identical.
         self.import_tree(cat, &commit.tree, report)?;
         let parent_tree = match commit.parents.first() {
-            Some(p) => Some(
-                self.meta
-                    .changeset(p)?
-                    .with_context(|| format!("parent {p} not ingested"))?
-                    .tree,
-            ),
+            Some(p) => Some(self.tree_of(p)?),
             None => None,
         };
         let changes = changes::diff_trees(&self.store, parent_tree, Some(commit.tree))?;
+        let derived_tree = crate::treegen::apply(&self.store, parent_tree, &changes);
+        let tree_override = match derived_tree {
+            Ok(t) if t == commit.tree => None,
+            _ => Some(commit.tree),
+        };
+        let row = match RawCommit::split(&data).filter(|rc| {
+            rc.tree == commit.tree && rc.parents == commit.parents && rc.encode() == data
+        }) {
+            Some(rc) => ChangesetRow {
+                seq: 0,
+                oid: *oid,
+                parents: rc.parents,
+                author: rc.author,
+                committer: Some(rc.committer),
+                extra_headers: rc.extra_headers,
+                message: rc.message,
+                commit_time: commit.committer.time,
+                changes: changes::encode_changes(&changes),
+                tree_override,
+                raw_commit: None,
+            },
+            None => {
+                let header = |k: &[u8]| object::commit_header(&data, k).unwrap_or(b"").to_vec();
+                ChangesetRow {
+                    seq: 0,
+                    oid: *oid,
+                    parents: commit.parents.clone(),
+                    author: header(b"author"),
+                    committer: Some(header(b"committer")),
+                    extra_headers: Vec::new(),
+                    message: commit.message.clone().into_bytes(),
+                    commit_time: commit.committer.time,
+                    changes: changes::encode_changes(&changes),
+                    tree_override,
+                    raw_commit: Some(data.clone()),
+                }
+            }
+        };
         // Generation number, from the (already ingested) parents. The path
         // index needs it, and it must be written in the same transaction as
         // the changeset: a changeset that exists is never re-ingested, so an
@@ -251,17 +292,13 @@ impl Repo {
             }
         }
         self.meta.write(|tx| {
-            MetaDb::insert_changeset(
-                tx,
-                oid,
-                &commit.tree,
-                &commit.parents,
-                commit.committer.time,
-                &changes::encode_changes(&changes),
-            )?;
+            MetaDb::insert_changeset(tx, &row)?;
             for p in &paths {
                 MetaDb::insert_path_index(tx, p, generation, oid)?;
             }
+            // The tree is derived data, but descendants derive theirs from
+            // it, so it is persisted with the changeset.
+            MetaDb::put_derived_tx(tx, GitTree::KIND, oid.as_bytes(), commit.tree.as_bytes())?;
             Ok(())
         })?;
         // Derived eagerly, but safe to lose: recomputed on demand if missing.
@@ -375,7 +412,28 @@ impl Repo {
     // ---- queries --------------------------------------------------------------
 
     pub fn commit(&self, oid: &Oid) -> Result<Commit> {
-        self.store.read_commit(oid)
+        Commit::parse(&self.commit_object(oid)?).with_context(|| format!("parsing commit {oid}"))
+    }
+
+    /// The git commit object of a changeset, derived from it: its fields plus
+    /// the derived tree. It hashes to `oid` (checked at ingest).
+    pub fn commit_object(&self, oid: &Oid) -> Result<Vec<u8>> {
+        let row = self
+            .meta
+            .changeset(oid)?
+            .ok_or_else(|| crate::not_found(format!("unknown changeset {oid}")))?;
+        if let Some(raw) = row.raw_commit {
+            return Ok(raw);
+        }
+        Ok(RawCommit {
+            tree: self.tree_of(oid)?,
+            parents: row.parents,
+            committer: row.committer.unwrap_or_else(|| row.author.clone()),
+            author: row.author,
+            extra_headers: row.extra_headers,
+            message: row.message,
+        }
+        .encode())
     }
 
     /// The changes a changeset made relative to its first parent.
@@ -387,12 +445,9 @@ impl Repo {
         changes::decode_changes(&row.changes)
     }
 
+    /// The root tree of a changeset (derived data).
     pub fn tree_of(&self, oid: &Oid) -> Result<Oid> {
-        Ok(self
-            .meta
-            .changeset(oid)?
-            .ok_or_else(|| crate::not_found(format!("unknown changeset {oid}")))?
-            .tree)
+        Ok(self.derived::<GitTree>(oid)?.0)
     }
 
     pub fn diff(&self, base: &Oid, head: &Oid) -> Result<Vec<Change>> {

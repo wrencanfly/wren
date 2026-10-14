@@ -17,6 +17,7 @@ pub mod oid;
 pub mod repo;
 pub mod sparse;
 pub mod store;
+pub mod treegen;
 pub mod wire;
 
 pub use oid::Oid;

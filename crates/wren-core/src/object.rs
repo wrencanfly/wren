@@ -174,6 +174,105 @@ pub fn parse_tree(data: &[u8]) -> Result<Vec<TreeEntry>> {
     Ok(out)
 }
 
+/// Serialize tree entries the way git does: entries sorted by name, with
+/// directories compared as if their name ended in '/', and modes written in
+/// octal without leading zeros (`40000`, `100644`, ...).
+pub fn encode_tree<'a>(entries: impl IntoIterator<Item = &'a TreeEntry>) -> Vec<u8> {
+    let mut sorted: Vec<&TreeEntry> = entries.into_iter().collect();
+    let key = |e: &TreeEntry| {
+        let mut k = e.name.clone();
+        if e.is_tree() {
+            k.push(b'/');
+        }
+        k
+    };
+    sorted.sort_by_cached_key(|e| key(e));
+    let mut out = Vec::new();
+    for e in sorted {
+        out.extend_from_slice(format!("{:o} ", e.mode).as_bytes());
+        out.extend_from_slice(&e.name);
+        out.push(0);
+        out.extend_from_slice(e.oid.as_bytes());
+    }
+    out
+}
+
+/// A commit split into the parts a changeset stores, byte for byte. Only
+/// commits in git's canonical layout split: `tree`, `parent`s, `author`,
+/// `committer`, then any other headers (`encoding`, `mergetag`, `gpgsig`,
+/// ...), a blank line and the message. Whether a commit can be rebuilt from
+/// its parts is checked by `encode() == raw`, not assumed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawCommit {
+    pub tree: Oid,
+    pub parents: Vec<Oid>,
+    /// Header values after "author " / "committer ", e.g. `A <a@x> 1700000000 +0100`.
+    pub author: Vec<u8>,
+    pub committer: Vec<u8>,
+    /// The remaining header lines, verbatim (continuation lines included),
+    /// joined by '\n', without a trailing newline. Empty if there are none.
+    pub extra_headers: Vec<u8>,
+    pub message: Vec<u8>,
+}
+
+impl RawCommit {
+    pub fn split(data: &[u8]) -> Option<RawCommit> {
+        let i = find(data, b"\n\n")?;
+        let (headers, message) = (&data[..i], &data[i + 2..]);
+        let mut lines = headers.split(|&b| b == b'\n').peekable();
+        let oid = |v: &[u8]| Oid::from_hex(std::str::from_utf8(v).ok()?).ok();
+        let tree = oid(lines.next()?.strip_prefix(b"tree ")?)?;
+        let mut parents = Vec::new();
+        while let Some(v) = lines.peek().and_then(|l| l.strip_prefix(b"parent ")) {
+            parents.push(oid(v)?);
+            lines.next();
+        }
+        let author = lines.next()?.strip_prefix(b"author ")?.to_vec();
+        let committer = lines.next()?.strip_prefix(b"committer ")?.to_vec();
+        let extra_headers = lines.collect::<Vec<_>>().join(&b'\n');
+        Some(RawCommit {
+            tree,
+            parents,
+            author,
+            committer,
+            extra_headers,
+            message: message.to_vec(),
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256 + self.extra_headers.len() + self.message.len());
+        out.extend_from_slice(format!("tree {}\n", self.tree).as_bytes());
+        for p in &self.parents {
+            out.extend_from_slice(format!("parent {p}\n").as_bytes());
+        }
+        for (key, val) in [
+            (&b"author "[..], &self.author),
+            (b"committer ", &self.committer),
+        ] {
+            out.extend_from_slice(key);
+            out.extend_from_slice(val);
+            out.push(b'\n');
+        }
+        if !self.extra_headers.is_empty() {
+            out.extend_from_slice(&self.extra_headers);
+            out.push(b'\n');
+        }
+        out.push(b'\n');
+        out.extend_from_slice(&self.message);
+        out
+    }
+}
+
+/// The value of the first `key` header line ("author", "committer"), for
+/// commits that do not split canonically.
+pub fn commit_header<'a>(data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let end = find(data, b"\n\n").unwrap_or(data.len());
+    data[..end]
+        .split(|&b| b == b'\n')
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix(b" "))
+}
+
 /// Annotated tag: only the fields needed to peel it.
 pub struct Tag {
     pub object: Oid,
@@ -264,6 +363,56 @@ mod tests {
         let (k, d) = decode_loose_verified(&oid, &raw).unwrap();
         assert_eq!(k, Kind::Blob);
         assert_eq!(d, b"hello\n");
+    }
+
+    #[test]
+    fn raw_commit_roundtrip() {
+        let c: &[u8] = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+parent ce013625030ba8dba906f756967f9e9ca394464a\n\
+parent 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+author A U Thor <a@example.com> 1700000000 +0100\n\
+committer C O Mitter <c@example.com> 1700000001 -0500\n\
+encoding ISO-8859-1\n\
+gpgsig -----BEGIN PGP SIGNATURE-----\n \n abc\n -----END PGP SIGNATURE-----\n\
+\n\
+Subject \xe9\n\nBody\n";
+        let rc = RawCommit::split(c).unwrap();
+        assert_eq!(rc.parents.len(), 2);
+        assert_eq!(rc.author, b"A U Thor <a@example.com> 1700000000 +0100");
+        assert!(rc
+            .extra_headers
+            .starts_with(b"encoding ISO-8859-1\ngpgsig "));
+        assert_eq!(rc.encode(), c);
+
+        let plain: &[u8] = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+author A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nm\n";
+        assert_eq!(RawCommit::split(plain).unwrap().encode(), plain);
+
+        // Not canonical: committer before author. It splits into nothing.
+        let odd: &[u8] = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+committer A <a@x> 1 +0000\nauthor A <a@x> 1 +0000\n\nm\n";
+        assert!(RawCommit::split(odd).is_none());
+        assert_eq!(commit_header(odd, b"author"), Some(&b"A <a@x> 1 +0000"[..]));
+    }
+
+    #[test]
+    fn tree_encoding_matches_git_order() {
+        let o = Oid::hash_object("blob", b"");
+        let e = |mode, name: &str| TreeEntry {
+            mode,
+            name: name.as_bytes().to_vec(),
+            oid: o,
+        };
+        // "a.c" < "a/" < "a0": the directory "a" sorts as "a/".
+        let data = encode_tree(&[e(MODE_BLOB, "a0"), e(MODE_TREE, "a"), e(MODE_BLOB, "a.c")]);
+        let names: Vec<_> = parse_tree(&data)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, [&b"a.c"[..], b"a", b"a0"]);
+        assert!(data.starts_with(b"100644 a.c\0"));
+        assert!(find(&data, b"40000 a\0").is_some());
     }
 
     #[test]

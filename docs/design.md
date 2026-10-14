@@ -74,7 +74,11 @@ Wren 是独立项目，与 Anthropic 无关，也没有得到其背书。
 
 ### Changeset
 
-每个 commit ingest 后在 `changesets` 表里追加一行：`seq`（自增，相当于 WAL 序号）、`oid`、`tree`、`parents`，以及**相对第一父的变更列表**（路径、状态、新旧 mode 和 oid）。merge 提交也只相对第一父记录，原因同 Scion 的脚注：在 trunk-based 开发中，有意义的是主线历史。
+每个 commit ingest 后在 `changesets` 表里追加一行：`seq`（自增，相当于 WAL 序号）、`oid`、`parents`、原样字节的 `author`、`committer`、其余头部（`encoding`、`mergetag`、`gpgsig` 等）和 `message`，以及**相对第一父的变更列表**（路径、状态、新旧 mode 和 oid）。merge 提交也只相对第一父记录，原因同 Scion 的脚注：在 trunk-based 开发中，有意义的是主线历史。
+
+**changeset 不存 tree。** 和 Scion 一样，tree 是派生数据：`git_tree(cs) = apply(git_tree(p1), cs.changes)`，用路径复制只重写改动路径沿途的目录，按 git 的规范格式序列化，所以派生出的 id 就是 git 的 id。commit 对象也由 changeset 加派生 tree 拼出，哈希等于 `oid`。这样服务端可以只凭"父提交 + 改了哪些文件"创建提交（迁移设计 M2），不需要客户端给出树。
+
+git 接受一些它自己不会写的对象（如 `100664` 这类旧 mode、头部顺序不规范的 commit）。ingest 时逐个校验：派生 tree 不等于 git 的 tree，就在该行记下 `tree_override`；commit 不能按规范拆分还原，就记下 `raw_commit`。id 永远不变，后代从覆盖值继续派生。覆盖数量在 `GET /api/v1/repos` 里报告。
 
 **changeset 与它的路径索引行在同一个事务里写入。** 已经存在的 changeset 永远不会被重新 ingest，所以如果分成两次写，中间崩溃丢掉的索引行就再也补不回来了。审阅报告 02 发现过这个 bug，现已修复。
 
@@ -86,6 +90,8 @@ mirror 是一个 bare 仓库，通过 `objects/info/alternates` 借用 Wren 的�
 2. 删除这些 pack 和对象。
 
 mirror 因此只剩 refs。git.git 上实测从 326 MB 降到 5.3 MB。
+
+mirror 的增量 fetch 要用 git 自己的 commit 和 tree 做协商，所以在迁移设计 M5（Wren 成为数据源）之前，这些对象仍然导入对象存储。派生出的 tree 与它们逐字节相同，写入时直接跳过。
 
 fetch 下来的对象顺序是任意的，所以"tree 存在就意味着整棵子树都存在"这个不变量只在导入完成后才成立。导入永远在 ingest 提交之前做完；中断的话，因为 pack 还没删，下次会整个重做。
 
@@ -106,6 +112,7 @@ pub trait Derivable {
 
 | 数据 | 机制 | 时机 | 用途 |
 |---|---|---|---|
+| `GitTree` | `Derivable`：由第一父的 tree 加变更列表推出 | ingest 时随 changeset 同一事务写入 | changeset 的根 tree；commit 对象据此派生 |
 | `GraphNode` | `Derivable`：值由父提交的值递归推出 | ingest 时提前算，丢失可重算 | generation、first-parent 深度、parents、skip list（`skip[k]` 是往回 2^k 步的第一父祖先） |
 | `path_index` | ingest 时直接写的索引，和 changeset 同一事务 | ingest 时 | 每个变更路径及其所有父目录 → (generation, commit) |
 | `blame` | 同样是递归思想，但按 (path, commit) 存，沿**该文件的变更链**往回递推，而不是沿父提交；只存查询结果和检查点 | 查询时再算 | 每行的来源（commit、原行号） |
@@ -185,12 +192,13 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 
 1. 对象一旦写入就永不改变；所有写入都是 tmp 文件加 rename。
 2. tree 只能在其全部子对象落盘后写入。mirror 吸收 pack 期间例外，所以吸收必须在任何 ingest 之前完成，中断后整体重做。
-3. changeset 与其路径索引行必须在同一事务里写入。
+3. changeset 与其路径索引行、派生 tree 必须在同一事务里写入。
 4. ref 只能通过 `cas_ref` 修改，并且只在它指向的全部 changeset ingest 完成之后才发布。
 5. 持久化的 derived 值必须是不可变输入的纯函数；依赖时间、配置或外部服务的结果不得持久化。
 6. 每一层对外的 RPC 完全相同，客户端不能依赖拓扑。
 7. 新的历史查询必须用 derived data 或索引实现，禁止线性扫描 commit log。
 8. 每个查询 API 都必须有对 git 的差分测试。
+9. 派生出的 tree 和 commit 对象必须复现 git 的 id；复现不了的只能写入覆盖值（`tree_override`、`raw_commit`），不能改 id。changeset 的字段按原样字节保存，不做编码转换。
 
 ## 9. 测试
 
