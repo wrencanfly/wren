@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <b>Server-side source control queries for git.</b><br>
+  <b>Server-side source control queries for git, in the style of Anthropic's Scion.</b><br>
   History, blame, grep and bisect without a clone, for agents and CI.
 </p>
 
