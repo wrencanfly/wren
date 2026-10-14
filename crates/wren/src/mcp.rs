@@ -3,9 +3,9 @@
 //! history, blame and diffs of any revision without a local checkout.
 
 use anyhow::Result;
-use wren_core::api::*;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use wren_core::api::*;
 
 use crate::client::Client;
 

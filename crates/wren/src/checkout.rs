@@ -17,12 +17,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Result};
+use rayon::prelude::*;
 use wren_core::changes::join;
 use wren_core::index::{write_index, IndexEntry, Stat};
 use wren_core::object::{MODE_EXEC, MODE_GITLINK, MODE_SYMLINK};
 use wren_core::sparse::Sparse;
 use wren_core::{ObjectStore, Oid};
-use rayon::prelude::*;
 
 use crate::client::{CheckoutConfig, Client};
 
