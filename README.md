@@ -105,6 +105,20 @@ wren diff master --name-status          # what master changed vs its first paren
 wren cat README.md --rev v2.40.0
 ```
 
+**Writes.** Commits are made on the server, from whole files, with no
+checkout. Landing rebases onto the branch tip on the server; with a git
+host upstream, the host is updated first with `--force-with-lease`. Writes go
+to the server, not a cache, and need its write token.
+
+```sh
+export WREN_WRITE_SERVER=http://127.0.0.1:7070 WREN_WRITE_TOKEN=…
+export WREN_AUTHOR="Ada Lovelace <ada@example.com>"
+wren commit -m "Fix typo" --land master --set README.md=./README.md
+wren commit -m "Drop script" --parent master --delete ci/old.sh   # prints the commit id
+wren land --onto master <commit>...       # oldest first; exits 1 on conflicts
+wren revert <commit> --onto master
+```
+
 **Check out only what you need, as a real git repo**
 
 ```sh
@@ -143,11 +157,18 @@ before Wren answers. You can also point your host's push webhook at
 | `wren_merge_base`, `wren_is_ancestor`, `wren_landed` | Ancestry questions, such as "did this land on main, and through which merge?" |
 | `wren_bisect_step` | The next commit to test, or the first bad one |
 | `wren_refs` | Branches and tags, filtered by prefix |
+| `wren_commit` | Commit whole-file contents on the server, and optionally land the commit on a branch |
+| `wren_land`, `wren_revert` | Land commits on a branch; revert a commit |
 
-Every tool resolves its revisions to full commit ids first, and every answer
-names the commit it describes. Outputs are capped (about 10k tokens by
+Every query tool resolves its revisions to full commit ids first, and every
+answer names the commit it describes. Outputs are capped (about 10k tokens by
 default) and say when they were cut, so an agent can narrow the request
 instead of guessing.
+
+The write tools send commits to `WREN_WRITE_SERVER` (default `WREN_SERVER`)
+with `WREN_WRITE_TOKEN` (default `WREN_TOKEN`), authored as `WREN_AUTHOR`.
+When a land conflicts, nothing moves. The tool lists the conflicting paths and
+tells the agent to read them at the branch tip and commit again.
 
 ## How it works
 

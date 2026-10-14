@@ -1,4 +1,4 @@
-//! HTTP client for the query API and the object protocol.
+//! HTTP client for the query API, the object protocol and the write API.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use wren_core::api::*;
 use wren_core::wire::{FrameDecoder, ObjectsRequest};
+use wren_core::write::Landed;
 use wren_core::{ObjectStore, Oid};
 
 pub const BATCH: usize = 1000;
@@ -126,6 +127,57 @@ impl Client {
         Ok(Self::check(resp).await?.json().await?)
     }
 
+    /// POST a JSON body to a write endpoint. A 409 carries a meaningful body
+    /// (conflicts, a stale ref, a rejection), so it is parsed like a success.
+    pub async fn write<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let resp = self
+            .http
+            .post(self.url(path))
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("connecting to {}", self.server))?;
+        let status = resp.status();
+        let bytes = resp.bytes().await?;
+        parse_write(status, &bytes)
+    }
+
+    /// Store blobs on the server; returns their ids in order.
+    pub async fn upload_blobs(&self, blobs: &[Content]) -> Result<Vec<Oid>> {
+        let r: BlobsResponse = self
+            .write(
+                "blobs",
+                &BlobsRequest {
+                    blobs: blobs.to_vec(),
+                },
+            )
+            .await?;
+        if r.oids.len() != blobs.len() {
+            bail!(
+                "server returned {} ids for {} blobs",
+                r.oids.len(),
+                blobs.len()
+            );
+        }
+        Ok(r.oids)
+    }
+
+    pub async fn create_changeset(&self, req: &ChangesetRequest) -> Result<ChangesetResponse> {
+        self.write("changesets", req).await
+    }
+
+    pub async fn land(&self, req: &LandRequest) -> Result<Landed> {
+        self.write("land", req).await
+    }
+
+    pub async fn revert(&self, req: &RevertRequest) -> Result<RevertResponse> {
+        self.write("revert", req).await
+    }
+
     pub async fn repos(&self) -> Result<Vec<RepoInfo>> {
         let resp = self
             .http
@@ -240,5 +292,436 @@ impl Client {
         })
         .await??;
         Ok(())
+    }
+}
+
+// ---- Writes -----------------------------------------------------------------
+//
+// Request and response bodies of the server-side write API. Revisions are sent
+// as given; the server resolves them against its own (authoritative) refs.
+
+/// `Name <email>`, optionally with a time and timezone (the server fills in
+/// the current time when they are missing).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct Person {
+    pub name: String,
+    pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tz: Option<String>,
+}
+
+impl Person {
+    /// Parse `Name <email>`.
+    pub fn parse(s: &str) -> Result<Person> {
+        let s = s.trim();
+        let parsed = s.split_once('<').and_then(|(name, rest)| {
+            let email = rest.strip_suffix('>')?;
+            let (name, email) = (name.trim(), email.trim());
+            let ok = !name.is_empty() && !email.is_empty() && !email.contains(['<', '>']);
+            ok.then(|| (name.to_string(), email.to_string()))
+        });
+        let Some((name, email)) = parsed else {
+            bail!("expected \"Name <email>\", got {s:?}");
+        };
+        Ok(Person {
+            name,
+            email,
+            time: None,
+            tz: None,
+        })
+    }
+}
+
+/// A file's new content: UTF-8 text is sent as is, anything else as base64.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Content {
+    Text { content: String },
+    Base64 { content_base64: String },
+}
+
+impl Content {
+    pub fn from_bytes(data: Vec<u8>) -> Content {
+        match String::from_utf8(data) {
+            Ok(content) => Content::Text { content },
+            Err(e) => Content::Base64 {
+                content_base64: base64(e.as_bytes()),
+            },
+        }
+    }
+}
+
+/// What happens to one path.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Edit {
+    Write(Content),
+    /// A blob already stored on the server (see [`Client::upload_blobs`]).
+    Blob {
+        blob: Oid,
+    },
+    Delete {
+        delete: bool,
+    },
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: String,
+    #[serde(flatten)]
+    pub edit: Edit,
+    /// `100644`, `100755` or `120000`. Default: the file's existing mode,
+    /// else `100644`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct LandOnto {
+    pub onto: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ChangesetRequest {
+    pub parents: Vec<String>,
+    pub author: Person,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer: Option<Person>,
+    pub message: String,
+    pub changes: Vec<FileChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub land: Option<LandOnto>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChangesetResponse {
+    pub oid: Oid,
+    #[serde(default)]
+    pub tree: Option<Oid>,
+    #[serde(default)]
+    pub land: Option<Landed>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct LandRequest {
+    pub changesets: Vec<String>,
+    pub onto: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer: Option<Person>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct RevertRequest {
+    pub commit: String,
+    pub author: Person,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer: Option<Person>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onto: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RevertResponse {
+    pub oid: Oid,
+    #[serde(default)]
+    pub land: Option<Landed>,
+}
+
+#[derive(Serialize)]
+struct BlobsRequest {
+    blobs: Vec<Content>,
+}
+
+#[derive(Deserialize)]
+struct BlobsResponse {
+    oids: Vec<Oid>,
+}
+
+/// Interpret a write endpoint's response. Success and 409 both carry the
+/// typed body; a 409 that is a plain error (or any other failure) becomes an
+/// error, with a hint for the usual configuration mistakes.
+pub fn parse_write<T: DeserializeOwned>(status: reqwest::StatusCode, body: &[u8]) -> Result<T> {
+    if status.is_success() {
+        return serde_json::from_slice(body).with_context(|| {
+            format!(
+                "unexpected response ({status}): {}",
+                String::from_utf8_lossy(body)
+            )
+        });
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        if let Ok(v) = serde_json::from_slice(body) {
+            return Ok(v);
+        }
+    }
+    let (code, msg) = match serde_json::from_slice::<ErrorBody>(body) {
+        Ok(e) => (e.code, e.error),
+        Err(_) => (String::new(), String::from_utf8_lossy(body).into_owned()),
+    };
+    let hint = match (status.as_u16(), code.as_str()) {
+        (403, _) | (_, "forbidden") => {
+            " (writes must go to the control-plane server, not a cache, with a write token: set WREN_WRITE_SERVER and WREN_WRITE_TOKEN)"
+        }
+        (401, _) | (_, "unauthorized") => {
+            " (write endpoints need the write token: set WREN_WRITE_TOKEN)"
+        }
+        _ => "",
+    };
+    bail!("{status}: {msg}{hint}")
+}
+
+/// Standard base64 with padding (RFC 4648).
+pub fn base64(data: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = |i: usize| chunk.get(i).copied().unwrap_or(0) as u32;
+        let n = (b(0) << 16) | (b(1) << 8) | b(2);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+    use serde_json::json;
+
+    fn oid(c: char) -> String {
+        c.to_string().repeat(40)
+    }
+
+    #[test]
+    fn base64_matches_rfc4648() {
+        for (i, o) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(i.as_bytes()), o);
+        }
+        assert_eq!(base64(&[0xff, 0xfe, 0x00]), "//4A");
+    }
+
+    #[test]
+    fn person_parse() {
+        let p = Person::parse(" Ada Lovelace <ada@example.com> ").unwrap();
+        assert_eq!(
+            (p.name.as_str(), p.email.as_str()),
+            ("Ada Lovelace", "ada@example.com")
+        );
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            json!({"name": "Ada Lovelace", "email": "ada@example.com"})
+        );
+        for bad in ["Ada", "<a@b>", "Ada <>", "Ada <a@b", "Ada <a<b>"] {
+            assert!(Person::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn request_shapes() {
+        let change = |path: &str, edit, mode: Option<&str>| FileChange {
+            path: path.into(),
+            edit,
+            mode: mode.map(Into::into),
+        };
+        let req = ChangesetRequest {
+            parents: vec!["main".into()],
+            author: Person::parse("A <a@x>").unwrap(),
+            committer: None,
+            message: "m".into(),
+            changes: vec![
+                change(
+                    "a.txt",
+                    Edit::Write(Content::from_bytes(b"hi\n".to_vec())),
+                    None,
+                ),
+                change(
+                    "bin",
+                    Edit::Write(Content::from_bytes(vec![0xff, 0])),
+                    Some("100755"),
+                ),
+                change(
+                    "big",
+                    Edit::Blob {
+                        blob: oid('b').parse().unwrap(),
+                    },
+                    None,
+                ),
+                change("gone", Edit::Delete { delete: true }, None),
+            ],
+            land: Some(LandOnto {
+                onto: "main".into(),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            json!({
+                "parents": ["main"],
+                "author": {"name": "A", "email": "a@x"},
+                "message": "m",
+                "changes": [
+                    {"path": "a.txt", "content": "hi\n"},
+                    {"path": "bin", "content_base64": "/wA=", "mode": "100755"},
+                    {"path": "big", "blob": oid('b')},
+                    {"path": "gone", "delete": true},
+                ],
+                "land": {"onto": "main"},
+            })
+        );
+        let land = LandRequest {
+            changesets: vec!["abc".into()],
+            onto: "main".into(),
+            committer: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&land).unwrap(),
+            json!({"changesets": ["abc"], "onto": "main"})
+        );
+        let rv = RevertRequest {
+            commit: "abc".into(),
+            author: Person::parse("A <a@x>").unwrap(),
+            committer: None,
+            onto: Some("main".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&rv).unwrap(),
+            json!({"commit": "abc", "author": {"name": "A", "email": "a@x"}, "onto": "main"})
+        );
+        assert_eq!(
+            serde_json::to_value(BlobsRequest {
+                blobs: vec![Content::from_bytes(b"x".to_vec())]
+            })
+            .unwrap(),
+            json!({"blobs": [{"content": "x"}]})
+        );
+    }
+
+    #[test]
+    fn parses_success_and_409_bodies() {
+        let created: ChangesetResponse = parse_write(
+            StatusCode::CREATED,
+            json!({"oid": oid('a'), "tree": oid('b')})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(created.oid.to_hex(), oid('a'));
+        assert!(created.land.is_none());
+
+        let landed: ChangesetResponse = parse_write(
+            StatusCode::OK,
+            json!({"oid": oid('a'), "tree": oid('b'), "land": {
+                "result": "landed", "ref": "refs/heads/main", "old": oid('c'), "new": oid('d'),
+                "changesets": [oid('d')], "dropped": [], "attempts": 1}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            matches!(landed.land, Some(Landed::Landed { ref name, attempts: 1, .. }) if name == "refs/heads/main")
+        );
+
+        let conflict: ChangesetResponse = parse_write(
+            StatusCode::CONFLICT,
+            json!({"oid": oid('a'), "tree": oid('b'), "land": {
+                "result": "conflicts", "onto": oid('c'), "conflicts": [{
+                    "changeset": oid('a'), "path": "src/x.rs", "kind": "content",
+                    "base": {"mode": "100644", "oid": oid('1')},
+                    "ours": {"mode": "100644", "oid": oid('2')},
+                    "theirs": {"mode": "100644", "oid": oid('3')}}]}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        match conflict.land {
+            Some(Landed::Conflicts { onto, conflicts }) => {
+                assert_eq!(onto.to_hex(), oid('c'));
+                assert_eq!(conflicts[0].path, "src/x.rs");
+                assert_eq!(conflicts[0].kind, "content");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let rejected: Landed = parse_write(
+            StatusCode::CONFLICT,
+            br#"{"result":"rejected","reason":"protected branch"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rejected,
+            Landed::Rejected {
+                reason: "protected branch".into()
+            }
+        );
+
+        let deleted: Landed = parse_write(
+            StatusCode::CONFLICT,
+            json!({"result": "conflicts", "onto": oid('c'), "conflicts": [{
+                "changeset": oid('a'), "path": "f", "kind": "modify/delete",
+                "base": {"mode": "100644", "oid": oid('1')}, "ours": null,
+                "theirs": {"mode": "100644", "oid": oid('3')}, "detail": "deleted on the branch"}]})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            matches!(deleted, Landed::Conflicts { ref conflicts, .. } if conflicts[0].ours.is_none())
+        );
+
+        let reverted: RevertResponse = parse_write(
+            StatusCode::CREATED,
+            json!({"oid": oid('e')}).to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(reverted.oid.to_hex(), oid('e'));
+    }
+
+    #[test]
+    fn errors_keep_message_and_hint() {
+        let err =
+            |status, body: &[u8]| parse_write::<Landed>(status, body).unwrap_err().to_string();
+        let e = err(
+            StatusCode::FORBIDDEN,
+            br#"{"code":"forbidden","error":"caches do not accept writes"}"#,
+        );
+        assert!(
+            e.contains("403")
+                && e.contains("caches do not accept writes")
+                && e.contains("WREN_WRITE_SERVER"),
+            "{e}"
+        );
+        let e = err(StatusCode::UNAUTHORIZED, b"");
+        assert!(e.contains("WREN_WRITE_TOKEN"), "{e}");
+        // A 409 whose body is a plain error rather than a typed outcome.
+        let e = err(
+            StatusCode::CONFLICT,
+            br#"{"code":"conflict","error":"main kept moving"}"#,
+        );
+        assert!(e.contains("409") && e.contains("main kept moving"), "{e}");
+        let e = err(
+            StatusCode::NOT_FOUND,
+            br#"{"code":"not_found","error":"unknown revision nope"}"#,
+        );
+        assert!(
+            e.contains("404") && e.contains("unknown revision nope"),
+            "{e}"
+        );
+        // A success that is not the expected shape is an error, not a panic.
+        assert!(parse_write::<Landed>(StatusCode::OK, b"{}").is_err());
     }
 }
