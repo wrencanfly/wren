@@ -273,17 +273,30 @@ impl Repo {
                 }
             }
         };
+        self.insert_changeset(&row, &changes, commit.tree)?;
+        report.new_changesets += 1;
+        Ok(())
+    }
+
+    /// Persist a changeset whose tree is known: the row, its path index rows
+    /// and its derived tree, in one transaction. Parents must already exist.
+    pub(crate) fn insert_changeset(
+        &self,
+        row: &ChangesetRow,
+        changes: &[Change],
+        tree: Oid,
+    ) -> Result<()> {
         // Generation number, from the (already ingested) parents. The path
         // index needs it, and it must be written in the same transaction as
         // the changeset: a changeset that exists is never re-ingested, so an
         // index row lost to a crash between two writes would never come back.
         let mut generation = 1;
-        for p in &commit.parents {
+        for p in &row.parents {
             generation = generation.max(self.node(p)?.generation + 1);
         }
         // Every changed path and each of its parent directories.
         let mut paths = BTreeSet::new();
-        for c in &changes {
+        for c in changes {
             let mut p = c.path.as_str();
             paths.insert(p.to_string());
             while let Some(i) = p.rfind('/') {
@@ -291,20 +304,20 @@ impl Repo {
                 paths.insert(p.to_string());
             }
         }
+        let oid = &row.oid;
         self.meta.write(|tx| {
-            MetaDb::insert_changeset(tx, &row)?;
+            MetaDb::insert_changeset(tx, row)?;
             for p in &paths {
                 MetaDb::insert_path_index(tx, p, generation, oid)?;
             }
             // The tree is derived data, but descendants derive theirs from
             // it, so it is persisted with the changeset.
-            MetaDb::put_derived_tx(tx, GitTree::KIND, oid.as_bytes(), commit.tree.as_bytes())?;
+            MetaDb::put_derived_tx(tx, GitTree::KIND, oid.as_bytes(), tree.as_bytes())?;
             Ok(())
         })?;
         // Derived eagerly, but safe to lose: recomputed on demand if missing.
         let node = self.derived::<GraphNode>(oid)?;
         debug_assert_eq!(node.generation, generation);
-        report.new_changesets += 1;
         Ok(())
     }
 

@@ -15,6 +15,16 @@ pub struct GitMirror {
     path: PathBuf,
 }
 
+/// Outcome of a conditional push to the upstream.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Push {
+    Done,
+    /// The upstream ref no longer has the expected value.
+    Stale,
+    /// The upstream refused the update (hook, branch protection, ...).
+    Rejected(String),
+}
+
 pub struct UpstreamRef {
     pub name: String,
     pub oid: Oid,
@@ -117,6 +127,54 @@ impl GitMirror {
             c
         })?;
         Ok(())
+    }
+
+    /// Push `new` (or a deletion) to `name` on the upstream, but only if the
+    /// upstream still has `expected` there (`--force-with-lease`; `None`
+    /// means "must not exist"). receive-pack checks the old value inside its
+    /// ref transaction, so this is a compare-and-swap on the host. The
+    /// objects come from Wren's store through the mirror's alternates.
+    pub fn push_lease(&self, name: &str, expected: Option<Oid>, new: Option<Oid>) -> Result<Push> {
+        let lease = format!(
+            "--force-with-lease={name}:{}",
+            expected.map(|o| o.to_hex()).unwrap_or_default()
+        );
+        let refspec = match new {
+            Some(n) => format!("{n}:{name}"),
+            None => format!(":{name}"),
+        };
+        let out = git(&self.path)
+            .args(["push", "--porcelain", "--quiet", &lease, "origin", &refspec])
+            .stderr(Stdio::piped())
+            .output()
+            .context("running git push")?;
+        if out.status.success() {
+            return Ok(Push::Done);
+        }
+        // Porcelain lines: "<flag>\t<from>:<to>\t<summary> (<reason>)".
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        match stdout.lines().find(|l| l.starts_with('!')) {
+            // "stale info": the client-side lease check failed. "incorrect
+            // old value provided" / "failed to lock": the host's own ref
+            // transaction lost a race. All mean "the ref moved".
+            Some(l)
+                if [
+                    "stale info",
+                    "fetch first",
+                    "incorrect old value",
+                    "failed to lock",
+                ]
+                .iter()
+                .any(|m| l.contains(m)) =>
+            {
+                Ok(Push::Stale)
+            }
+            Some(l) => Ok(Push::Rejected(
+                l.rsplit('\t').next().unwrap_or(l).trim().to_string(),
+            )),
+            None => bail!("git push to upstream failed: {}", stderr.trim()),
+        }
     }
 
     /// The upstream's default branch (e.g. `refs/heads/main`), if it has one.

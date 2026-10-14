@@ -19,6 +19,7 @@ pub mod sparse;
 pub mod store;
 pub mod treegen;
 pub mod wire;
+pub mod write;
 
 pub use oid::Oid;
 
