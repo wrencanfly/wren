@@ -55,8 +55,11 @@ landed are identical to git's.
 
 - Both sides fetch about the same number of objects: 1,850 for Wren and
   1,966 for git in the sparse case.
-- Wren wins on protocol mechanics. There is no have/want negotiation and no
-  pack generation, and requests run in parallel batches.
+- Wren's edge comes from the server doing less per request. It never
+  generates or compresses a pack: objects are stored in their wire encoding
+  and streamed as they are. Requests also run in parallel batches.
+- The edge is not from skipping have/want negotiation. A cold `git clone`
+  sends no `have` lines either.
 - On a warm node, git's `worktree add` is already good. Wren's shared node
   store is 2.5× faster and needs no pre-existing clone per repository.
 
@@ -69,13 +72,45 @@ landed are identical to git's.
   `builtin/blame.c`). After that, each further change to the file costs one
   line diff.
 
+## Costs
+
+Wren buys these gains with storage and bandwidth. All numbers are for
+git/git.
+
+| | git | Wren | |
+|---|---:|---:|---:|
+| Object storage | about 313 MiB (one pack) | 4.7 GB (421k loose objects) | about 15× |
+| Bytes sent, full checkout at HEAD | 13.4 MB | 16.7 MB | 1.25× |
+| Bytes sent, sparse checkout of `Documentation` | 4.6 MB | 5.4 MB | 1.16× |
+| Bytes sent, warm node updating `HEAD~15` → `HEAD` | 14 KB (thin pack) | 570 KB | about 41× |
+| Bytes sent, warm node updating `HEAD~50` → `HEAD` | 1.35 MB | 4.61 MB | 3.4× |
+
+**Why the gap.** Wren stores and sends every object whole, compressed on its
+own. Git packs delta-compress objects against each other, and a thin pack
+sends a changed file as a delta against the version the client already has.
+Adding HTTP gzip on top of Wren's frames saves under 1%.
+
+**How these were measured.** The byte counts were modeled from git/git's
+objects with `bench/wire_bytes.py`, using Wren's exact frame format, against
+`git pack-objects` for git. The storage figure is the size of the benchmark
+server's store on disk.
+
+**Not measured yet:**
+- real network latency (every number on this page is localhost);
+- server CPU per request;
+- how many round trips a deep tree costs: the client fetches one tree level
+  per round trip.
+
+Delta frames and packed storage are on the roadmap.
+
 ## Ingest and footprint
 
 | | |
 |---|---|
 | Initial sync (all objects + 85,545 changesets + commit graph + path index) | 173 s |
 | Objects imported | 421,115 |
-| Server-side git mirror after sync | **5.3 MiB** (refs only; fetched packs are absorbed into the object store and deleted) |
+| Server-side git mirror after sync | 5.3 MiB (refs only; fetched packs are absorbed into the object store and deleted) |
+| Object store after sync | 4.7 GB on disk (see [Costs](#costs)) |
 
 ## Blame agreement with git
 
@@ -103,6 +138,12 @@ misconfigured git baselines.
    drops from 278 ms to 50 ms and merge-base from 220 ms to 35 ms.
 4. **Disk note.** The earlier claim that Wren's store is smaller than git's
    `.git` was an artifact of mistake 1.
+
+5. **Attribution.** Earlier text credited Wren's checkout speed to skipping
+   have/want negotiation. A cold clone does not negotiate either. The real
+   difference is that Wren generates no packs. Earlier versions also did
+   not report storage or bytes on the wire, which are worse for Wren; see
+   [Costs](#costs).
 
 The script now enforces the fair setup: a silently ignored filter aborts
 the run.

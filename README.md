@@ -6,50 +6,76 @@
 </p>
 
 <p align="center">
-  <b>Agent-scale source control on top of git.</b><br>
-  History, blame and bisect without a clone. Checkouts that cost what you read.
+  <b>Server-side source control queries for git.</b><br>
+  History, blame, grep and bisect without a clone, for agents and CI.
 </p>
 
 <p align="center">
+  <a href="https://github.com/wrencanfly/wren/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/wrencanfly/wren/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-2F4BFF">
-  <img alt="Written in Rust" src="https://img.shields.io/badge/rust-1.99-B7410E">
+  <img alt="Written in Rust" src="https://img.shields.io/badge/rust-stable-B7410E">
   <img alt="Status: experimental" src="https://img.shields.io/badge/status-experimental-F2A516">
-  <img alt="Protocol: v1 draft" src="https://img.shields.io/badge/protocol-v1%20draft-11142B">
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
+  <a href="#for-agents-mcp">MCP</a> ·
   <a href="#how-it-works">How it works</a> ·
+  <a href="docs/principles.md">Scion principles</a> ·
   <a href="docs/benchmarks.md">Benchmarks</a> ·
-  <a href="docs/spec/wren-protocol-v1.md">Protocol spec</a> ·
-  <a href="docs/design.md">Design</a>
+  <a href="docs/spec/wren-protocol-v1.md">API reference</a>
 </p>
 
 ---
 
-Wren is a git-compatible acceleration layer for repositories that CI jobs and
-AI agents read far more often than humans do. It sits in front of any existing
-git host. There is nothing to migrate, and your git host stays the source of
-truth.
+Wren runs in front of an existing git host and answers source control
+questions on the server. A CI job or an AI agent can ask for log, blame,
+grep, diff, merge-base, "which merge brought this into main?" or a bisect
+step without cloning anything. When a job does need files, it fetches only
+the objects it reads, through cache tiers that all speak the same RPC, and
+gets a normal git working tree.
+
+Your git host stays the source of truth. Wren is read-only, and writes still
+go through `git push`.
+
+## Why
+
+Anthropic's [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control)
+describes how agents running all day broke the assumption that every git
+client is offline and holds a full copy of history. The article does not
+call for replacing git. It suggests that "Git platforms can provide
+comprehensive server-side RPCs like Scion, perhaps even in a standardized way
+across forges that the git client can learn to talk to."
+
+Wren is a working, open implementation of those server-side RPCs that you can
+run today, and a concrete starting point for standardizing them.
+[docs/principles.md](docs/principles.md) checks Wren against each Scion
+principle and lists what it deliberately leaves out.
+
+Wren is an independent project. It is not affiliated with or endorsed by
+Anthropic.
 
 |  |  |
 |---|---|
-| **Ask history without a clone** | Log, blame, diff, merge-base, ancestry, bisect and "which merge brought this into main?" are answered by a server over HTTP, a CLI, and an [MCP](https://modelcontextprotocol.io) server for agents. |
-| **Check out only what you read** | A *want-only* object protocol through cache tiers that all speak the same RPC. A sparse checkout never fetches blobs outside its cone. |
-| **Still just git** | `--git` checkouts are normal git working trees with a sparse index. Stock `git status`, `commit` and `push` work. |
+| **Ask history without a clone** | Log by path, blame, diff, merge-base, ancestry, `landed` and bisect are answered from server-side indexes: changesets, a commit graph with skip lists, a path index, and persisted blame. |
+| **Search and read at any revision** | `grep`, `cat` and `ls` at any commit, with no checkout. |
+| **Bounded, cacheable answers for agents** | MCP tools pin revisions to full commit ids, so answers are immutable and served by caches. Line ranges and output caps keep token use predictable. |
+| **Check out only what you read** | A want-only object protocol through same-RPC cache tiers. `--git` checkouts are stock git working trees with a sparse index, so `git status`, `commit` and `push` work. |
 | **Verified against git** | A seeded differential fuzz suite generates random histories and checks every answer against git itself. |
 
-Wren is inspired by Anthropic's
-[Scion](https://www.anthropic.com/engineering/redesigning-source-control).
-That post recommends bringing Scion's most successful ideas to git *without*
-leaving the git model, and Wren follows that advice.
-
-> [!NOTE]
-> **v0.1, experimental.** Wren serves reads only; writes go through
-> `git push`. Each repository has one authoritative server. Object reads, and
-> queries pinned to full commit ids, scale out through cache tiers. All other
-> queries are computed by that one server. See
-> [design §1](docs/design.md#1-目标与非目标) for the exact boundaries.
+> [!IMPORTANT]
+> **v0.1, experimental. Read this before you deploy.**
+> - **One trust domain.** A token can read every repository on a server, and
+>   the object store is shared across repositories. Run one Wren per trust
+>   domain.
+> - **Force-pushed content stays readable.** Objects removed from a branch
+>   remain in the store.
+> - **One authoritative server per repository** (SQLite). Object reads and
+>   pinned queries scale out through caches; everything else hits that
+>   server.
+> - **No TLS of its own.** Put Wren behind a TLS-terminating proxy.
+> - **Storage and incremental fetches cost more than git.** See
+>   [Costs](docs/benchmarks.md#costs).
 
 ## Quick start
 
@@ -58,7 +84,6 @@ cargo build --release
 export PATH=$PWD/target/release:$PATH
 
 # 1. Serve a repository mirrored from any git URL (or local path).
-#    Without --token, anyone who can reach the port can read every mirrored repo.
 export WREN_TOKEN=$(openssl rand -hex 16)
 wren server --data ./wren-data --repo git=https://github.com/git/git.git &
 
@@ -68,11 +93,12 @@ wren cache --upstream http://127.0.0.1:7070 --listen 127.0.0.1:7071 \
 export WREN_SERVER=http://127.0.0.1:7071 WREN_REPO=git
 ```
 
-**Ask questions without a checkout**
+**Ask without a checkout**
 
 ```sh
 wren log -n 5 -- builtin/blame.c
 wren blame Documentation/git-blame.adoc
+wren grep -i 'first.parent' builtin
 wren landed <commit> --into master        # which merge brought it into master
 wren merge-base master next
 wren diff master~1 master --name-status
@@ -86,14 +112,21 @@ wren checkout ws --sparse t/helper --git
 cd ws && git status && git log -1     # stock git works
 ```
 
-**Bisect without a clone.** Each step is a fresh sparse checkout that reuses
-the node-wide object store.
+**Find the commit that broke main.** Bisection runs over first-parent
+history. Each step is a fresh sparse checkout that reuses the node-wide
+object store.
 
 ```sh
 wren bisect --good v2.40.0 --bad master --sparse t -- make -C t test-lint
 ```
 
-### For agents (MCP)
+**Freshness.** Answers reflect the git host as of the last sync. Every
+unpinned answer carries a `wren-synced-at` header. A query that names a
+commit Wren has not seen, for example one you just pushed, triggers one sync
+before Wren answers. You can also point your host's push webhook at
+`POST /api/v1/repos/{repo}/sync`.
+
+## For agents (MCP)
 
 ```json
 { "mcpServers": { "wren": { "command": "wren", "args": ["mcp"],
@@ -101,9 +134,20 @@ wren bisect --good v2.40.0 --bad master --sparse t -- make -C t test-lint
            "WREN_TOKEN": "…" } } } }
 ```
 
-Tools: `wren_log`, `wren_show`, `wren_diff`, `wren_blame`, `wren_read_file`,
-`wren_list_dir`, `wren_merge_base`, `wren_is_ancestor`, `wren_landed`,
-`wren_bisect_step`, `wren_refs`.
+| Tool | Answers |
+|---|---|
+| `wren_log` | First-parent history, optionally for a path |
+| `wren_show`, `wren_diff` | What a commit changed; diffs between revisions |
+| `wren_blame` | Who last changed each line, for a line range |
+| `wren_read_file`, `wren_list_dir`, `wren_grep` | Files, directories and search at any revision |
+| `wren_merge_base`, `wren_is_ancestor`, `wren_landed` | Ancestry questions, such as "did this land on main, and through which merge?" |
+| `wren_bisect_step` | The next commit to test, or the first bad one |
+| `wren_refs` | Branches and tags, filtered by prefix |
+
+Every tool resolves its revisions to full commit ids first, and every answer
+names the commit it describes. Outputs are capped (about 10k tokens by
+default) and say when they were cut, so an agent can narrow the request
+instead of guessing.
 
 ## How it works
 
@@ -117,31 +161,33 @@ flowchart LR
   node --> co["git checkout<br/><small>sparse index</small>"]
 ```
 
-- **Changesets and derived data.** Each commit is ingested as the list of
-  paths it changed relative to its first parent. The commit graph
-  (generation numbers and first-parent skip lists) is derived recursively
-  from each changeset's parents. The path index is written atomically with
-  each changeset. Blame is derived lazily, one step per change to the file,
-  and persisted only when exact.
-- **Want-only protocol.** `POST /v1/objects {"oids": [...]}`. The client never
-  describes what it has. It walks down from the root tree and asks only for
-  objects it is missing. Every answer is immutable, so any tier can cache it,
-  clients verify every hash, and retries resume for free.
-- **Pinned queries are immutable.** A query whose revisions are all full
-  commit ids can never change its answer. The server marks it
-  `Cache-Control: immutable` and caches keep it forever.
-- **Lean server.** The git mirror keeps refs only. Fetched packs are absorbed
-  into a content-addressed object store and deleted.
-- **Git compatibility.** Objects are stored and shipped in git's loose format.
-  For `--git` checkouts Wren writes git's sparse index directly (stat data,
-  skip-worktree bits, sparse directory entries), configures cone-mode sparse
-  checkout, and sets the git host as a promisor remote.
+- **Changesets.** Each commit is ingested as the list of paths it changed
+  relative to its first parent. The path index is written in the same
+  transaction.
+- **Derived data.** The commit graph (generation numbers and first-parent
+  skip lists) is derived recursively from parents. Blame is derived lazily,
+  one step per change to the file, and persisted.
+- **Immutable answers.** Objects are content-addressed. A query whose
+  revisions are all full commit ids can never change its answer, so it is
+  marked `immutable`. Caches keep it, keyed by a query-semantics version
+  (`wren-semantics`), so an algorithm change never mixes old and new
+  answers.
+- **Want-only objects.** `POST /v1/objects {"oids": [...]}`. The client walks
+  down from the root tree and asks only for objects it is missing. It
+  verifies every hash, and retries resume.
+- **Git compatibility.** Objects use git's loose format. For `--git`
+  checkouts Wren writes git's sparse index directly, configures cone-mode
+  sparse checkout, and sets the git host as a promisor remote.
+- **Lean mirror, not a lean store.** The server's git mirror keeps refs
+  only: fetched packs are absorbed into the object store and deleted. That
+  store holds loose objects, which take far more disk than a git pack.
 
 ## Benchmarks
 
-On [git/git](https://github.com/git/git) (85k commits), against git's *best*
-equivalent setup: a partial clone that really applies its filter, a
-commit-graph with Bloom filters, and `worktree add` on a warm node.
+On [git/git](https://github.com/git/git) (85k commits, local machine),
+against git's *best* equivalent setup: a partial clone that really applies
+its filter, a commit-graph with Bloom filters, and `worktree add` on a warm
+node.
 
 | Scenario | git | Wren | |
 |---|---:|---:|---:|
@@ -153,22 +199,40 @@ commit-graph with Bloom filters, and `worktree add` on a warm node.
 | `blame`, warm | 86 ms | 14 ms | 6× |
 | `blame`, first time for a file | 86 ms | 622 ms | **slower** |
 
-Full results, method and caveats, including the baseline mistakes an earlier
-version made: [docs/benchmarks.md](docs/benchmarks.md).
+**Costs.** Wren's object store for git/git is 4.7 GB of loose objects, about
+15× the size of a git pack. An incremental update from `HEAD~15` sends 570 KB
+where a git thin pack sends 14 KB. Full results, method, corrections and
+caveats are in [docs/benchmarks.md](docs/benchmarks.md).
+
+## Roadmap
+
+- **Upstream.** Send the sparse/promisor report to the git list, and write a
+  proposal for git protocol v2 extensions: a `query` command family, and a
+  `missing-ok` option for want-only fetches. The goal is for stock git
+  clients to use these RPCs.
+- **Cheaper cold blame.** Derive the whole chain in one pass and diff with
+  imara-diff ([research](docs/research/04-cold-blame.md)).
+- **Costs.** Delta frames for incremental fetches, packed storage, and
+  per-repository authorization.
+- **Post-merge testing.** Build a `culprit` workflow on `landed` and `bisect`.
+
+Not planned: virtual filesystems, server-side commits, becoming the source of
+truth, merge queues and code review.
 
 ## Documentation
 
 | | |
 |---|---|
-| [Protocol spec v1](docs/spec/wren-protocol-v1.md) | Wire format, endpoints and caching rules (draft) |
-| [Design](docs/design.md) | Data model, invariants, limitations, roadmap (Chinese) |
-| [Scion analysis](docs/00-overview.md) | What Wren takes from Scion and why (Chinese) |
-| [Design reviews](docs/reviews) | Independent reviews against the Scion article |
+| [Scion principles](docs/principles.md) | How Wren maps to each Scion principle, and where it deliberately differs |
+| [API reference](docs/spec/wren-protocol-v1.md) | Endpoints, wire format and caching rules (draft, unstable) |
+| [Benchmarks](docs/benchmarks.md) | Method, results, costs and corrections |
+| [Design](docs/design.md) | Data model, invariants, limitations (Chinese) |
+| [Reviews](docs/reviews) and [research](docs/research) | Design reviews and research notes written with AI agents during development (Chinese) |
 
 ## Development
 
 ```sh
-cargo test                                   # unit + differential fuzz (vs git) + end-to-end
+cargo test --release                         # unit + differential fuzz (vs git) + end-to-end
 WREN_FUZZ_SEEDS=1,2,3,0xbeef cargo test --release -p wren-vcs-core --test differential
 ```
 

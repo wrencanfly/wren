@@ -1,10 +1,11 @@
 # Wren 设计文档
 
-Wren 是一个 **git 兼容的源码控制加速层**，面向 agent 规模的仓库。它部署在任意 git 托管（GitHub、GitLab、Gitea、自建）前面，把 Anthropic Scion 的读路径设计带给 git 用户，并且不要求迁移。
+Wren 是 **git 的服务端源码控制查询层**。它部署在任意 git 托管（GitHub、GitLab、Gitea、自建）前面，把 Anthropic Scion 的读路径带给 git 用户，不要求迁移。同时，它也是原文建议 forge 提供的"服务端 RPC"的一份可运行实现，可以作为标准化讨论的起点。
 
 - 背景与动机：[00-overview.md](00-overview.md)
-- 协议规范：[spec/wren-protocol-v1.md](spec/wren-protocol-v1.md)
-- 独立审阅报告：[reviews/](reviews/)，修复情况见 §11
+- 对照 Scion 各条原则：[principles.md](principles.md)
+- API 参考（草案）：[spec/wren-protocol-v1.md](spec/wren-protocol-v1.md)
+- AI agent 撰写的审阅报告：[reviews/](reviews/)，修复情况见 §11
 
 ## 1. 目标与非目标
 
@@ -15,17 +16,19 @@ Wren 是一个 **git 兼容的源码控制加速层**，面向 agent 规模的�
 - **对象读取**可以水平扩展：对象不可变、内容寻址，每层缓存的 RPC 都相同。
 - 产出的工作目录对原生 git 完全可用，`git status`、`git commit`、`git push` 都能正常工作，并且不会触发懒拉取。
 - 正确性以 git 为准：每一个查询都和 git CLI 做差分测试。
+- 面向 agent 的回答有界、可缓存：MCP 先把修订解析成完整 commit id，输出带行范围和长度上限。
 
 **v0.1 的扩展边界（实话实说）**
 
 - 每个仓库只有**一个权威 server**：元数据是本地 SQLite，同步锁是进程内锁。多个 server 不能共享同一个仓库。
 - 能横向扩展的是对象读取，以及"固定到完整 commit id 的查询"，后者可以被缓存层永久缓存（§6）。其余查询都由权威 server 计算。
-- 权威 server 的对象存储里有一份完整的对象集，这是"权威层"的固有成本。消除它需要把对象存储换成 S3/GCS 一类后端，见路线图。
+- 权威 server 的对象存储里有一份完整的对象集，并且是 loose 格式：git/git 占 4.7 GB，打成 pack 约 313 MiB，相差约 15 倍（见 benchmarks.md 的 Costs 一节）。
+- **单一信任域**：token 不区分仓库，对象存储跨仓库共享，force-push 掉的对象仍然可读。每个信任域部署一套 Wren。
 
 **非目标（v0.1）**
 
-- 取代 git 托管。写入仍然走 `git push` 到源站，Wren 只是只读镜像加计算层。
-- 服务端提交、无锁合入、目录级 ACL。只要源站还能被直接 clone，目录 ACL 就算不上真正的安全边界。
+- 取代 git 托管，或成为权威源。写入仍然走 `git push` 到源站，Wren 只是只读镜像加计算层。原文的建议是"不偏离 git 的整体模型"，所以这条不做。
+- 服务端提交、无锁合入、目录级 ACL、merge queue、code review。
 - 虚拟文件系统（FUSE / FSKit / ProjFS）。
 
 ## 2. 组件
@@ -163,6 +166,7 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 
 - 对象请求先查本地存储，未命中的合并成一个批次回源。
 - **固定查询的不可变缓存**：所有 rev 参数都是 40 位完整 commit id 的查询，答案永远不变。server 会给这类响应加 `Cache-Control: immutable`，缓存层把它落盘，以后直接回答。分支名或默认 HEAD 的查询一律透传。
+- **查询语义版本**：答案是"不可变输入 + 算法"的纯函数。算法改变答案时（例如换 blame 的行 diff 启发式），`QUERY_SEMANTICS` 加一，并通过 `wren-semantics` 响应头告知。缓存层用它作为缓存 key 的一部分，新旧答案不会混在一起。
 - 所有回源请求（对象和查询）共用一个并发上限（`--upstream-concurrency`），并且有超时（`--upstream-timeout`），避免冷缓存把上层打垮。这对应原文的"严格分层，隔离故障域"。
 - `/v1/stats` 报告对象和查询的命中情况。
 
@@ -171,6 +175,9 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 - `--token` / `WREN_TOKEN`：除 `/healthz` 外，所有请求都必须带 `Authorization: Bearer <token>`，比较用常数时间。缓存层用 `--token` 校验自己的客户端，用 `--upstream-token` 向上游证明身份。token 不会写进 checkout 的 `.wren/config.json`。
 - server 监听非回环地址却没设 token 时，会打印警告：所有镜像的仓库都会被任何能连上端口的人读到。
 - `GET /api/v1/repos` 返回 `last_sync`（上次成功同步的时间）和 `last_sync_error`。像 `landed` 这类回答反映的是那个时刻的源站状态。
+- 每个未固定的查询响应都带 `wren-synced-at` 头。
+- **按需同步（read-your-writes）**：查询里出现 Wren 没见过的修订（例如刚 push 的 commit 或新分支）时，server 先同步一次再回答。同一仓库的并发请求共享一次同步，两次按需同步至少间隔 1 秒。源站的 push webhook 也可以直接指向 `POST /api/v1/repos/{repo}/sync`。
+- 开启 token 时，不可变响应的 `Cache-Control` 是 `private`，只允许 Wren 自己的缓存层保存，CDN 和共享 HTTP 缓存不得保存。
 
 ## 8. 不变量（给人和 agent 的"不"清单）
 
@@ -226,6 +233,14 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 | 03 S5 | 没有鉴权 | ✅ bearer token，暴露在非回环地址时警告 |
 | 03 S6 | sparse 与 promisor 的组合问题应反馈给 git | 📝 已起草，见 [upstream/git-sparse-promisor.md](upstream/git-sparse-promisor.md)，**尚未发送** |
 | 01 S3 | 缓存只增不减 | ⏳ 路线图 |
+| 05、07 | 固定答案的不可变承诺与算法实现绑死 | ✅ `wren-semantics` 版本，缓存 key 包含它 |
+| 05 | 错误没有机器可读的错误码；私有仓库的响应被标为 `public` | ✅ `ErrorBody.code`；有 token 时用 `private` |
+| 06 | MCP 默认查 `HEAD`，全部穿透缓存；输出没有上限 | ✅ 先解析成完整 id；行范围和输出上限 |
+| 06 | push 后读不到自己的提交 | ✅ 按需同步、`wren-synced-at` |
+| 06、07 | agent 缺少代码搜索 | ✅ `grep`（API、CLI、MCP） |
+| 05、07 | 存储放大和线上字节数没有披露；"省掉协商"的归因不成立 | ✅ benchmarks.md 加了 Costs 一节，附 `bench/wire_bytes.py` |
+| 07 | 名字和 FluxCD、crates.io 冲突 | ✅ 改名 Wren |
+| 04、07 | 定位与原文建议冲突（"另造一个系统"） | ✅ 重新定位为服务端查询 RPC 的实现，见 principles.md；砍掉虚拟化 checkout 和"成为权威源"两项 |
 | spec #1–3 | 修订语法太宽松（`main~1x`）；40 位 id 可被同名 ref 遮蔽；ref 查找顺序与 git 不同 | ✅ 严格解析，并按 git 的规则查找 |
 | spec #14 | bisect 下界错误：good 不在主干上时会误判 | ✅ 下界改为"bad 第一父链上、同时是 good 祖先的最新提交"，并加了差分测试 |
 | spec #6–9、#11、#12、#21 | 错误码不一致；缓存不校验哈希；降级的 blame 结果被标成不可变；frame 长度溢出；mode 表示不一致；`no-store` 头被丢掉 | ✅ |
@@ -233,10 +248,11 @@ GET  /v1/capabilities   → {"protocol":1,"object_format":"sha1","tier":"server|
 
 ## 12. 路线图
 
-| 阶段 | 内容 |
+| 方向 | 内容 |
 |---|---|
-| v0.2 | 对象存储后端换成 S3/GCS/R2，元数据换成 Postgres 或 Spanner，从而支持多个 server 和无状态 server；webhook 触发同步；缓存层加 singleflight |
-| v0.2 | 带引用计数的空间回收：节点存储登记哪些 checkout 通过 alternates 在用；缓存层按 LRU 淘汰 |
-| v0.3 | 虚拟化 checkout（macOS FSKit / Linux FUSE），按读取需要实时拉取 |
-| v0.4 | Wren 作为可选的权威源：服务端 commit、rebase、merge API，无锁 ref CAS，目录级 ACL 在这时才成为真正的安全边界 |
-| 持续 | 推动 spec 跨 forge 标准化；探索把查询映射成 git protocol v2 命令 |
+| 上游 | 发出 sparse/promisor 报告；写一份 git protocol v2 扩展提案：`query` 命令族、want-only 拉取的 `missing-ok`、用 promisor-remote 宣告缓存层。目标是让原生 git 客户端能直接用这些 RPC |
+| 冷 blame | 一次推导整条链、单事务持久化、改用 imara-diff（[research/04](research/04-cold-blame.md)） |
+| 代价 | delta 帧（增量拉取）；pack 化存储；按仓库授权；空间回收（引用计数加 LRU） |
+| 合入后测试 | 基于 `landed` 和 `bisect` 的 `culprit` 工作流 |
+| 扩展 | 只在有真实部署方需要时再做：S3/GCS 对象后端、Postgres 元数据、多个 server、缓存层 singleflight |
+| 不做 | 虚拟文件系统；服务端提交；成为权威源；merge queue；code review |

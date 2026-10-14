@@ -1,6 +1,6 @@
 # Contributing to Wren
 
-1. Read [docs/design.md](docs/design.md), especially **§7 Invariants**. Changes
+1. Read [docs/design.md](docs/design.md), especially **§8 Invariants**. Changes
    that break an invariant will not be merged, however convenient.
 2. Every query Wren answers must have a differential test against git
    (`crates/wren-core/tests/differential.rs`). git is the oracle.
