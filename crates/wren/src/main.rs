@@ -186,6 +186,23 @@ enum Cmd {
         #[command(flatten)]
         target: Target,
     },
+    /// Search file contents at a revision without checking anything out
+    /// (like `git grep -n`). The pattern is a Rust regex.
+    Grep {
+        pattern: String,
+        /// Limit the search to a file or directory.
+        #[arg(default_value = "")]
+        path: String,
+        #[arg(long, default_value = "HEAD")]
+        rev: String,
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+        /// Maximum number of matching lines.
+        #[arg(short = 'm', long, default_value_t = 100)]
+        limit: usize,
+        #[command(flatten)]
+        target: Target,
+    },
     /// Print a file at a revision without checking anything out.
     Cat {
         path: String,
@@ -329,11 +346,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if token.is_none() && !listen.ip().is_loopback() {
                 tracing::warn!("listening on {listen} without --token: every mirrored repository is readable by anyone who can reach this port");
             }
-            let state = Arc::new(server::ServerState {
-                store,
-                repos: map,
-                token,
-            });
+            let state = Arc::new(server::ServerState::new(store, map, token));
             server::spawn_pollers(state.clone(), (poll > 0).then(|| Duration::from_secs(poll)));
             let listener = tokio::net::TcpListener::bind(listen).await?;
             tracing::info!(
@@ -362,7 +375,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 upstream_token,
                 upstream_permits: tokio::sync::Semaphore::new(upstream_concurrency),
                 stats: Default::default(),
+                semantics: Default::default(),
             });
+            state.discover_semantics().await;
             let listener = tokio::net::TcpListener::bind(listen).await?;
             tracing::info!(
                 "wren cache listening on http://{listen}, upstream {}",
@@ -611,6 +626,44 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     eprintln!("{commit} is not contained in {into}");
                     return Ok(ExitCode::FAILURE);
                 }
+            }
+        }
+        Cmd::Grep {
+            pattern,
+            path,
+            rev,
+            ignore_case,
+            limit,
+            target,
+        } => {
+            let c = need_repo(&target).await?;
+            let limit = limit.to_string();
+            let mut q = vec![
+                ("pattern", pattern.as_str()),
+                ("rev", rev.as_str()),
+                ("limit", limit.as_str()),
+            ];
+            if !path.is_empty() {
+                q.push(("path", path.as_str()));
+            }
+            if ignore_case {
+                q.push(("ignore_case", "true"));
+            }
+            let r: wren_core::grep::GrepResponse = c.get("grep", &q).await?;
+            if target.json {
+                return print_json(&r).map(|_| ExitCode::SUCCESS);
+            }
+            for m in &r.matches {
+                println!("{}:{}:{}", m.path, m.line, m.text);
+            }
+            if r.truncated {
+                eprintln!(
+                    "(stopped after {} matches; raise --limit for more)",
+                    r.matches.len()
+                );
+            }
+            if r.matches.is_empty() {
+                return Ok(ExitCode::FAILURE);
             }
         }
         Cmd::Cat { path, rev, target } => {

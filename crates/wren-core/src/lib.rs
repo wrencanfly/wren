@@ -9,6 +9,7 @@ pub mod changes;
 pub mod derived;
 pub mod git_source;
 pub mod graph;
+pub mod grep;
 pub mod index;
 pub mod meta;
 pub mod object;

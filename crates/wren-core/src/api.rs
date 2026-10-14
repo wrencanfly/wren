@@ -35,9 +35,19 @@ pub struct Capabilities {
     pub object_format: String,
     pub tier: String,
     pub features: Vec<String>,
+    /// Version of the query answers' semantics (see [`QUERY_SEMANTICS`]).
+    #[serde(default)]
+    pub semantics: String,
 }
 
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Version of the *answers*, separate from the wire protocol. A pinned query
+/// is a pure function of immutable inputs and this version: when an algorithm
+/// changes what it returns (e.g. a different line-diff heuristic in blame),
+/// this is bumped, and caches key stored answers by it so old and new answers
+/// never mix. Sent on every response as the `wren-semantics` header.
+pub const QUERY_SEMANTICS: &str = "1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RefInfo {
@@ -147,7 +157,12 @@ pub struct TreeResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ErrorBody {
+    /// Human-readable message.
     pub error: String,
+    /// Machine-readable code: `not_found`, `bad_request`, `unauthorized`,
+    /// `too_large`, `upstream_unavailable` or `internal`.
+    #[serde(default)]
+    pub code: String,
 }
 
 impl Repo {

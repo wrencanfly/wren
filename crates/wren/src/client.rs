@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use wren_core::api::*;
-use wren_core::wire::{FrameDecoder, ObjectsRequest};
-use wren_core::{ObjectStore, Oid};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use wren_core::api::*;
+use wren_core::wire::{FrameDecoder, ObjectsRequest};
+use wren_core::{ObjectStore, Oid};
 
 pub const BATCH: usize = 1000;
 pub const PARALLEL: usize = 16;

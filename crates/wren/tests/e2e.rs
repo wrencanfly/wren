@@ -365,6 +365,13 @@ fn end_to_end() {
     // …and the research blob still was never fetched.
     assert!(!store2.join(&model_oid[..2]).join(&model_oid[2..]).exists());
 
+    // Read-your-writes: the server polls only once (--poll 0), yet a query
+    // naming the just-pushed commit by full id is answered at once, because
+    // an unknown revision triggers one on-demand sync.
+    let pushed = git(&ws, &["rev-parse", "HEAD"]);
+    let shown = wren_ok(&["show", pushed.trim()], &env, None);
+    assert!(shown.contains("agent: bump api"), "{shown}");
+
     // The server picks up the push.
     wren_ok(&["sync"], &env, None);
     let log = wren_ok(&["log", "-n", "3"], &env, None);
@@ -392,6 +399,14 @@ fn end_to_end() {
     );
     let diff = wren_ok(&["diff", "main"], &env, None);
     assert!(diff.contains("+    println!(\"api v2\");"), "{diff}");
+    // Server-side grep agrees with git grep.
+    let grep = wren_ok(&["grep", "println", "services"], &env, None);
+    let expected = git(&up, &["grep", "-n", "println", "main", "--", "services"]);
+    let expected: String = expected
+        .lines()
+        .map(|l| format!("{}\n", l.strip_prefix("main:").unwrap()))
+        .collect();
+    assert_eq!(grep, expected);
     let mb = wren_ok(&["merge-base", "feature", "main~2"], &env, None);
     assert_eq!(
         mb.trim(),
@@ -490,8 +505,22 @@ fn end_to_end() {
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
         assert!(text.contains("wren-protocol: 1"), "{text}");
+        assert!(text.contains("wren-semantics: 1"), "{text}");
         assert!(text.contains("\"protocol\":1"), "{text}");
     }
+
+    // Errors carry a machine-readable code.
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "-H",
+            "Authorization: Bearer s3cret-cache",
+            &format!("{cache_url}/api/v1/repos/nope/refs"),
+        ])
+        .output()
+        .unwrap();
+    let err: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(err["code"], "not_found", "{err}");
 
     // Freshness is visible to clients.
     let repos = wren_ok(&["repos", "--json"], &env, None);
@@ -606,6 +635,26 @@ fn end_to_end() {
         serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"wren_read_file","arguments":{"path":"nope"}}}),
     );
     assert_eq!(bad["result"]["isError"], true);
+    // Agents ask about "HEAD", but the tools pin it to a full commit id first,
+    // so a repeated question is answered by the cache tier.
+    let hits2 = stats("api_hits");
+    let mut blame_text = String::new();
+    for id in [5, 6] {
+        let r = rpc(
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"wren_blame","arguments":{"path":"services/api/lib.rs","end_line":1}}}),
+        );
+        blame_text = r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    }
+    assert!(blame_text.contains("(lines 1-1 of"), "{blame_text}");
+    assert!(stats("api_hits") > hits2, "MCP queries should be cacheable");
+    let found = rpc(
+        serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"wren_grep","arguments":{"pattern":"health"}}}),
+    );
+    let found = found["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(found.contains("services/api/lib.rs:"), "{found}");
     drop(stdin);
     let _ = mcp.wait();
     let _ = PathBuf::new();

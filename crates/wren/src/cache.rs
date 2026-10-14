@@ -23,14 +23,17 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use wren_core::api::{Capabilities, PROTOCOL_VERSION};
-use wren_core::wire::{self, FrameDecoder, ObjectsRequest};
-use wren_core::{ObjectStore, Oid};
 use serde::Serialize;
 use sha1::{Digest, Sha1};
 use tokio::sync::Semaphore;
+use wren_core::api::{Capabilities, PROTOCOL_VERSION, QUERY_SEMANTICS};
+use wren_core::wire::{self, FrameDecoder, ObjectsRequest};
+use wren_core::{ObjectStore, Oid};
 
-use crate::server::{objects_response, protocol_header, require_token, ApiError, IMMUTABLE};
+use crate::server::{
+    immutable, objects_response, protocol_header, require_token, ApiError, FEATURES,
+    SEMANTICS_HEADER, SYNCED_AT_HEADER,
+};
 
 pub struct CacheState {
     pub store: Arc<ObjectStore>,
@@ -45,6 +48,10 @@ pub struct CacheState {
     /// Bounds concurrent upstream requests (objects and queries alike).
     pub upstream_permits: Semaphore,
     pub stats: Stats,
+    /// The upstream's query semantics version, learned from its responses.
+    /// Stored answers are keyed by it, so a server upgrade that changes
+    /// answers never mixes old and new ones.
+    pub semantics: std::sync::RwLock<String>,
 }
 
 #[derive(Default)]
@@ -84,21 +91,13 @@ pub fn router(state: Arc<CacheState>) -> Router {
         .with_state(state)
 }
 
-async fn capabilities() -> Json<Capabilities> {
+async fn capabilities(State(st): St) -> Json<Capabilities> {
     Json(Capabilities {
         protocol: PROTOCOL_VERSION,
         object_format: "sha1".into(),
         tier: "cache".into(),
-        features: [
-            "objects-batch",
-            "objects-single",
-            "query-api",
-            "bisect",
-            "landed",
-            "immutable-pinned-queries",
-        ]
-        .map(String::from)
-        .to_vec(),
+        features: FEATURES.iter().map(|f| f.to_string()).collect(),
+        semantics: st.current_semantics(),
     })
 }
 
@@ -120,6 +119,38 @@ async fn stats(State(st): St) -> Json<StatsBody> {
 }
 
 impl CacheState {
+    fn current_semantics(&self) -> String {
+        let s = self.semantics.read().unwrap_or_else(|p| p.into_inner());
+        if s.is_empty() {
+            QUERY_SEMANTICS.to_string()
+        } else {
+            s.clone()
+        }
+    }
+
+    fn learn_semantics(&self, v: &str) {
+        let mut s = self.semantics.write().unwrap_or_else(|p| p.into_inner());
+        if *s != v {
+            *s = v.to_string();
+        }
+    }
+
+    /// Ask the upstream which semantics it serves (best effort; every
+    /// upstream response also carries it).
+    pub async fn discover_semantics(&self) {
+        let resp = self
+            .upstream_request(reqwest::Method::GET, "/v1/capabilities")
+            .send()
+            .await;
+        if let Ok(caps) = resp {
+            if let Ok(caps) = caps.json::<Capabilities>().await {
+                if !caps.semantics.is_empty() {
+                    self.learn_semantics(&caps.semantics);
+                }
+            }
+        }
+    }
+
     fn upstream_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let mut rb = self
             .http
@@ -240,7 +271,7 @@ async fn object_one(State(st): St, Path(oid): Path<String>) -> Result<Response, 
         Some(raw) => Ok((
             [
                 (header::CONTENT_TYPE, "application/x-git-loose-object"),
-                (header::CACHE_CONTROL, IMMUTABLE),
+                (header::CACHE_CONTROL, immutable(st.token.is_some())),
             ],
             raw,
         )
@@ -256,8 +287,8 @@ fn upstream_error(e: anyhow::Error) -> ApiError {
     ApiError(StatusCode::BAD_GATEWAY, format!("upstream: {e:#}"))
 }
 
-fn api_cache_path(st: &CacheState, path_q: &str) -> PathBuf {
-    let key = hex::encode(Sha1::digest(path_q.as_bytes()));
+fn api_cache_path(st: &CacheState, semantics: &str, path_q: &str) -> PathBuf {
+    let key = hex::encode(Sha1::digest(format!("{semantics}\n{path_q}").as_bytes()));
     st.api_dir.join(&key[..2]).join(&key[2..])
 }
 
@@ -271,7 +302,8 @@ async fn proxy(State(st): St, req: Request) -> Result<Response, ApiError> {
         .unwrap_or_default();
     let method = req.method().clone();
     let cacheable = method == axum::http::Method::GET;
-    let cache_file = api_cache_path(&st, &path_q);
+    let semantics = st.current_semantics();
+    let cache_file = api_cache_path(&st, &semantics, &path_q);
     if cacheable {
         if let Ok(body) = tokio::fs::read(&cache_file).await {
             st.stats.api_hits.fetch_add(1, Ordering::Relaxed);
@@ -282,8 +314,13 @@ async fn proxy(State(st): St, req: Request) -> Result<Response, ApiError> {
             if let Ok(v) = HeaderValue::from_str(&ctype) {
                 out.headers_mut().insert(header::CONTENT_TYPE, v);
             }
-            out.headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static(IMMUTABLE));
+            out.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(immutable(st.token.is_some())),
+            );
+            if let Ok(v) = HeaderValue::from_str(&semantics) {
+                out.headers_mut().insert(SEMANTICS_HEADER, v);
+            }
             return Ok(out);
         }
         st.stats.api_misses.fetch_add(1, Ordering::Relaxed);
@@ -313,15 +350,29 @@ async fn proxy(State(st): St, req: Request) -> Result<Response, ApiError> {
     let status = resp.status();
     let ctype = resp.headers().get(header::CONTENT_TYPE).cloned();
     let cache_control = resp.headers().get(header::CACHE_CONTROL).cloned();
-    let immutable = resp
+    let synced_at = resp.headers().get(SYNCED_AT_HEADER).cloned();
+    let resp_semantics = resp
+        .headers()
+        .get(SEMANTICS_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Some(v) = &resp_semantics {
+        st.learn_semantics(v);
+    }
+    let upstream_immutable = resp
         .headers()
         .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("immutable"));
     let bytes = resp.bytes().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    if cacheable && immutable && status == StatusCode::OK {
+    if cacheable && upstream_immutable && status == StatusCode::OK {
+        // Store under the semantics that produced the answer.
+        let file = match &resp_semantics {
+            Some(v) if *v != semantics => api_cache_path(&st, v, &path_q),
+            _ => cache_file,
+        };
         let _ = write_atomic(
-            &cache_file,
+            &file,
             &bytes,
             ctype.as_ref().and_then(|c| c.to_str().ok()).unwrap_or(""),
         )
@@ -336,6 +387,12 @@ async fn proxy(State(st): St, req: Request) -> Result<Response, ApiError> {
     // …) so HTTP caches below this tier can honour it too.
     if let Some(cc) = cache_control {
         out.headers_mut().insert(header::CACHE_CONTROL, cc);
+    }
+    if let Some(v) = synced_at {
+        out.headers_mut().insert(SYNCED_AT_HEADER, v);
+    }
+    if let Some(v) = resp_semantics.and_then(|v| HeaderValue::from_str(&v).ok()) {
+        out.headers_mut().insert(SEMANTICS_HEADER, v);
     }
     Ok(out)
 }
