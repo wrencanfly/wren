@@ -8,7 +8,8 @@
 //! * query responses the upstream marked `immutable`, i.e. queries whose
 //!   every revision is a full commit id (see `server::is_pinned`).
 //!
-//! Other query calls are forwarded. All upstream traffic shares one
+//! Other query calls are forwarded. Writes are refused: they go directly to
+//! the server (the control plane). All upstream traffic shares one
 //! concurrency limit and has a timeout, so a cold or flooded cache cannot
 //! overwhelm the tier above it.
 
@@ -292,6 +293,22 @@ fn api_cache_path(st: &CacheState, semantics: &str, path_q: &str) -> PathBuf {
     st.api_dir.join(&key[..2]).join(&key[2..])
 }
 
+/// Whether a request under /api/ may be forwarded. The cache presents its
+/// own upstream token, so relaying a write would let anyone who can reach the
+/// cache write with the cache's credentials. Only queries (GET) and the
+/// sync trigger pass.
+fn is_read(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    if *method == Method::GET || *method == Method::HEAD {
+        return true;
+    }
+    let sync = path
+        .strip_prefix("/api/v1/repos/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(repo, endpoint)| !repo.is_empty() && endpoint == "sync");
+    *method == Method::POST && sync
+}
+
 /// Serve a query: from the immutable response cache when possible,
 /// otherwise forwarded to the upstream tier.
 async fn proxy(State(st): St, req: Request) -> Result<Response, ApiError> {
@@ -301,6 +318,14 @@ async fn proxy(State(st): St, req: Request) -> Result<Response, ApiError> {
         .map(|p| p.as_str().to_string())
         .unwrap_or_default();
     let method = req.method().clone();
+    if !is_read(&method, req.uri().path()) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "a cache does not relay writes; send them directly to the server \
+             (the control plane)"
+                .into(),
+        ));
+    }
     let cacheable = method == axum::http::Method::GET;
     let semantics = st.current_semantics();
     let cache_file = api_cache_path(&st, &semantics, &path_q);

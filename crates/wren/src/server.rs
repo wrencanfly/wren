@@ -19,12 +19,17 @@ use wren_core::changes::normalize_path;
 use wren_core::wire::{self, ObjectsRequest};
 use wren_core::{ObjectStore, Oid, Repo};
 
+mod writes;
+
 pub struct ServerState {
     pub store: Arc<ObjectStore>,
     pub repos: BTreeMap<String, Arc<Repo>>,
     /// If set, every request except /healthz must carry
     /// `Authorization: Bearer <token>`.
     pub token: Option<String>,
+    /// If set, the write API is enabled and needs this token. It is also
+    /// accepted wherever `token` is.
+    pub write_token: Option<String>,
     /// Per repo: when the last on-demand sync finished (see `resolve`).
     pub on_demand: BTreeMap<String, Mutex<Option<Instant>>>,
 }
@@ -38,6 +43,7 @@ impl ServerState {
         store: Arc<ObjectStore>,
         repos: BTreeMap<String, Arc<Repo>>,
         token: Option<String>,
+        write_token: Option<String>,
     ) -> ServerState {
         let on_demand = repos
             .keys()
@@ -47,6 +53,7 @@ impl ServerState {
             store,
             repos,
             token,
+            write_token,
             on_demand,
         }
     }
@@ -94,6 +101,8 @@ impl IntoResponse for ApiError {
             StatusCode::NOT_FOUND => "not_found",
             StatusCode::BAD_REQUEST => "bad_request",
             StatusCode::UNAUTHORIZED => "unauthorized",
+            StatusCode::FORBIDDEN => "forbidden",
+            StatusCode::CONFLICT => "conflict",
             StatusCode::PAYLOAD_TOO_LARGE => "too_large",
             StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => "upstream_unavailable",
             _ => "internal",
@@ -148,9 +157,8 @@ fn repo(st: &ServerState, name: &str) -> ApiResult<Arc<Repo>> {
 // ---- router -----------------------------------------------------------------
 
 pub fn router(state: Arc<ServerState>) -> Router {
-    let token = state.token.clone();
     let private = state.private();
-    Router::new()
+    let reads = Router::new()
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/objects", post(objects_batch))
         .route("/v1/objects/{oid}", get(object_one))
@@ -176,9 +184,12 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .layer(axum::middleware::from_fn(move |req, next| {
             pinned_queries_are_immutable(private, req, next)
         }))
-        .layer(axum::middleware::from_fn(move |req, next| {
-            require_token(token.clone(), req, next)
-        }))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_read_token,
+        ));
+    reads
+        .merge(writes::routes(state.clone()))
         .route("/healthz", get(|| async { "ok" }))
         .layer(axum::middleware::map_response(protocol_header))
         .with_state(state)
@@ -243,6 +254,31 @@ pub async fn require_token(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .is_some_and(|got| constant_time_eq(got.as_bytes(), t.as_bytes()));
+        if !ok {
+            return ApiError(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid bearer token".into(),
+            )
+            .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Reads need the read token (when one is configured) or the write token.
+async fn require_read_token(
+    State(st): St,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(t) = &st.token {
+        let ok = writes::bearer(&req).is_some_and(|got| {
+            constant_time_eq(got.as_bytes(), t.as_bytes())
+                || st
+                    .write_token
+                    .as_deref()
+                    .is_some_and(|w| constant_time_eq(got.as_bytes(), w.as_bytes()))
+        });
         if !ok {
             return ApiError(
                 StatusCode::UNAUTHORIZED,
@@ -348,12 +384,19 @@ pub const FEATURES: &[&str] = &[
     "error-codes",
 ];
 
-async fn capabilities() -> Json<Capabilities> {
+/// Advertised only by a server started with a write token.
+pub const WRITE_FEATURE: &str = "write.v1";
+
+async fn capabilities(State(st): St) -> Json<Capabilities> {
+    let mut features: Vec<String> = FEATURES.iter().map(|f| f.to_string()).collect();
+    if st.write_token.is_some() {
+        features.push(WRITE_FEATURE.into());
+    }
     Json(Capabilities {
         protocol: PROTOCOL_VERSION,
         object_format: "sha1".into(),
         tier: "server".into(),
-        features: FEATURES.iter().map(|f| f.to_string()).collect(),
+        features,
         semantics: QUERY_SEMANTICS.into(),
     })
 }

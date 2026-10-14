@@ -6,9 +6,9 @@
 | Protocol major version | **1** (the `wren-protocol` header, [§1.2](#12-protocol-version-and-the-wren-protocol-header)) |
 | Query semantics version | **`1`** (the `wren-semantics` header, [§7.3](#73-the-immutability-contract)) |
 | Reference implementation | `crates/wren` (server, cache, client) and `crates/wren-core` |
-| Reference test suite | `crates/wren-core/tests/differential.rs` (git as oracle), `crates/wren/tests/e2e.rs` |
+| Reference test suite | `crates/wren-core/tests/differential.rs` (git as oracle), `crates/wren/tests/e2e.rs`; for writes, `crates/wren-core/tests/writes.rs` and `crates/wren/tests/writes_http.rs` |
 | Object format | `sha1` only |
-| Revision | Third draft. It adds `grep`, error codes, the semantics version, on-demand sync, and the `wren-synced-at` header; see [§13](#13-open-issues). |
+| Revision | Fourth draft. The third added `grep`, error codes, the semantics version, on-demand sync, and the `wren-synced-at` header; the fourth adds the write API ([§14](#14-writes)). See [§13](#13-open-issues). |
 
 This document describes the HTTP API served by Wren, a git-compatible
 source-control acceleration layer that answers history queries on the server.
@@ -51,6 +51,7 @@ to do; they do not mean the draft is final.
 11. [Security considerations](#11-security-considerations)
 12. [Worked example (informative)](#12-worked-example-informative)
 13. [Open issues](#13-open-issues)
+14. [Writes](#14-writes)
 
 ---
 
@@ -88,7 +89,8 @@ This specification covers:
 * the **query API**, which answers history questions such as log, blame, ancestry, merge-base, "landed", bisect, and grep ([§4](#4-query-api));
 * the **capabilities** document and the version headers ([§1.2](#12-protocol-version-and-the-wren-protocol-header), [§1.3](#13-capabilities-get-v1capabilities));
 * **authentication** and the **tier model** ([§2](#2-authentication-and-tiers));
-* **caching** rules ([§7](#7-caching)).
+* **caching** rules ([§7](#7-caching));
+* the **write API**, which creates changesets, lands them, moves branches, and reverts, on a server started with a write token ([§14](#14-writes)).
 
 The following are out of scope: how a server ingests history from its upstream,
 the on-disk storage format, the derived-data indexes, the CLI, and the MCP
@@ -155,12 +157,15 @@ shape is identical on every tier.
 }
 ```
 
+A server started with a write token adds `"write.v1"` to `features`
+([§14](#14-writes)).
+
 | Field | Type | Meaning |
 |---|---|---|
 | `protocol` | integer | Protocol major version. MUST be `1` for this specification. |
 | `object_format` | string | The hash algorithm of every oid on this tier. MUST be `"sha1"` in v1 ([§1.5](#15-object-format)). |
 | `tier` | string | `"server"` or `"cache"`: which kind of tier answered. Clients MUST NOT change their behaviour based on this value ([§2.2](#22-tiers)). |
-| `features` | array of strings | Feature flags. The reference implementation advertises exactly the nine values above on both tiers (`FEATURES` in `crates/wren/src/server.rs`). |
+| `features` | array of strings | Feature flags. The reference implementation advertises exactly the nine values above on both tiers (`FEATURES` in `crates/wren/src/server.rs`), plus `write.v1` on a server with a write token. |
 | `semantics` | string | The query semantics version ([§1.2](#12-protocol-version-and-the-wren-protocol-header)). A server reports its own. A cache reports the value it last learned from its upstream, or its own built-in value if it has learned none ([§7.2](#72-marking-and-storing)). Clients MUST treat an absent field (older servers) as unknown. |
 
 Feature flags defined in v1:
@@ -176,6 +181,7 @@ Feature flags defined in v1:
 | `immutable-pinned-queries` | Pinned query responses carry `Cache-Control: ... immutable` ([§7](#7-caching)) |
 | `on-demand-sync` | An unknown revision triggers one sync with upstream before the server answers `404` ([§4.0.7](#407-unknown-revisions-and-on-demand-sync)) |
 | `error-codes` | Errors produced by handlers carry a machine-readable `code` ([§6.1](#61-errorbody)) |
+| `write.v1` | The write API of [§14](#14-writes). Only a server with a write token advertises it; a cache never does. |
 
 Clients MUST ignore feature flags they do not recognise.
 
@@ -243,6 +249,10 @@ upstream token to its upstream tier. A cache never forwards the client's
 
 The token is not repository-scoped. Any valid token grants access to every
 repository and to every object in the server's object store ([§11](#11-security-considerations)).
+
+A server MAY also have a write token, which enables the write API and is
+accepted for reads as well. The read token never grants writes
+([§14.1](#141-authentication)).
 
 ### 2.2 Tiers
 
@@ -514,6 +524,9 @@ All query endpoints are under `/api/v1/`. Repository-scoped endpoints are under
 | POST | `/api/v1/repos/{repo}/sync` | [4.14](#414-sync) |
 | GET | `/api/v1/repos/{repo}/grep` | [4.15](#415-grep) |
 
+The write endpoints (`POST` on `blobs`, `changesets`, `land`, `refs`, and
+`revert`) are described in [§14](#14-writes).
+
 A request with the wrong method on a known path gets `405 Method Not Allowed`
 with an `Allow` header (for example `Allow: GET,HEAD`) and an empty body.
 
@@ -733,8 +746,9 @@ existing refs to be fresher than `last_sync` MAY call
 
 Refs whose peeled target is not a commit (for example a tag of a tree or a blob)
 are omitted. Annotated tag objects are fetchable through the object protocol.
-Refs are updated only by sync, and only after every commit they reach has been
-ingested.
+Refs are updated by sync, only after every commit they reach has been
+ingested, and by the write API ([§14](#14-writes)), only after the git host
+accepted the update.
 
 ### 4.3 Resolve
 
@@ -1349,6 +1363,8 @@ Errors produced by Wren handlers and middleware have
 | `404` | `not_found` |
 | `400` | `bad_request` |
 | `401` | `unauthorized` |
+| `403` | `forbidden` |
+| `409` | `conflict` |
 | `413` | `too_large` |
 | `502`, `504` | `upstream_unavailable` (no tier sends `504` today) |
 | any other, in practice `500` | `internal` |
@@ -1386,13 +1402,17 @@ The reference server classifies every handler error by its cause chain:
 | Status | When | Body |
 |---|---|---|
 | `200` | Success. | Endpoint-specific. |
+| `201 Created` | A write created a changeset ([§14.4](#144-create-a-changeset), [§14.7](#147-revert)). | Endpoint-specific. |
 | `400 Bad Request` | The request is malformed or self-contradictory (`BadRequest`): invalid revision suffix syntax or digit overflow ([§5.3](#53-applying-suffixes)); ambiguous abbreviated id; malformed oid in `/v1/objects/{oid}`; `diff` on a root commit without `base`; `bisect` when `good` shares no history with `bad`'s first-parent chain, or when `bad` is an ancestor of `good`; a `grep` pattern that does not compile. | ErrorBody, `bad_request` |
 | `400 Bad Request` | Query-string parse failure: missing required parameter, non-numeric `limit`, boolean other than `true`/`false`, duplicate parameter. | `text/plain` ([§6.1](#61-errorbody)) |
-| `401 Unauthorized` | Missing or invalid bearer token ([§2.1](#21-bearer-tokens)). | ErrorBody, `unauthorized` |
+| `401 Unauthorized` | Missing or invalid bearer token ([§2.1](#21-bearer-tokens), [§14.1](#141-authentication)). | ErrorBody, `unauthorized` |
+| `403 Forbidden` | A write to a server without a write token, or with the read token ([§14.1](#141-authentication)); any write sent to a cache ([§14.9](#149-caches)). | ErrorBody, `forbidden` |
 | `404 Not Found` | The thing named does not exist (`NotFound`): unknown repository; unknown revision or full id, after at most one on-demand sync ([§4.0.7](#407-unknown-revisions-and-on-demand-sync)); `~N` past the root; nonexistent `^N` parent; repository without `HEAD`, or `HEAD` naming a missing ref; unknown changeset; an object the query needs is not in the store; `path` absent or of the wrong kind for `blame`/`tree`/`file`/`grep`; `GET /v1/objects/{oid}` for an absent object. | ErrorBody, `not_found` |
 | `404 Not Found` | Unknown route (after authentication). | empty |
 | `405 Method Not Allowed` | Known path, wrong method. Carries an `Allow` header. | empty |
-| `413 Payload Too Large` | `POST /v1/objects` with more than 10 000 oids (server and cache). | ErrorBody, `too_large` |
+| `409 Conflict` | A land with conflicts or refused by the git host, a stale ref update ([§14.5](#145-land), [§14.6](#146-update-a-ref)). | The Landed or RefUpdate object |
+| `409 Conflict` | A land that gave up because the branch kept moving ([§14.5](#145-land)). | ErrorBody, `conflict` |
+| `413 Payload Too Large` | `POST /v1/objects` with more than 10 000 oids (server and cache); a write body over 64 MiB ([§14.2](#142-common-rules)). | ErrorBody, `too_large` |
 | `415`, `422`, `400` | `POST /v1/objects` with the wrong `Content-Type` (415), a syntactically valid body with an invalid oid or shape (422), or malformed JSON (400). | `text/plain` |
 | `500 Internal Server Error` | Every other handler error: I/O and database failures; corrupt stored data; an object too large to frame ([§3.2](#32-batch-fetch-post-v1objects)); `sync` without an upstream, or a failed upstream fetch ([§4.14](#414-sync)); a panicked worker task (`task failed: ...`). | ErrorBody, `internal` |
 | `502 Bad Gateway` | Caches only ([§6.3](#63-errors-at-caches)). | ErrorBody, `upstream_unavailable` |
@@ -1412,8 +1432,8 @@ retry it. A `400` is not retryable unchanged.
 
 A cache relays upstream query responses (status, `Content-Type`, body, and the
 headers of [§2.2](#22-tiers)) unchanged, including upstream `4xx` and `5xx`
-answers. The reference cache forwards every request under `/api/`, whatever
-its method or path, so framework rejections on query routes (`text/plain`
+answers. The reference cache forwards every `GET` and `HEAD` request under
+`/api/`, whatever its path, and `POST .../sync`, so framework rejections on query routes (`text/plain`
 `400`, empty `404` and `405`) come from upstream and are relayed. Errors that
 originate in the cache itself use the same ErrorBody shape:
 
@@ -1421,6 +1441,7 @@ originate in the cache itself use the same ErrorBody shape:
 |---|---|---|
 | `502 Bad Gateway` | `upstream_unavailable` | Object path (`POST /v1/objects` with at least one local miss, or `GET /v1/objects/{oid}` on a local miss): the upstream is unreachable or times out, answers non-2xx (`upstream: upstream returned <status>`), returns a malformed frame stream, or returns an object that fails hash verification ([§3.4](#34-verification)). Body: `{"error":"upstream: ...","code":"upstream_unavailable"}`. |
 | `502 Bad Gateway` | `upstream_unavailable` | Query path (`/api/...`): the upstream is unreachable or times out (`upstream unreachable: ...`). |
+| `403` | `forbidden` | Any other request under `/api/`, i.e. a write: writes go directly to the server ([§14.9](#149-caches)). |
 | `413` | `too_large` | Batch over 10 000 oids, checked before contacting upstream. |
 | `404` | `not_found` | `GET /v1/objects/{oid}` that is neither stored nor returned by upstream. |
 | `400` | `bad_request` | Malformed oid in `GET /v1/objects/{oid}`. |
@@ -1666,11 +1687,14 @@ object authorization, which v1 does not provide (§13, item 10).
   combine `log`, `merge-base`, and `is-ancestor` instead.
 * **SHA-1 only.** `object_format` is always `"sha1"`. The frame layout fixes
   20-byte oids (§1.5).
-* **Read-only.** There are no server-side writes: no push, no ref updates, no
-  commit creation. Writes go to the upstream git host with ordinary git, and
-  reach Wren through sync: periodic, on demand when a request names an unknown
-  revision (§4.0.7), or explicit (§4.14). Checkouts created with `--git` are
-  configured for this.
+* **Writes only through the git host's rules.** The write API (§14) creates
+  changesets and moves branches on the server, but while a git host is the
+  source of truth every branch move is pushed to the host first (§14.8).
+  Ordinary git pushes to the host keep working and reach Wren through sync:
+  periodic, on demand when a request names an unknown revision (§4.0.7), or
+  explicit (§4.14). Checkouts created with `--git` are configured for this.
+  Tags cannot be written, and there is no server-side merge of two branches
+  (only rebase).
 * **No rename or copy following.** Rename and copy detection is absent from
   `log?path=`, `blame`, `diff`, and changesets. A rename is a delete plus an add.
 * **First-parent history only** for `log`, `blame`, changesets, `landed`, and
@@ -1693,6 +1717,13 @@ object authorization, which v1 does not provide (§13, item 10).
 * **Integrity** comes from content addressing. Clients verify every object
   (§3.4), so tiers need not be trusted for integrity. Query responses are **not**
   self-verifying: a client trusts its tier for query answers.
+* **Writes** need the write token (§14.1), which is as server-wide as the
+  read token: it can write to every repository. Blobs uploaded through one
+  repository land in the shared object store and are readable through every
+  repository's object route. A cache never relays writes, so a cache's
+  upstream token, even a write token, cannot be used to write through it
+  (§14.9). Bodies are capped at 64 MiB; there is no separate limit on the
+  number of changes or the size of one file.
 * **Authorization** is a single bearer token per tier, valid for all
   repositories and all objects. The object namespace is server-wide (§3.2). A
   deployment that needs per-repository access control must not put repositories
@@ -1869,3 +1900,365 @@ Added in the third draft:
   unreachable and use disk until the cache directory is cleared. Options:
   put the semantics version in the URL, send `Vary` on a request header, or
   use a shorter `max-age`.
+
+---
+
+## 14. Writes
+
+The write API (feature `write.v1`) creates commits, lands them on branches,
+moves branches, and reverts commits, all on the server. A client sends file
+contents and parents, never a tree and never a checkout. The server derives
+the tree, so the cost of a write is proportional to the change, not to the
+repository. The implementation is `crates/wren/src/server/writes.rs` over
+`wren_core::write`. The tests are `crates/wren/tests/writes_http.rs` and
+`crates/wren-core/tests/writes.rs`.
+
+Commits created here are ordinary git commits with git ids. While a git host
+is the source of truth for a repository (it has an upstream, as every
+repository of the reference server has), a branch moves on the host first and
+Wren's ref follows ([§14.8](#148-write-proxy-mode)).
+
+### 14.1 Authentication
+
+Writes need a separate token. The server is started with `--write-token`
+(environment `WREN_WRITE_TOKEN`), which MUST differ from `--token`; the
+reference server refuses to start otherwise. Without a write token the server
+is read-only and does not advertise `write.v1`.
+
+* The write token is also accepted everywhere the read token is
+  ([§2.1](#21-bearer-tokens)), so a writer needs only one token. If the server
+  has no read token, reads stay open to everyone, and writes still need the
+  write token.
+* The read token never grants writes.
+
+A request to a write endpoint is answered as follows, before its body is read
+and before the repository is looked up:
+
+| Server configuration and request | Status | `code` |
+|---|---|---|
+| No write token configured | `403` | `forbidden`. The message says that writes are disabled and to start the server with `--write-token`. |
+| No `Authorization: Bearer ...` header | `401` | `unauthorized` |
+| The read token | `403` | `forbidden` |
+| Any other wrong token | `401` | `unauthorized` |
+| The write token | handled | |
+
+The write token, like the read token, is server-wide: it can write to every
+repository the server serves ([§11](#11-security-considerations)).
+
+### 14.2 Common rules
+
+| Method | Path | Success | § |
+|---|---|---|---|
+| POST | `/api/v1/repos/{repo}/blobs` | `200` | [14.3](#143-upload-blobs) |
+| POST | `/api/v1/repos/{repo}/changesets` | `201` (`200`/`409` with `land`) | [14.4](#144-create-a-changeset) |
+| POST | `/api/v1/repos/{repo}/land` | `200` (`409` on conflicts) | [14.5](#145-land) |
+| POST | `/api/v1/repos/{repo}/refs` | `200` (`409` when stale) | [14.6](#146-update-a-ref) |
+| POST | `/api/v1/repos/{repo}/revert` | `201` (`200`/`409` with `onto`) | [14.7](#147-revert) |
+
+`GET /api/v1/repos/{repo}/refs` is still the read endpoint of [§4.2](#42-refs).
+Only `POST` on that path writes.
+
+* **Bodies** are JSON. `Content-Type` is not checked. A body that is not valid
+  JSON, or has the wrong shape (a missing required field, a wrong type), is a
+  `400` ErrorBody with code `bad_request`. Unknown fields are ignored.
+* **Size.** A body may be up to 64 MiB. A larger one is a `413` ErrorBody
+  with code `too_large`.
+* **Caching.** Every response from a write endpoint, errors included,
+  carries `Cache-Control: no-store`. Write responses do not carry
+  `wren-synced-at`. They do carry `wren-protocol` and `wren-semantics`.
+* **Revisions** (`parents`, `changesets`, `commit`) are resolved with the
+  syntax of [§5](#5-revision-syntax), including one on-demand sync for an
+  unknown revision ([§4.0.7](#407-unknown-revisions-and-on-demand-sync)).
+  Fields documented as oids must be full 40-hex ids.
+* **Errors** follow [§6.2](#62-status-codes): `400` (`bad_request`) for
+  invalid requests, and `404` (`not_found`) for an unknown repository,
+  revision, changeset or branch. Outcomes that are not errors (conflicts, a
+  stale ref, a refusal by the git host) are `409` with a result object, not
+  an ErrorBody ([§14.5](#145-land), [§14.6](#146-update-a-ref)).
+
+**Person** (an author or committer):
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `name` | string | yes | No `<`, `>` or newline (otherwise `400`). |
+| `email` | string | yes | No `<`, `>` or newline. |
+| `time` | integer | no | Unix seconds. Default: the server's current time. |
+| `tz` | string | no | `+hhmm` or `-hhmm`. Default `"+0000"`. Anything else is `400`. |
+
+This is the shape of `author` and `committer` in CommitInfo
+([§4.0.6](#406-the-commitinfo-object)). A changeset's id depends on both
+signatures, including their times. A client that wants a retried request to
+produce the same id MUST send `time`.
+
+### 14.3 Upload blobs
+
+`POST /api/v1/repos/{repo}/blobs`
+
+```json
+{"blobs": [{"content": "hello\n"}, {"content_base64": "AJ+Slv8="}]}
+```
+
+Each entry has exactly one of `content` (UTF-8 text, stored as its UTF-8
+bytes) or `content_base64` (standard base64 with padding, for any bytes).
+Anything else is `400`.
+
+**Response** `200`: `{"oids": ["ce013625030ba8dba906f756967f9e9ca394464a", "..."]}`,
+the blob ids in request order. They equal `git hash-object`. Uploading is
+idempotent. Blobs go into the server-wide object store
+([§3.2](#32-batch-fetch-post-v1objects)), so they can be fetched through the
+object protocol at once.
+
+Uploading separately is useful for large or binary files, and for content used
+by several changesets. Small text files can be sent inline in a changeset
+instead.
+
+### 14.4 Create a changeset
+
+`POST /api/v1/repos/{repo}/changesets`
+
+```json
+{
+  "parents": ["main"],
+  "author": {"name": "Agent", "email": "agent@example.com", "time": 1700000000, "tz": "+0000"},
+  "message": "Add health endpoint",
+  "changes": [
+    {"path": "src/health.rs", "content": "pub fn ok() -> bool { true }\n"},
+    {"path": "assets/logo.png", "blob": "<oid from POST .../blobs>"},
+    {"path": "tools/run.sh", "content": "#!/bin/sh\necho v2\n"},
+    {"path": "old.txt", "delete": true}
+  ]
+}
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `parents` | array of revisions | yes, at least one | The new commit's parents, in order. Each must be a known commit. Two or more make a merge commit. |
+| `author` | Person | yes | |
+| `committer` | Person | no | Default: the author. |
+| `message` | string | yes | The commit message. A trailing newline is added if missing. |
+| `changes` | array of change requests | no (default empty) | What changes, **relative to the first parent**. |
+| `land` | `{"onto": "<branch>"}` | no | Land the new changeset at once ([§14.5](#145-land)). |
+
+A **change request** has a `path` and exactly one of:
+
+| Field | Meaning |
+|---|---|
+| `content` | The new content as UTF-8 text. The server stores it as a blob. |
+| `content_base64` | The new content, base64. |
+| `blob` | The id of a blob already in the store ([§14.3](#143-upload-blobs)), or, with mode `160000`, a commit id. |
+| `delete: true` | Delete the file. |
+
+It may also have `mode`, a six-digit octal string: `"100644"`, `"100755"`,
+`"120000"` (a symlink; the content is the link target) or `"160000"` (a
+gitlink; needs `blob`). Without `mode`, a path that is a file or symlink at the
+first parent keeps its mode, so an executable stays executable. Any other path
+gets `100644`. A deletion takes no mode.
+
+The server checks the following, and answers `400` if one fails:
+
+* `path` is relative and already normalised (no leading or trailing `/`, no
+  empty, `.` or `..` segments), has no NUL, and no segment is `.git` in any
+  case;
+* no path appears twice;
+* a deleted path exists at the first parent and is a file (to delete a
+  directory, delete the files in it);
+* a `blob` is in the store;
+* the resulting tree is consistent: a file cannot be added under a path that
+  stays a file, and a file that replaces a directory needs every file in that
+  directory deleted.
+
+A change that leaves a path as it is at the first parent is skipped. An empty
+`changes` makes a commit with the first parent's tree. An unknown parent is
+`404`. No ref moves.
+
+**Response** `201 Created`:
+
+```json
+{"oid": "<new commit>", "tree": "<its root tree>"}
+```
+
+Creating the same changeset twice (same parents, signatures, message, and
+resulting tree) returns the same `oid`.
+
+With `land`, the changeset is created and then landed as by
+`POST .../land` with `{"changesets": [oid], "onto": ...}`. The response adds
+the Landed object ([§14.5](#145-land)), and its status follows the land rule:
+`200` when landed, `409` on conflicts or a refusal. The changeset exists
+either way, so a client can retry the land later.
+
+```json
+{"oid": "...", "tree": "...",
+ "land": {"result": "landed", "ref": "refs/heads/main", "old": "...", "new": "...",
+          "changesets": ["..."], "dropped": [], "attempts": 1}}
+```
+
+### 14.5 Land
+
+`POST /api/v1/repos/{repo}/land`
+
+```json
+{"changesets": ["<oldest>", "<newest>"], "onto": "main"}
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `changesets` | array of revisions | yes, non-empty | A stack, oldest first. Each must have exactly one parent, and each after the first must be the child of the one before it. Otherwise `400`. |
+| `onto` | string | yes | The branch: `main` or `refs/heads/main`. An unknown branch is `404`. |
+| `committer` | Person | no | If given, every replayed changeset gets this committer. Otherwise each keeps its own. |
+
+The server rebases the stack onto the branch's current tip and moves the
+branch to the result with a compare-and-swap. If the branch moved in between,
+it rebases again onto the new tip, up to 8 attempts in all. There is no lock
+and no queue.
+
+The rebase looks only at the paths each changeset changed, one changeset
+after the other. For each such path, with *base* the path at the changeset's
+original parent, *ours* the path at the new base, and *theirs* the path in the
+changeset:
+
+* if *ours* equals *base*, the changeset's version is taken;
+* else if *ours* already equals *theirs*, nothing is done;
+* else, if all three are regular files, the contents are merged with git's
+  three-way merge (`git merge-file`), and the modes by the same rule. A clean
+  merge is taken; anything else is a conflict;
+* otherwise it is a conflict.
+
+A changeset none of whose changes remain is dropped, as `git rebase` does. If
+the stack already sits on the tip and no `committer` is given, nothing is
+replayed and the branch fast-forwards to the stack's last changeset. Replaying
+the same stack onto the same tip twice gives the same ids. Clean results agree
+with `git merge-tree --write-tree` on the same inputs (trees and conflicted
+paths).
+
+**Response**: a Landed object, tagged by `result`.
+
+`200 OK`, landed:
+
+```json
+{"result": "landed", "ref": "refs/heads/main",
+ "old": "<tip before>", "new": "<tip after>",
+ "changesets": ["<new id>", "..."], "dropped": [], "attempts": 1}
+```
+
+| Field | Meaning |
+|---|---|
+| `ref` | The full branch name. |
+| `old`, `new` | The branch before and after. `new` equals `old` when every changeset was dropped. |
+| `changesets` | The landed changesets, oldest first: the rebased ids, or the stack itself on a fast-forward. |
+| `dropped` | Stack entries whose changes the branch already had. |
+| `attempts` | How many rebases it took: 1 unless the branch moved. |
+
+`409 Conflict`, conflicts. Nothing moved:
+
+```json
+{"result": "conflicts", "onto": "<tip>",
+ "conflicts": [
+   {"changeset": "<stack entry>", "path": "README.md", "kind": "content",
+    "base":   {"mode": "100644", "oid": "..."},
+    "ours":   {"mode": "100644", "oid": "..."},
+    "theirs": {"mode": "100644", "oid": "..."}}
+ ]}
+```
+
+| Field | Meaning |
+|---|---|
+| `onto` | The tip the stack was rebased onto. |
+| `conflicts[].changeset` | The stack entry that could not be applied. Only the first such entry is reported. |
+| `conflicts[].path` | The path. Empty when the conflict was found while building the tree; `detail` then explains it. |
+| `conflicts[].kind` | `content`, `add/add`, `modify/delete` (the tip modified the path, the changeset deletes it), `delete/modify` (the reverse), `mode`, or `file/directory`. |
+| `conflicts[].base`, `.ours`, `.theirs` | A FileVersion ([§4.0.5](#405-the-change-object)) or `null`: the path at the changeset's original parent, at the tip, and in the changeset. |
+| `conflicts[].detail` | Optional text. |
+
+`409 Conflict`, rejected by the git host (a hook, branch protection). Nothing
+moved:
+
+```json
+{"result": "rejected", "reason": "pre-receive hook declined"}
+```
+
+`409 Conflict` with an ErrorBody, code `conflict`: the branch kept moving
+through all 8 attempts. Nothing moved. The client MAY retry.
+
+### 14.6 Update a ref
+
+`POST /api/v1/repos/{repo}/refs`
+
+```json
+{"name": "refs/heads/topic", "expected": "<oid or null>", "new": "<oid or null>"}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | string | A branch. A name without `refs/` means `refs/heads/<name>`. Anything outside `refs/heads/`, for example a tag, is `400`. |
+| `expected` | oid or `null` | The value the branch must have now. `null`: the branch must not exist. |
+| `new` | oid or `null` | The new value, a known commit (`404` otherwise, after one on-demand sync). `null` deletes the branch. |
+
+This is a compare-and-swap: the branch is set to `new` only if it is
+`expected`. `expected` and `new` must be full ids (`400` otherwise).
+
+**Response**: a RefUpdate object.
+
+| Status | Body | Meaning |
+|---|---|---|
+| `200` | `{"result": "updated"}` | Done. |
+| `409` | `{"result": "stale", "current": "<oid or null>"}` | The branch was not `expected`. Nothing changed. `current` is Wren's value of the branch, which can lag the git host until the next sync. |
+| `409` | `{"result": "rejected", "reason": "..."}` | The git host refused. Nothing changed. |
+
+### 14.7 Revert
+
+`POST /api/v1/repos/{repo}/revert`
+
+```json
+{"commit": "<revision>", "author": {"name": "...", "email": "..."}, "onto": "main"}
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `commit` | revision | yes | The commit to revert. A merge or a root commit is `400`. |
+| `author` | Person | yes | |
+| `committer` | Person | no | Default: the author. |
+| `onto` | string | no | A branch to land the revert on. |
+
+The revert is a new changeset whose parent is `commit` and which restores
+every path `commit` changed to its first-parent version. Its message is
+`Revert "<summary>"`, a blank line, and `This reverts commit <oid>.`, as
+`git revert` writes it.
+
+**Response** without `onto`: `201 Created`, `{"oid": "<revert>"}`. No ref
+moves. With `onto`, the revert is landed on that branch as by
+[land](#145-land), and the response is `{"oid": "<revert>", "land": <Landed>}`
+with the land status rule (`200` landed, `409` otherwise). `land.new` is the
+revert rebased onto the branch; `oid` is the revert before rebasing.
+
+### 14.8 Write-proxy mode
+
+Until Wren itself is the source of truth, the git host stays authoritative,
+and its branch protection and hooks keep working:
+
+1. A ref update (by `POST .../refs`, or the last step of a land) first pushes
+   to the host from the server's mirror, with
+   `git push --force-with-lease=<ref>:<expected> origin <new>:<ref>`. The lease
+   makes the push a compare-and-swap on the host. Only the new commits, trees,
+   and blobs are sent.
+2. If the host's branch is not `expected`, the answer is `stale`; a land then
+   syncs from the host and rebases again. If the host refuses the push, the
+   answer is `rejected`, with the host's reason.
+3. Only after the host has accepted does Wren compare-and-swap its own ref. If
+   a sync already published the same value, the update still counts as done.
+
+So after a `200` the host has the new value, and ordinary git clients see it
+at once. Later syncs bring the same commits back from the host with the same
+ids, which are already known. A repository without an upstream has only Wren's
+ref.
+
+### 14.9 Caches
+
+A cache never relays writes. It presents its own upstream token, which can be
+a write token, so relaying would let anyone who can reach the cache write with
+the cache's credentials. A cache answers every request under `/api/` other
+than `GET`, `HEAD`, and `POST /api/v1/repos/{repo}/sync` with `403` and code
+`forbidden`, with a message that writes go directly to the server (the
+control plane). It does not contact its upstream for them. A cache does not
+advertise `write.v1`. Writers talk to the server. Readers can keep using
+caches: a branch moved by a write is visible through a cache as soon as the
+server has it, because unpinned queries are always forwarded.
