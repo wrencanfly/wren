@@ -206,10 +206,11 @@ caveats are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Roadmap
 
-- **Upstream.** Send the sparse/promisor report to the git list, and write a
-  proposal for git protocol v2 extensions: a `query` command family, and a
-  `missing-ok` option for want-only fetches. The goal is for stock git
-  clients to use these RPCs.
+- **Upstream.** Send the [sparse/promisor report](docs/upstream/git-sparse-promisor.md)
+  to the git list. Refine the [draft git protocol v2 extensions](docs/upstream/git-protocol-v2-query.md):
+  a `query` command, more `object-info` attributes, and `missing-ok` for
+  fetches. Add a `git-upload-pack` v2 front end so that stock git clients can
+  use these RPCs.
 - **Cheaper cold blame.** Derive the whole chain in one pass and diff with
   imara-diff ([research](docs/research/04-cold-blame.md)).
 - **Costs.** Delta frames for incremental fetches, packed storage, and
