@@ -10,8 +10,9 @@
 //!   (write-proxy mode), the host is updated first with `--force-with-lease`,
 //!   which is a compare-and-swap inside receive-pack, and Wren's ref follows.
 //! * `land` = rebase onto the branch tip + `update_ref`, retried when the
-//!   branch moved. There is no lock and no merge queue: a lost race costs
-//!   one more rebase of the stack.
+//!   branch moved. There is no merge queue and no global lock: a lost race
+//!   costs one more rebase of the stack. (Within one process, attempts on a
+//!   repo take turns; see `land`.)
 //! * `revert`: the inverse changeset, optionally landed.
 //!
 //! Commits created here are ordinary git commits with git ids, so when the
@@ -463,6 +464,20 @@ impl Repo {
         expected: Option<Oid>,
         new: Option<Oid>,
     ) -> Result<RefUpdate> {
+        let _guard = self.sync_lock.lock().unwrap();
+        self.update_ref_locked(name, expected, new)
+    }
+
+    /// `update_ref` with `sync_lock` held by the caller. A push reads packs
+    /// in the mirror that a concurrent sync's absorb would delete, and
+    /// holding the lock across push and CAS means Wren's ref has caught up
+    /// before the next local writer reads it.
+    fn update_ref_locked(
+        &self,
+        name: &str,
+        expected: Option<Oid>,
+        new: Option<Oid>,
+    ) -> Result<RefUpdate> {
         if !name.starts_with("refs/heads/") || name.len() <= "refs/heads/".len() {
             return Err(bad_request(format!(
                 "only branches can be updated, not {name:?}"
@@ -506,6 +521,13 @@ impl Repo {
             format!("refs/heads/{onto}")
         };
         for attempt in 1..=LAND_ATTEMPTS {
+            // One attempt (read the tip, rebase, push, CAS) runs under the
+            // repo's sync lock, so local lands onto a branch take turns
+            // instead of invalidating each other's rebases in a retry storm.
+            // This is only an optimization within one process: correctness
+            // rests on the compare-and-swaps (the host's lease and Wren's
+            // ref), which also catch writers this lock cannot see.
+            let guard = self.sync_lock.lock().unwrap();
             let r = self
                 .meta
                 .get_ref(&name)?
@@ -534,7 +556,9 @@ impl Repo {
                     attempts: attempt,
                 });
             }
-            match self.update_ref(&name, Some(tip), Some(new))? {
+            let outcome = self.update_ref_locked(&name, Some(tip), Some(new))?;
+            drop(guard);
+            match outcome {
                 RefUpdate::Updated => {
                     return Ok(Landed::Landed {
                         name,

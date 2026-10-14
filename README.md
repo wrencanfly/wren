@@ -38,7 +38,7 @@ Like Scion, Wren keeps clients thin and puts the work on the server:
   Nothing is cloned.
 - **Writes on the server.** Commits are created from "parent + changed
   files", then rebased, landed and reverted on the server, with no checkout
-  and no lock.
+  and no merge queue.
 - **Changesets, with derived trees.** A changeset records what changed
   relative to its first parent; trees and commit objects are derived from it.
 - **Want-only checkouts through cache tiers that all speak the same RPC.**
@@ -85,7 +85,7 @@ principle and says where it still differs.
 
 |  |  |
 |---|---|
-| **Commit without a checkout** | Send "parent + changed files"; Wren derives the tree, rebases onto the branch tip with git's own three-way merge, and lands with a compare-and-swap. Concurrent lands never take a lock. |
+| **Commit without a checkout** | Send "parent + changed files"; Wren derives the tree, rebases onto the branch tip with git's own three-way merge, and lands with a compare-and-swap. No merge queue: a lost race costs one more rebase. |
 | **Ask history without a clone** | Log by path, blame, diff, merge-base, ancestry, `landed` and bisect are answered from server-side indexes: changesets, a commit graph with skip lists, a path index, and persisted blame. |
 | **Search and read at any revision** | `grep`, `cat` and `ls` at any commit, with no checkout. |
 | **Bounded, cacheable answers for agents** | MCP tools pin revisions to full commit ids, so answers are immutable and served by caches. Line ranges and output caps keep token use predictable. |
@@ -228,7 +228,7 @@ flowchart LR
   `git merge-file` for files changed on both sides, and moves the branch with
   a compare-and-swap. With a git host upstream, the host is updated first
   (`--force-with-lease` is checked inside receive-pack) and Wren's ref
-  follows. A lost race costs one more rebase, never a lock. Caches refuse
+  follows. A lost race costs one more rebase. Caches refuse
   writes, so a cache's credentials can never be used to write.
 - **Derived data.** Trees are derived from changesets. The commit graph (generation numbers and first-parent
   skip lists) is derived recursively from parents. Blame is derived lazily:

@@ -497,6 +497,28 @@ fn concurrent_lands_all_land_linearly() {
     let repo = f.repo.clone();
     let base = repo.resolve("main").unwrap();
     const N: usize = 12;
+    const OUTSIDE: usize = 4;
+    // Meanwhile, someone pushes to the host directly, behind Wren's back:
+    // lands lose the host's lease, sync, and replay.
+    let work = f.work.clone();
+    let (first_push, pushed) = std::sync::mpsc::channel();
+    let outsider = std::thread::spawn(move || {
+        for i in 0..OUTSIDE {
+            std::fs::create_dir_all(work.join("outside")).unwrap();
+            std::fs::write(work.join(format!("outside/{i}")), format!("{i}\n")).unwrap();
+            git(&work, &["add", "-A"]);
+            git(&work, &["commit", "-q", "-m", &format!("outside {i}")]);
+            while !git_out(&work, &["push", "-q", "origin", "main"]).0 {
+                git(&work, &["pull", "-q", "--rebase", "origin", "main"]);
+            }
+            if i == 0 {
+                first_push.send(()).unwrap();
+            }
+        }
+    });
+    // Wren has not seen the outsider's first push, so the first land must
+    // lose the host's lease, sync and replay.
+    pushed.recv().unwrap();
     let handles: Vec<_> = (0..N)
         .map(|i| {
             let repo = repo.clone();
@@ -525,21 +547,29 @@ fn concurrent_lands_all_land_linearly() {
         })
         .collect();
     let attempts: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    outsider.join().unwrap();
     eprintln!("land attempts: {attempts:?}");
+    assert!(attempts.iter().any(|&a| a > 1), "no land had to retry");
 
+    // After a sync, Wren has exactly the host's main.
+    repo.sync().unwrap();
     let tip = repo.resolve("main").unwrap();
-    // The host has exactly Wren's main.
     let host_main = oid(&git(&f.host, &["rev-parse", "refs/heads/main"]));
     assert_eq!(host_main, tip);
-    // Linear: N new commits on the first-parent chain, each a single-parent
-    // commit, and every agent's file is in the final tree.
+    // Linear: every agent's and the outsider's commit is on the first-parent
+    // chain, each a single-parent commit, and every file is in the tree.
     let log = repo.log(&tip, None, 100).unwrap();
-    assert_eq!(log.len(), N + 1);
-    for c in &log[..N] {
+    assert_eq!(log.len(), N + OUTSIDE + 1);
+    for c in &log[..N + OUTSIDE] {
         assert_eq!(repo.commit(c).unwrap().parents.len(), 1);
     }
     let ls = git(&f.host, &["ls-tree", "-r", "--name-only", "main", "agents"]);
     assert_eq!(ls.lines().count(), N);
+    let ls = git(
+        &f.host,
+        &["ls-tree", "-r", "--name-only", "main", "outside"],
+    );
+    assert_eq!(ls.lines().count(), OUTSIDE);
     // git agrees the history is sound.
     git(&f.host, &["fsck", "--no-dangling"]);
 }

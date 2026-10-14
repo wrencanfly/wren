@@ -2108,8 +2108,10 @@ either way, so a client can retry the land later.
 
 The server rebases the stack onto the branch's current tip and moves the
 branch to the result with a compare-and-swap. If the branch moved in between,
-it rebases again onto the new tip, up to 8 attempts in all. There is no lock
-and no queue.
+it rebases again onto the new tip, up to 8 attempts in all. There is no queue
+and no global lock. Within one server, lands to a repository take turns, which
+only avoids retry storms; the compare-and-swap is what makes a land safe,
+including against writers outside Wren.
 
 The rebase looks only at the paths each changeset changed, one changeset
 after the other. For each such path, with *base* the path at the changeset's

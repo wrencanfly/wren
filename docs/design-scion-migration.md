@@ -222,7 +222,7 @@ commit 对象；它的哈希必须等于 `changesets.oid`。commit 对象不持�
 |---|---|
 | 服务端创建 = `git commit` | ✅ 60 轮随机改动（修改、新增、删除、可执行位、软链接、文件和目录互换），commit id 与 git 完全相同；重复创建是幂等的 |
 | rebase 对 `git merge-tree --merge-base` | ✅ 80 轮重叠修改：47 轮干净（tree 相同），33 轮冲突（冲突路径集合相同） |
-| 并发 land | ✅ 12 个线程同时 land 到 `main`：全部落地，历史线性，git 主机与 Wren 一致，`git fsck` 通过。抢输的一方重新 rebase 后重试，无锁 |
+| 并发 land | ✅ 12 个线程同时 land 到 `main`：全部落地，历史线性，git 主机与 Wren 一致，`git fsck` 通过。同一 server 内的 land 依次执行（进程内锁，只为避免重试风暴）；另有一个外部推送者同时直接推主机，迫使 land 走"lease 失败 → sync → 重新 rebase"路径。30 次重复全部通过 |
 | 主机被直接推送过 | ✅ 第一次推送 lease 失败，同步后 rebase 到主机的新提交上，第二次成功 |
 | revert | ✅ 与 git 的三方合并结果一致 |
 

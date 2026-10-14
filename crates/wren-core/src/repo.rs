@@ -26,7 +26,9 @@ pub struct Repo {
     pub upstream: Option<String>,
     dir: PathBuf,
     pub(crate) memo: Mutex<Memo>,
-    sync_lock: Mutex<()>,
+    /// Held by sync (fetch, absorb packs, ingest) and by pushes to the
+    /// upstream: a push reads the mirror's packs, which absorb deletes.
+    pub(crate) sync_lock: Mutex<()>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -103,7 +105,17 @@ impl Repo {
         let start = Instant::now();
         let url = self.upstream.as_deref().context("repo has no upstream")?;
         let mirror = GitMirror::open(self.dir.join("mirror.git"), url, self.store.root())?;
-        mirror.fetch()?;
+        // The host can move a ref between the ref advertisement and the
+        // fetch (another writer landing), which makes the fetch fail with
+        // "not our ref". Such failures are transient: retry.
+        let mut attempt = 0;
+        while let Err(e) = mirror.fetch() {
+            attempt += 1;
+            if attempt == 4 {
+                return Err(e);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50 << attempt));
+        }
         if let Some(head) = mirror.default_branch()? {
             self.meta.set_kv("HEAD", &head)?;
         }
