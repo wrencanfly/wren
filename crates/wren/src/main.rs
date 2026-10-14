@@ -15,9 +15,13 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use wren_core::api::*;
+use wren_core::write::Landed;
 use wren_core::{ObjectStore, Repo};
 
-use crate::client::{find_checkout_config, Client};
+use crate::client::{
+    find_checkout_config, ChangesetRequest, Client, Content, Edit, FileChange, LandOnto,
+    LandRequest, Person, RevertRequest,
+};
 
 /// Wren: agent-scale source control on top of git.
 #[derive(Parser)]
@@ -41,6 +45,18 @@ struct Target {
     /// Print raw JSON.
     #[arg(long, global = true)]
     json: bool,
+}
+
+/// Where writes go. Caches refuse writes, so this must be the control-plane
+/// server even when queries go through a cache.
+#[derive(Args, Clone)]
+struct WriteTarget {
+    /// Server that takes writes. Defaults to --server.
+    #[arg(long, env = "WREN_WRITE_SERVER")]
+    write_server: Option<String>,
+    /// Bearer token for writes. Defaults to --token.
+    #[arg(long, env = "WREN_WRITE_TOKEN", hide_env_values = true)]
+    write_token: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -240,8 +256,64 @@ enum Cmd {
         #[command(flatten)]
         target: Target,
     },
-    /// Serve the query API to an AI agent as an MCP server over stdio.
+    /// Create a commit on the server from local files, without a checkout.
+    /// Optionally land it on a branch in the same request.
+    Commit {
+        #[arg(short, long)]
+        message: String,
+        /// Revision to commit on top of. Default: the --land branch, else HEAD.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Land the commit on this branch (rebased onto its tip if it moved).
+        #[arg(long, value_name = "BRANCH")]
+        land: Option<String>,
+        /// "Name <email>". Default: WREN_AUTHOR, else git's user.name and user.email.
+        #[arg(long, env = "WREN_AUTHOR")]
+        author: Option<String>,
+        /// Write REPO_PATH with the contents of LOCAL_FILE (repeatable). An
+        /// executable file becomes 100755 and a symlink 120000; otherwise the
+        /// path keeps its current mode.
+        #[arg(long = "set", value_name = "REPO_PATH=LOCAL_FILE")]
+        set: Vec<String>,
+        /// Delete REPO_PATH (repeatable).
+        #[arg(long = "delete", value_name = "REPO_PATH")]
+        delete: Vec<String>,
+        #[command(flatten)]
+        write: WriteTarget,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Land commits on a branch: rebase them onto its tip on the server and
+    /// move the branch. Exits 1 on conflicts or if the git host refuses.
+    Land {
+        #[arg(long, value_name = "BRANCH")]
+        onto: String,
+        /// Commits to land, oldest first; each must be the parent of the next.
+        #[arg(required = true)]
+        revs: Vec<String>,
+        #[command(flatten)]
+        write: WriteTarget,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Create a commit that undoes REV, and optionally land it.
+    Revert {
+        rev: String,
+        #[arg(long, value_name = "BRANCH")]
+        onto: Option<String>,
+        /// "Name <email>". Default: WREN_AUTHOR, else git's user.name and user.email.
+        #[arg(long, env = "WREN_AUTHOR")]
+        author: Option<String>,
+        #[command(flatten)]
+        write: WriteTarget,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Serve the query and write API to an AI agent as an MCP server over
+    /// stdio. Commits made through it are authored by WREN_AUTHOR.
     Mcp {
+        #[command(flatten)]
+        write: WriteTarget,
         #[command(flatten)]
         target: Target,
     },
@@ -282,6 +354,127 @@ async fn need_repo(t: &Target) -> Result<Client> {
         }
     }
     Ok(c)
+}
+
+/// The client for writes: same repository as `read`, but on the write
+/// server with the write token.
+fn writer(read: &Client, t: &Target, w: &WriteTarget) -> Client {
+    let server = w.write_server.as_deref().unwrap_or(&read.server);
+    let token = w.write_token.as_deref().or(t.token.as_deref());
+    Client::new(server, &read.repo, token)
+}
+
+/// Files above this size are uploaded on their own before the changeset, so
+/// no single request gets large.
+const INLINE_MAX: u64 = 256 << 10;
+
+/// One `--set REPO_PATH=LOCAL_FILE`.
+async fn local_change(w: &Client, spec: &str) -> Result<FileChange> {
+    let (path, local) = spec
+        .split_once('=')
+        .with_context(|| format!("--set expects REPO_PATH=LOCAL_FILE, got {spec:?}"))?;
+    let meta = std::fs::symlink_metadata(local).with_context(|| format!("reading {local}"))?;
+    let (data, mode) = if meta.file_type().is_symlink() {
+        use std::os::unix::ffi::OsStrExt;
+        let target = std::fs::read_link(local)?;
+        (target.as_os_str().as_bytes().to_vec(), Some("120000"))
+    } else if meta.is_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let exec = meta.permissions().mode() & 0o111 != 0;
+        let data = std::fs::read(local).with_context(|| format!("reading {local}"))?;
+        (data, exec.then_some("100755"))
+    } else {
+        bail!("{local} is not a file or a symlink");
+    };
+    let edit = if data.len() as u64 > INLINE_MAX {
+        let oids = w.upload_blobs(&[Content::from_bytes(data)]).await?;
+        Edit::Blob { blob: oids[0] }
+    } else {
+        Edit::Write(Content::from_bytes(data))
+    };
+    Ok(FileChange {
+        path: path.to_string(),
+        edit,
+        mode: mode.map(String::from),
+    })
+}
+
+/// `--author`, else WREN_AUTHOR (both via clap), else git's identity.
+fn cli_author(author: Option<String>) -> Result<Person> {
+    if let Some(a) = author {
+        return Person::parse(&a);
+    }
+    let git = |key: &str| {
+        std::process::Command::new("git")
+            .args(["config", key])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    match (git("user.name"), git("user.email")) {
+        (Some(name), Some(email)) => Ok(Person {
+            name,
+            email,
+            time: None,
+            tz: None,
+        }),
+        _ => bail!("pass --author \"Name <email>\" or set WREN_AUTHOR"),
+    }
+}
+
+/// Print a land result: the branch move on stdout, problems on stderr.
+/// Returns whether it landed.
+fn report_land(l: &Landed) -> bool {
+    match l {
+        Landed::Landed {
+            name,
+            old,
+            new,
+            dropped,
+            ..
+        } => {
+            println!("landed {name} {old} -> {new}");
+            for d in dropped {
+                eprintln!("dropped {d} (the branch already has its changes)");
+            }
+            true
+        }
+        Landed::Conflicts { onto, conflicts } => {
+            eprintln!(
+                "not landed: {} conflicting path(s) against {onto}:",
+                conflicts.len()
+            );
+            for c in conflicts {
+                let detail = c
+                    .detail
+                    .as_deref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "  {:<14} {}{detail}  [in {}]",
+                    c.kind,
+                    c.path,
+                    c.changeset.short()
+                );
+            }
+            eprintln!("update those files as of {onto} and commit again with --parent {onto}");
+            false
+        }
+        Landed::Rejected { reason } => {
+            eprintln!("not landed: the git host rejected the update: {reason}");
+            false
+        }
+    }
+}
+
+fn exit_code(ok: bool) -> ExitCode {
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
@@ -726,9 +919,103 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let r: wren_core::repo::SyncReport = c.post("sync").await?;
             print_json(&r)?;
         }
-        Cmd::Mcp { target } => {
+        Cmd::Commit {
+            message,
+            parent,
+            land,
+            author,
+            set,
+            delete,
+            write,
+            target,
+        } => {
+            let author = cli_author(author)?;
             let c = need_repo(&target).await?;
-            mcp::serve(c).await?;
+            let w = writer(&c, &target, &write);
+            let mut changes = Vec::with_capacity(set.len() + delete.len());
+            for spec in &set {
+                changes.push(local_change(&w, spec).await?);
+            }
+            changes.extend(delete.into_iter().map(|path| FileChange {
+                path,
+                edit: Edit::Delete { delete: true },
+                mode: None,
+            }));
+            if changes.is_empty() {
+                bail!("nothing to commit: pass --set REPO_PATH=LOCAL_FILE or --delete REPO_PATH");
+            }
+            let parent = parent
+                .or_else(|| land.clone())
+                .unwrap_or_else(|| "HEAD".into());
+            let r = w
+                .create_changeset(&ChangesetRequest {
+                    parents: vec![parent],
+                    author,
+                    committer: None,
+                    message,
+                    changes,
+                    land: land.map(|onto| LandOnto { onto }),
+                })
+                .await?;
+            let ok = !matches!(&r.land, Some(l) if !matches!(l, Landed::Landed { .. }));
+            if target.json {
+                print_json(&r)?;
+                return Ok(exit_code(ok));
+            }
+            println!("{}", r.oid);
+            return Ok(exit_code(r.land.as_ref().is_none_or(report_land)));
+        }
+        Cmd::Land {
+            onto,
+            revs,
+            write,
+            target,
+        } => {
+            let c = need_repo(&target).await?;
+            let w = writer(&c, &target, &write);
+            let l = w
+                .land(&LandRequest {
+                    changesets: revs,
+                    onto,
+                    committer: None,
+                })
+                .await?;
+            if target.json {
+                print_json(&l)?;
+                return Ok(exit_code(matches!(l, Landed::Landed { .. })));
+            }
+            return Ok(exit_code(report_land(&l)));
+        }
+        Cmd::Revert {
+            rev,
+            onto,
+            author,
+            write,
+            target,
+        } => {
+            let author = cli_author(author)?;
+            let c = need_repo(&target).await?;
+            let w = writer(&c, &target, &write);
+            let r = w
+                .revert(&RevertRequest {
+                    commit: rev,
+                    author,
+                    committer: None,
+                    onto,
+                })
+                .await?;
+            let ok = !matches!(&r.land, Some(l) if !matches!(l, Landed::Landed { .. }));
+            if target.json {
+                print_json(&r)?;
+                return Ok(exit_code(ok));
+            }
+            println!("{}", r.oid);
+            return Ok(exit_code(r.land.as_ref().is_none_or(report_land)));
+        }
+        Cmd::Mcp { write, target } => {
+            let c = need_repo(&target).await?;
+            let w = writer(&c, &target, &write);
+            mcp::serve(c, w).await?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -763,5 +1050,94 @@ fn main() -> ExitCode {
             eprintln!("wren: {e:#}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn write_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "wren",
+            "commit",
+            "-m",
+            "msg",
+            "--land",
+            "main",
+            "--set",
+            "a/b.rs=/tmp/b.rs",
+            "--set",
+            "c=d",
+            "--delete",
+            "old.txt",
+            "--write-server",
+            "http://w",
+            "--server",
+            "http://r",
+        ])
+        .unwrap();
+        let Cmd::Commit {
+            message,
+            parent,
+            land,
+            set,
+            delete,
+            write,
+            target,
+            ..
+        } = cli.cmd
+        else {
+            panic!("not commit")
+        };
+        assert_eq!(message, "msg");
+        assert_eq!(parent, None);
+        assert_eq!(land.as_deref(), Some("main"));
+        assert_eq!(set, ["a/b.rs=/tmp/b.rs", "c=d"]);
+        assert_eq!(delete, ["old.txt"]);
+        assert_eq!(write.write_server.as_deref(), Some("http://w"));
+        assert_eq!(target.server.as_deref(), Some("http://r"));
+
+        let cli = Cli::try_parse_from(["wren", "land", "--onto", "main", "a", "b"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Land { ref revs, .. } if revs == &["a", "b"]));
+        assert!(Cli::try_parse_from(["wren", "land", "--onto", "main"]).is_err());
+        let cli = Cli::try_parse_from(["wren", "revert", "abc", "--onto", "main"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Revert { ref rev, onto: Some(_), .. } if rev == "abc"));
+    }
+
+    #[test]
+    fn writer_falls_back_to_read_target() {
+        let read = Client::new("http://cache", "demo", Some("read"));
+        let t = Target {
+            server: None,
+            token: Some("read".into()),
+            repo: None,
+            json: false,
+        };
+        let none = WriteTarget {
+            write_server: None,
+            write_token: None,
+        };
+        let w = writer(&read, &t, &none);
+        assert_eq!(
+            (w.server.as_str(), w.repo.as_str()),
+            ("http://cache", "demo")
+        );
+        let set = WriteTarget {
+            write_server: Some("http://server/".into()),
+            write_token: Some("write".into()),
+        };
+        let w = writer(&read, &t, &set);
+        assert_eq!(
+            (w.server.as_str(), w.repo.as_str()),
+            ("http://server", "demo")
+        );
     }
 }
