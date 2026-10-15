@@ -1,6 +1,6 @@
 # 设计：Wren 向 Scion 架构迁移
 
-> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15，M3d ✅ 2026-10-15**，其余待做。
+> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15，M3d ✅ 2026-10-15，M4 ✅ 2026-10-15，M5 ✅ 2026-10-15**，其余待做。
 > 范围：用户选择"全面 Scion 化"，即下文 M1–M7 全部纳入路线图。
 > 这推翻了 v0.1 的定位（只读、git 主机是数据源、"不做服务端写入"），也推翻了
 > [reviews/04](reviews/04-positioning-vs-intent.md) 和 [reviews/08](reviews/08-synthesis.md)
@@ -451,6 +451,80 @@ wren daemon --socket /run/wren.sock --upstream https://cache.region.example \
 - 50 个节点同时冷启动时，区域 cache 的上游请求峰值有上限；有快照和没有快照
   两种情况都要测。
 
+### 5.8 实现（M4 ✅）
+
+**节点 daemon 和有界存储**（`wren daemon`，`wren_core::bounded`）
+
+- daemon 就是节点层的 cache：同一套 RPC，监听 unix socket（可选再开 TCP），对象库
+  就是这台机器上检出共用的节点对象库（`--store`，即 `WREN_STORE`）。
+- 到达的对象先是 loose，维护时封成段，每个段是一代。超出预算时整代删除最老的段：
+  删之前把其中的树、commit、tag、被再次访问过的 blob（访问记录的代数比该段新）和
+  租约可达的 blob 复制到最新一代。从不逐个删对象，也不原地改写。
+- 租约：检出在**打开对象库之前**写租约（commit id），然后拿一次维护锁
+  （`maintenance.lock`，维护运行期间独占持有），等正在进行的维护结束。之后的维护都
+  看得到这份租约，检出在库里看到的对象不会在它手里消失。`--git` 检出保留租约
+  （git 之后通过 alternates 读对象，不经过任何人）；普通检出结束后归还。
+  - 这是测试抓到的：最初租约在检出结束时才写，检出进程已经 mmap 了快照段、以为
+    对象都在，daemon 却在中途把那个段淘汰了，检出完成后 git 读不到 blob。
+- daemon 拥有对象库：它在 capabilities 里报告自己的 `store`，同一台机器上用同一个
+  库的客户端只校验收到的对象、不再自己写（否则同一对象会被两个进程各写一份，
+  封成两个段）。
+- 计划里的"淘汰后按需从 promisor 取回"留到 M5（那时 promisor 指向 Wren 自己的
+  git 前端）；现在被淘汰的对象由 Wren 检出按需取回，`--git` 检出靠租约保住。
+
+**快照**（`wren_core::snapshot`）
+
+- 内容是 (commit, cone) 的纯函数：commit、它下面的全部树、cone 里的 blob，按固定
+  顺序写成一个不带 delta 的段，名字是 pack 校验和。共享元数据的任何 server 都能在
+  本地没有文件时重建出逐字节相同的快照。
+- `GET /api/v1/repos/{repo}/snapshot` 给出当前快照；`GET /v1/snapshots/{name}.pack|.idx`
+  不可变，支持 Range。cache 下载一次（并发请求合并），按名字校验后保存；daemon 按
+  8 MiB 分块续传，校验后作为最老的一代装入。
+- server 用 `--snapshot-every` 定期重建，或带写 token `POST` 立即重建。
+
+**区域 cache**
+
+- 对象和查询的并发未命中都合并成一次上游请求（singleflight）。合并用的占位在请求
+  被取消时也会清掉（仿真抓到：客户端断开后占位残留，后来的请求一直在等）；等待的
+  请求发现对方失败，就自己重取（仿真抓到：等待方把对方的失败当成"对象不存在"）。
+- 最近服务过的对象另存一份在内存 LRU（`--memory`）。
+- 快照描述（`.../snapshot`）在 cache 里复用 10 秒：这是唯一一个 cache 自己回答的
+  非固定查询，旧一点的快照一样能播种节点。
+
+**严格分层**：capabilities 的 `tier` 是 `server`、`region`、`node`（旧 cache 的
+`cache` 视为 `region`）。cache 启动时检查上游正好是上一层，否则拒绝启动；小部署可以
+用 `--allow-tier-skip` 明确放开（会打警告）。
+
+**控制面和对象面**：客户端的对象请求发往 `WREN_OBJECTS`（如
+`unix:/var/wren/store/daemon.sock`），查询和写入仍发往 `WREN_SERVER`。
+
+**仿真**（`crates/wren/tests/sim.rs`，turmoil）
+
+- 真实的 server、区域 cache、节点 daemon（同一套 axum 路由、cache 逻辑和对象库）
+  跑在 turmoil 的模拟网络上；为此 `wren` 拆成库加一个很薄的命令行，cache 的上游
+  HTTP 走 `Transport` 接口（生产用 reqwest，仿真用模拟 TCP 上的 HTTP/1）。
+- 每个种子：2 个节点、4 个读者（随机提交的整棵树逐对象校验，固定查询经各层和直连
+  server 对比）、2 个写者（经 server 落地到 `main`，网络错误就重试）。故障按种子生成：
+  链路分区和恢复、延迟、区域 cache 和节点崩溃后重启（目录保留）。
+- 不变量：收到的每个对象都校验通过；各层回答与 server 相同且语义版本一致；`main`
+  是可线性化的 CAS 寄存器（每个报告落地的提交都恰好一次出现在最终第一父链上，每个
+  读者看到的 `main` 只沿链前进）；server 上来自区域 cache 的并发请求不超过上限。
+- 网络和故障由种子决定；存储操作跑在真实线程上，所以线程交错不保证逐位复现，
+  不变量对任何交错都必须成立。
+- 仿真抓到并修掉了上面两个 singleflight 的 bug，还有 cache 写查询缓存时的临时文件
+  名只用进程号（同一进程两个任务会互相覆盖）。
+- 门槛：
+  - 1 万个种子全部通过：216 万个对象逐个校验，没有违反任何不变量（8 线程 16 分钟）。
+    CI 每晚另跑 1000 个新种子。
+  - 50 个节点同时冷启动、各自读取 `main` 的整棵树：
+
+| | 到区域 cache 的请求 | 到 server 的请求 | server 上同时在途的最大请求数 |
+|---|---:|---:|---:|
+| 无快照 | 400 | 8 | 1 |
+| 有快照 | 250 | 5 | 1 |
+
+  单个节点独自读取也要约 8 次 server 请求：50 个节点的未命中被区域 cache 合并了。
+
 ---
 
 ## 6. M5：数据源翻转和旧客户端
@@ -484,6 +558,67 @@ ref 的列表、land 前调用的策略钩子（webhook，返回允许或拒绝�
 - stock git 对 Wren 做 clone、fetch（含 partial clone）、push，全部成功。
 - 用 `git fsck` 检查导出到原主机的历史。
 - 镜像延迟的 p99 小于 10 秒。
+
+### 6.5 实现（M5 ✅）
+
+**git 协议前端**（`wren_core::gitproto`，路由在 `/git/{repo}`，`.git` 后缀可有可无）
+
+- 取：只支持协议 v2（git ≥ 2.26）。`ls-refs`（`peel`、`symrefs`、`ref-prefix`、
+  `unborn`）直接读元数据库；`fetch` 用代数号做 paint-down（最大堆，后代总先出堆，
+  所以出堆时"客户端是否已有"的标记已经确定），客户端没有的提交一旦全部出堆就停。
+  边界提交的树下面的对象视为客户端已有。支持 `filter blob:none` 和 `blob:limit`，
+  partial clone 的按需取（`want <blob>`）、`include-tag`、`thin-pack`。不支持浅克隆
+  （提示改用 partial clone）。
+- **复用 git 算好的 delta**：段里以 delta 存的对象，只要它的 base 也在这次发送的
+  集合里（或 `thin-pack` 下客户端已有），就把存着的压缩 delta 原样作为 `REF_DELTA`
+  发出；其余整对象发送。pack 仍然按请求即时生成、不落盘、不 repack（D4 的"先不做
+  delta"因此提前解决了，没有引入 gix）。
+- 推：`receive-pack`（v0 能力：`report-status`、`delete-refs`、`side-band-64k`）。
+  推上来的 pack 用 `git index-pack --stdin --fix-thin --strict` 建索引（逐对象检查；
+  git 不理会 `no-thin`，薄 pack 的 base 通过一个 alternates 指向对象库的临时仓库补齐），
+  成为一个段（有 bucket 时先上传），新提交按父先子后摄入成 changeset，然后每个 ref
+  经 `update_ref_as(…, "push")` 做 CAS。
+- 认证：git 用 HTTP Basic，任意用户名，口令是 token（读 token 可取，写 token 才能推）；
+  没有凭据时回 401 和 Basic 质询，git 会去问凭据助手。也接受 Bearer。
+
+**翻转**（`wren server --source-of-truth wren`，记录在元数据里，所有 server 一致）
+
+- 翻转前先和主机同步一次，然后把当前每个 ref 记为"已导出"。之后 ref 先在 Wren 里
+  CAS，主机由导出器跟上；不再从主机拉取。
+- **导出器按状态对齐，而不是按日志重放**：每轮对比 Wren 的 ref 和 `exported:<ref>`，
+  不同就带 lease（lease 是上次导出的值）推到主机，成功后更新 `exported:<ref>`。这样
+  幂等、崩溃后可恢复，中间值可以跳过。原计划的 `export_log` 队列因此不需要。
+  多台 server 时导出器在 mirror 锁下轮流运行。
+- 有人绕过 Wren 直接推主机：lease 失败，**不覆盖**，记录 `export_error` 并打错误日志。
+- 延迟：每次 CAS 记录时间，导出成功时算出延迟，保留最近 1000 个样本；`GET
+  /api/v1/repos` 的 `export` 字段给出 `authoritative`、`pending`、`lag_ms_p99` 和错误。
+
+**翻转后补上的保护**（两种模式都生效，写 API、land、git push 三条路径都经过同一个
+`update_ref_as`）
+
+- `--protect PATTERN`：受保护的 ref 不能删除，只能快进。
+- `--policy-hook URL`：任何 ref 移动前 POST `{repo, ref, old, new, via}`，2xx 放行，
+  否则拒绝并把响应体作为原因；连不上也拒绝（fail closed）。
+- 审计日志：每次 ref 移动写一条（时间、ref、old、new、via）到元数据库新增的只追加
+  `log` 表（SQLite 和 Postgres 都有，一致性测试覆盖）；`GET /api/v1/repos/{repo}/audit`。
+
+**测试**（`crates/wren/tests/gitproto.rs`，stock git）：clone（含附注标签和其他分支，
+`git fsck`）、`--filter=blob:none` 的 partial clone 和按需取、push 后主机跟上并通过
+`git fsck`、服务端 land 后增量 fetch、受保护 ref 拒绝强推和删除、策略钩子拒绝、
+读 token 不能推、审计日志、`lag_ms_p99` < 10 s、绕过 Wren 直推主机后不被覆盖并报错；
+write-proxy 模式下 push 同步先到主机。
+
+**git/git 实测**（Wren 的数据是段存储）：
+
+| | git（`file://`） | 经 Wren |
+|---|---:|---:|
+| 增量 fetch `master~50..master` | 336 ms | 369 ms，多 0.5 MiB |
+| `clone --bare --filter=blob:none` | 5.3 s，117 MiB | 9.5 s，126 MiB |
+
+不复用 delta 时，同一个 partial clone 是 114 s、1.6 GB。
+
+**限制**：pack 在内存里生成（不流式）；完整克隆大仓库时内存占用约等于 pack 大小。
+不支持浅克隆。
 
 ---
 

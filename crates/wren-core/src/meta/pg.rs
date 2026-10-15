@@ -154,11 +154,14 @@ impl PgMeta {
                  name TEXT PRIMARY KEY, target BYTEA NOT NULL, peeled BYTEA NOT NULL);
              CREATE TABLE IF NOT EXISTS {s}.derived(
                  kind TEXT NOT NULL, key BYTEA NOT NULL, value BYTEA NOT NULL,
-                 PRIMARY KEY(kind, key));",
+                 PRIMARY KEY(kind, key));
+             CREATE TABLE IF NOT EXISTS {s}.log(
+                 seq BIGSERIAL PRIMARY KEY, stream TEXT NOT NULL, data BYTEA NOT NULL);",
         );
         let drop = self.sql(
             "DROP TABLE IF EXISTS {s}.changesets; DROP TABLE IF EXISTS {s}.path_index;
-             DROP TABLE IF EXISTS {s}.refs; DROP TABLE IF EXISTS {s}.derived;",
+             DROP TABLE IF EXISTS {s}.refs; DROP TABLE IF EXISTS {s}.derived;
+             DROP TABLE IF EXISTS {s}.log;",
         );
         let version_q = self.sql("SELECT value FROM {s}.kv WHERE key = 'schema_version'");
         let set_version = self.sql(
@@ -526,6 +529,38 @@ impl Backend for PgMeta {
         self.run(move |c| {
             c.execute(&q, &[&key, &value])?;
             Ok(())
+        })
+    }
+
+    fn kv_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let q = self.sql(
+            "SELECT key, value FROM {s}.kv WHERE substr(key, 1, length($1)) = $1 ORDER BY key",
+        );
+        let prefix = prefix.to_string();
+        self.run(move |c| {
+            Ok(c.query(&q, &[&prefix])?
+                .iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect())
+        })
+    }
+
+    fn append_log(&self, stream: &str, data: &[u8]) -> Result<i64> {
+        let q = self.sql("INSERT INTO {s}.log(stream, data) VALUES ($1, $2) RETURNING seq");
+        let (stream, data) = (stream.to_string(), data.to_vec());
+        self.run(move |c| Ok(c.query(&q, &[&stream, &data])?[0].get(0)))
+    }
+
+    fn read_log(&self, stream: &str, after: i64, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
+        let q = self.sql(
+            "SELECT seq, data FROM {s}.log WHERE stream = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+        );
+        let (stream, limit) = (stream.to_string(), limit as i64);
+        self.run(move |c| {
+            Ok(c.query(&q, &[&stream, &after, &limit])?
+                .iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect())
         })
     }
 

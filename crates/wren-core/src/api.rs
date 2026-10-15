@@ -29,6 +29,10 @@ pub struct RepoInfo {
     pub tree_overrides: i64,
     #[serde(default)]
     pub commit_overrides: i64,
+    /// Whether Wren or the git host is the source of truth, and how far
+    /// the host lags behind Wren when it is a downstream mirror.
+    #[serde(default)]
+    pub export: crate::write::ExportStatus,
 }
 
 /// `GET /v1/capabilities`: what this tier speaks. Identical shape on every

@@ -9,6 +9,7 @@ pub mod bounded;
 pub mod changes;
 pub mod derived;
 pub mod git_source;
+pub mod gitproto;
 pub mod graph;
 pub mod grep;
 pub mod index;

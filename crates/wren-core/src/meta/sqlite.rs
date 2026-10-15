@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS kv(
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Append-only logs (the audit log).
+CREATE TABLE IF NOT EXISTS log(
+    seq    INTEGER PRIMARY KEY AUTOINCREMENT,
+    stream TEXT NOT NULL,
+    data   BLOB NOT NULL
+);
 -- Superseded derived-data formats; nothing reads them any more.
 DELETE FROM derived WHERE kind = 'blame';
 "#;
@@ -510,6 +516,42 @@ impl Backend for SqliteMeta {
     }
     /// One server per SQLite database: the repository's in-process lock is
     /// all the exclusion there is to have.
+    fn kv_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT key, value FROM kv WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
+            )?;
+            let rows = st
+                .query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    fn append_log(&self, stream: &str, data: &[u8]) -> Result<i64> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO log(stream, data) VALUES (?1, ?2)",
+                params![stream, data],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    fn read_log(&self, stream: &str, after: i64, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT seq, data FROM log WHERE stream = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+            )?;
+            let rows = st
+                .query_map(params![stream, after, limit as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
     fn lock(&self, _name: &str) -> Result<MetaLock> {
         Ok(MetaLock::none())
     }

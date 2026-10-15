@@ -45,11 +45,13 @@ Like Scion, Wren keeps clients thin and puts the work on the server:
   A job fetches only the objects it reads.
 
 Unlike Scion, Wren stays git all the way through. Commit ids are git ids,
-objects are git objects, and checkouts are normal git working trees. Today
-Wren runs in front of your existing git host, which stays the source of truth:
-Wren lands commits on it with `--force-with-lease`. The
-[migration plan](docs/design-scion-migration.md) takes Wren the rest of the
-way to Scion's design, one milestone at a time.
+objects are git objects, and checkouts are normal git working trees. By
+default Wren runs in front of your existing git host, which stays the source
+of truth: Wren lands commits on it with `--force-with-lease`. With
+`--source-of-truth wren`, Wren holds the refs and keeps the host up to date
+as a downstream mirror, and stock git clones, fetches and pushes through
+Wren itself. The [migration plan](docs/design-scion-migration.md) records
+each milestone toward Scion's design.
 
 > Wren is an independent project. It is not affiliated with or endorsed by
 > Anthropic and contains no Anthropic code. "Scion" refers to the system
@@ -78,8 +80,8 @@ principle and says where it still differs.
 | Every commit, rebase and revert happens on the server; refs move by compare-and-swap | Server-side commit, rebase, land and revert; the git host is updated first (write proxy) | ✅ M2 |
 | Want-only object protocol; identical RPCs at every cache tier | `wren cache` tiers, per-object verification, resumable | ✅ |
 | No packfiles and no maintenance; contents in object storage; distributed metadata | Immutable segments (git's pack format, never repacked): git/git in 331 MiB. Delta frames on the wire. Segments in S3, GCS or Azure, read by range; Postgres metadata shared by stateless servers | ✅ M3 |
-| A daemon per node with a bounded cache, seeded from snapshots; strict tiering | Planned, with deterministic simulation tests | M4 |
-| The server is the source of truth; older git clients still work | Planned: a git protocol front end, with the git host as a downstream mirror | M5 |
+| A daemon per node with a bounded cache, seeded from snapshots; strict tiering | `wren daemon`: generational eviction under a byte budget, leases for git checkouts, snapshot seeding; node → region → server enforced at startup; turmoil simulation of the tiers with fault injection | ✅ M4 |
+| The server is the source of truth; older git clients still work | Stock git clones, fetches (partial clones too) and pushes through Wren's git protocol front end; with `--source-of-truth wren` the git host becomes a downstream mirror. Protected refs, a policy hook and an audit log replace the host's protections | ✅ M5 |
 | Path history, copy detection and search indexes; directory permissions | Planned | M6 |
 | Virtualized checkouts | Optional | M7 |
 
@@ -96,7 +98,10 @@ principle and says where it still differs.
 > **v0.1, experimental. Read this before you deploy.**
 > - **Writes are off by default.** They need `--write-token` on the server.
 >   In write-proxy mode the git host's branch protections still apply, because
->   Wren pushes to it like any client.
+>   Wren pushes to it like any client. With `--source-of-truth wren` they no
+>   longer do: use `--protect` (no deletion, fast-forward only),
+>   `--policy-hook` (a webhook that allows or refuses each ref move) and the
+>   audit log (`/api/v1/repos/{repo}/audit`), and let only Wren push to the host.
 > - **One trust domain.** A token can read every repository on a server, and
 >   the object store is shared across repositories. Run one Wren per trust
 >   domain.
@@ -125,10 +130,16 @@ export WREN_TOKEN=$(openssl rand -hex 16)
 export WREN_WRITE_TOKEN=$(openssl rand -hex 16)   # optional: enables writes
 wren server --data ./wren-data --repo git=https://github.com/git/git.git &
 
-# 2. Optional: a cache tier. Same RPCs, so clients can't tell the difference.
+# 2. Optional: a region cache. Same RPCs, so clients can't tell the difference.
 wren cache --upstream http://127.0.0.1:7070 --listen 127.0.0.1:7071 \
            --upstream-token "$WREN_TOKEN" &
 export WREN_SERVER=http://127.0.0.1:7071 WREN_REPO=git
+
+# 3. Optional: a node daemon per machine, with a bounded store shared by
+#    every checkout on the machine; objects go through its socket.
+wren daemon --store ~/.wren/store --upstream http://127.0.0.1:7071 \
+            --upstream-token "$WREN_TOKEN" --budget 20GiB --snapshot git &
+export WREN_STORE=~/.wren/store WREN_OBJECTS=unix:$HOME/.wren/store/daemon.sock
 ```
 
 **Ask without a checkout**
@@ -162,6 +173,14 @@ wren revert <commit> --onto master
 ```sh
 wren checkout ws --sparse t/helper --git
 cd ws && git status && git log -1     # stock git works
+```
+
+**Use stock git against Wren** (protocol v2, git ≥ 2.26; the token is the
+password):
+
+```sh
+git clone --filter=blob:none http://x:$WREN_TOKEN@127.0.0.1:7070/git/git
+git push http://x:$WREN_WRITE_TOKEN@127.0.0.1:7070/git/git HEAD:refs/heads/topic
 ```
 
 **Find the commit that broke main.** Bisection runs over first-parent
@@ -291,9 +310,9 @@ gates for each milestone.
 - **M3, storage.** Done: immutable segments (M3a), delta frames on the wire
   (M3b), Postgres metadata shared by stateless servers (M3c), segments in
   object storage (M3d).
-- **M4, node daemon.** A bounded per-node cache seeded from snapshots, strict
-  tiering, and deterministic simulation tests with fault injection.
-- **M5, source of truth.** A git protocol front end so stock git can clone,
+- **M4, node daemon.** Done: a bounded per-node cache seeded from snapshots,
+  strict tiering, and simulation tests of the tiers with fault injection.
+- **M5, source of truth.** Done: a git protocol front end so stock git can clone,
   fetch and push through Wren, with the git host as a downstream mirror.
 - **M6, indexes and permissions.** Path history through the derived-data
   mechanism, copy and rename detection, search indexes, directory ACLs.

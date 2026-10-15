@@ -117,6 +117,10 @@ pub struct CacheState {
     /// them wait for that fetch instead of asking again.
     inflight: Mutex<HashMap<Oid, watch::Receiver<bool>>>,
     snapshot_flights: tokio::sync::Mutex<()>,
+    /// Queries being forwarded right now (see `proxy`).
+    api_flights: Mutex<HashMap<String, watch::Receiver<bool>>>,
+    /// Answers reused for a short time (the snapshot description).
+    short_lived: Mutex<HashMap<String, (std::time::Instant, ShortLived)>>,
     /// Bytes stored since the node last ran maintenance.
     since_maintain: AtomicU64,
     maintaining: AtomicBool,
@@ -152,6 +156,24 @@ struct StatsBody {
     store_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     budget: Option<u64>,
+}
+
+/// Objects one request is fetching from upstream (see `fetch_coalesced`).
+struct Inflight<'a> {
+    map: &'a Mutex<HashMap<Oid, watch::Receiver<bool>>>,
+    oids: Vec<Oid>,
+    tx: watch::Sender<bool>,
+}
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap();
+        for o in &self.oids {
+            map.remove(o);
+        }
+        drop(map);
+        let _ = self.tx.send(true);
+    }
 }
 
 /// Raw (loose-encoded) objects, least recently used out first.
@@ -194,6 +216,7 @@ impl Lru {
 }
 
 type St = State<Arc<CacheState>>;
+type ShortLived = (StatusCode, Option<HeaderValue>, Bytes);
 
 pub fn router(state: Arc<CacheState>) -> Router {
     let token = state.token.clone();
@@ -281,6 +304,8 @@ impl CacheState {
             }),
             inflight: Mutex::new(HashMap::new()),
             snapshot_flights: tokio::sync::Mutex::new(()),
+            api_flights: Mutex::new(HashMap::new()),
+            short_lived: Mutex::new(HashMap::new()),
             since_maintain: AtomicU64::new(0),
             maintaining: AtomicBool::new(false),
         })
@@ -436,48 +461,72 @@ impl CacheState {
     }
 
     /// `fetch_upstream`, except that an object another request is already
-    /// fetching is waited for rather than asked for again.
+    /// fetching is waited for rather than asked for again. `Ok` means the
+    /// upstream answered for every object (it may have said "missing"): if
+    /// the fetch waited for fails, its objects are fetched again here.
     async fn fetch_coalesced(&self, oids: &[Oid], bases: &[Option<Oid>]) -> Result<()> {
-        let (tx, rx) = watch::channel(false);
-        let (mut mine, mut mine_bases, mut wait) = (Vec::new(), Vec::new(), Vec::new());
-        {
-            let mut inflight = self.inflight.lock().unwrap();
-            for (i, o) in oids.iter().enumerate() {
-                match inflight.get(o) {
-                    Some(r) => wait.push(r.clone()),
-                    None => {
-                        inflight.insert(*o, rx.clone());
-                        mine.push(*o);
-                        mine_bases.push(bases.get(i).copied().flatten());
+        let mut todo: Vec<(Oid, Option<Oid>)> = oids
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (*o, bases.get(i).copied().flatten()))
+            .collect();
+        loop {
+            let (tx, rx) = watch::channel(false);
+            let (mut mine, mut mine_bases) = (Vec::new(), Vec::new());
+            let mut wait: Vec<(Oid, Option<Oid>, watch::Receiver<bool>)> = Vec::new();
+            {
+                let mut inflight = self.inflight.lock().unwrap();
+                for (o, b) in &todo {
+                    match inflight.get(o) {
+                        Some(r) => wait.push((*o, *b, r.clone())),
+                        None => {
+                            inflight.insert(*o, rx.clone());
+                            mine.push(*o);
+                            mine_bases.push(*b);
+                        }
                     }
                 }
             }
-        }
-        self.stats
-            .coalesced
-            .fetch_add(wait.len() as u64, Ordering::Relaxed);
-        let mut result = Ok(());
-        for (chunk, chunk_bases) in mine
-            .chunks(wire::MAX_BATCH)
-            .zip(mine_bases.chunks(wire::MAX_BATCH))
-        {
-            if let Err(e) = self.fetch_upstream(chunk, chunk_bases).await {
-                result = Err(e);
-                break;
+            // Removes this request's entries and wakes its waiters however
+            // it ends, including when the request is cancelled.
+            let guard = Inflight {
+                map: &self.inflight,
+                oids: mine.clone(),
+                tx,
+            };
+            self.stats
+                .coalesced
+                .fetch_add(wait.len() as u64, Ordering::Relaxed);
+            let mut result = Ok(());
+            for (chunk, chunk_bases) in mine
+                .chunks(wire::MAX_BATCH)
+                .zip(mine_bases.chunks(wire::MAX_BATCH))
+            {
+                if let Err(e) = self.fetch_upstream(chunk, chunk_bases).await {
+                    result = Err(e);
+                    break;
+                }
+            }
+            drop(guard);
+            result?;
+            for (_, _, r) in &mut wait {
+                // An error means the fetcher went away; checked below.
+                let _ = r.wait_for(|done| *done).await;
+            }
+            // What the fetches waited for did not bring (they failed, or
+            // were cancelled) is fetched again, by this request if no other
+            // is at it by now.
+            let store = self.store.clone();
+            let waited: Vec<(Oid, Option<Oid>)> =
+                wait.into_iter().map(|(o, b, _)| (o, b)).collect();
+            todo = tokio::task::spawn_blocking(move || {
+                waited.into_iter().filter(|(o, _)| !store.has(o)).collect()
+            })
+            .await?;
+            if todo.is_empty() {
+                return Ok(());
             }
         }
-        {
-            let mut inflight = self.inflight.lock().unwrap();
-            for o in &mine {
-                inflight.remove(o);
-            }
-        }
-        let _ = tx.send(true);
-        for mut r in wait {
-            // An error means the fetcher went away; the caller re-checks.
-            let _ = r.wait_for(|done| *done).await;
-        }
-        result
     }
 
     /// Run a node's maintenance (in the background) once enough has
@@ -803,8 +852,45 @@ fn is_read(method: &axum::http::Method, path: &str) -> bool {
     *method == Method::POST && sync
 }
 
+/// A stored immutable answer, if there is one.
+async fn stored_answer(
+    st: &CacheState,
+    file: &std::path::Path,
+    semantics: &str,
+) -> Option<Response> {
+    let body = tokio::fs::read(file).await.ok()?;
+    let ctype = tokio::fs::read_to_string(file.with_extension("type"))
+        .await
+        .unwrap_or_default();
+    let mut out = Response::new(Body::from(body));
+    if let Ok(v) = HeaderValue::from_str(&ctype) {
+        out.headers_mut().insert(header::CONTENT_TYPE, v);
+    }
+    out.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(immutable(st.token.is_some())),
+    );
+    if let Ok(v) = HeaderValue::from_str(semantics) {
+        out.headers_mut().insert(SEMANTICS_HEADER, v);
+    }
+    Some(out)
+}
+
+/// How long a repository's snapshot description is reused. It changes as
+/// the default branch moves, but a slightly older snapshot seeds a node
+/// just as well; without this, every node starting at once would ask the
+/// server.
+const SNAPSHOT_INFO_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn is_snapshot_info(path: &str) -> bool {
+    path.strip_prefix("/api/v1/repos/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(repo, rest)| !repo.is_empty() && rest == "snapshot")
+}
+
 /// Serve a query: from the immutable response cache when possible,
-/// otherwise forwarded to the upstream tier.
+/// otherwise forwarded to the upstream tier. Concurrent identical queries
+/// that miss share one upstream request.
 async fn proxy(State(st): St, req: Request) -> Result<Response, ApiError> {
     let path_q = req
         .uri()
@@ -821,26 +907,62 @@ async fn proxy(State(st): St, req: Request) -> Result<Response, ApiError> {
         ));
     }
     let cacheable = method == axum::http::Method::GET;
+    let short_lived = cacheable && is_snapshot_info(req.uri().path());
     let semantics = st.current_semantics();
     let cache_file = api_cache_path(&st, &semantics, &path_q);
+    let mut _flight = None;
     if cacheable {
-        if let Ok(body) = tokio::fs::read(&cache_file).await {
-            st.stats.api_hits.fetch_add(1, Ordering::Relaxed);
-            let ctype = tokio::fs::read_to_string(cache_file.with_extension("type"))
-                .await
-                .unwrap_or_default();
-            let mut out = Response::new(Body::from(body));
-            if let Ok(v) = HeaderValue::from_str(&ctype) {
-                out.headers_mut().insert(header::CONTENT_TYPE, v);
+        for attempt in 0..2 {
+            if let Some(out) = stored_answer(&st, &cache_file, &semantics).await {
+                st.stats.api_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(out);
             }
-            out.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static(immutable(st.token.is_some())),
-            );
-            if let Ok(v) = HeaderValue::from_str(&semantics) {
-                out.headers_mut().insert(SEMANTICS_HEADER, v);
+            if short_lived {
+                let hit = st
+                    .short_lived
+                    .lock()
+                    .unwrap()
+                    .get(&path_q)
+                    .filter(|(at, _)| at.elapsed() < SNAPSHOT_INFO_TTL)
+                    .map(|(_, r)| r.clone());
+                if let Some((status, ctype, body)) = hit {
+                    st.stats.api_hits.fetch_add(1, Ordering::Relaxed);
+                    let mut out = Response::new(Body::from(body));
+                    *out.status_mut() = status;
+                    if let Some(c) = ctype {
+                        out.headers_mut().insert(header::CONTENT_TYPE, c);
+                    }
+                    return Ok(out);
+                }
             }
-            return Ok(out);
+            if attempt == 1 {
+                break;
+            }
+            // Wait for an identical query in flight, then look again; or
+            // become the one in flight.
+            let waiting = {
+                let mut flights = st.api_flights.lock().unwrap();
+                match flights.get(&path_q) {
+                    Some(r) => Some(r.clone()),
+                    None => {
+                        let (tx, rx) = watch::channel(false);
+                        flights.insert(path_q.clone(), rx);
+                        _flight = Some(ApiFlight {
+                            map: &st.api_flights,
+                            key: path_q.clone(),
+                            tx,
+                        });
+                        None
+                    }
+                }
+            };
+            match waiting {
+                Some(mut r) => {
+                    st.stats.coalesced.fetch_add(1, Ordering::Relaxed);
+                    let _ = r.wait_for(|done| *done).await;
+                }
+                None => break,
+            }
         }
         st.stats.api_misses.fetch_add(1, Ordering::Relaxed);
     }
@@ -894,6 +1016,15 @@ async fn proxy(State(st): St, req: Request) -> Result<Response, ApiError> {
         )
         .await;
     }
+    if short_lived && (status == StatusCode::OK || status == StatusCode::NOT_FOUND) {
+        st.short_lived.lock().unwrap().insert(
+            path_q.clone(),
+            (
+                std::time::Instant::now(),
+                (status, ctype.clone(), bytes.clone()),
+            ),
+        );
+    }
     let mut out = Response::new(Body::from(bytes));
     *out.status_mut() = status;
     if let Some(c) = ctype {
@@ -913,10 +1044,29 @@ async fn proxy(State(st): St, req: Request) -> Result<Response, ApiError> {
     Ok(out)
 }
 
+/// A query this cache is forwarding; identical ones wait for it.
+struct ApiFlight<'a> {
+    map: &'a Mutex<HashMap<String, watch::Receiver<bool>>>,
+    key: String,
+    tx: watch::Sender<bool>,
+}
+
+impl Drop for ApiFlight<'_> {
+    fn drop(&mut self) {
+        self.map.lock().unwrap().remove(&self.key);
+        let _ = self.tx.send(true);
+    }
+}
+
 async fn write_atomic(path: &std::path::Path, body: &[u8], ctype: &str) -> Result<()> {
     let dir = path.parent().unwrap();
     tokio::fs::create_dir_all(dir).await?;
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    static N: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
     // Content type first: the body's presence is what marks the entry valid.
     tokio::fs::write(path.with_extension("type"), ctype).await?;
     tokio::fs::write(&tmp, body).await?;

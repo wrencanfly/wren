@@ -144,6 +144,29 @@ fn exercise(db: &MetaDb) {
     db.set_kv("upstream", "b").unwrap();
     assert_eq!(db.get_kv("upstream").unwrap().as_deref(), Some("b"));
     assert!(db.get_kv("nope").unwrap().is_none());
+
+    // Keys by prefix (the exporter's state).
+    db.set_kv("exported:refs/heads/a", &oid(1).to_hex())
+        .unwrap();
+    db.set_kv("exported:refs/heads/b", "").unwrap();
+    db.set_kv("exportedX", "no").unwrap();
+    assert_eq!(
+        db.exported_names().unwrap(),
+        vec!["refs/heads/a".to_string()]
+    );
+
+    // Append-only logs, per stream, in order.
+    let a = db.append_log("audit", b"one").unwrap();
+    db.append_log("other", b"x").unwrap();
+    let b = db.append_log("audit", b"two").unwrap();
+    assert!(b > a);
+    let all = db.read_log("audit", 0, 10).unwrap();
+    assert_eq!(all, vec![(a, b"one".to_vec()), (b, b"two".to_vec())]);
+    assert_eq!(
+        db.read_log("audit", a, 10).unwrap(),
+        vec![(b, b"two".to_vec())]
+    );
+    assert_eq!(db.read_log("audit", 0, 1).unwrap().len(), 1);
 }
 
 #[test]

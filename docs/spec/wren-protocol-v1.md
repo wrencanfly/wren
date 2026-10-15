@@ -52,6 +52,8 @@ to do; they do not mean the draft is final.
 12. [Worked example (informative)](#12-worked-example-informative)
 13. [Open issues](#13-open-issues)
 14. [Writes](#14-writes)
+15. [Snapshots](#15-snapshots)
+16. [git protocol front end](#16-git-protocol-front-end)
 
 ---
 
@@ -65,7 +67,7 @@ interpreted as described in RFC 2119.
 |---|---|
 | **oid** | A git object id. In v1, a SHA-1 digest: 20 raw bytes on the wire, or 40 lowercase hexadecimal characters in JSON and URLs. |
 | **Loose object** | git's loose-object encoding of an object: `zlib("<type> <size>\0<content>")` ([§3.1](#31-object-encoding)). |
-| **Tier** | Any HTTP endpoint that speaks this protocol. There are two kinds: the **server** (authoritative) and a **cache** (sits in front of exactly one upstream tier, which is a server or another cache). |
+| **Tier** | Any HTTP endpoint that speaks this protocol. There are three kinds: the **server** (authoritative), a **region** cache (whose upstream is the server), and a **node** cache (one per machine, `wren daemon`, whose upstream is a region cache). A "cache" is a region or a node. |
 | **Client** | Anything that sends requests to a tier, for example the `wren` CLI or a cache talking to its upstream. |
 | **Repository** (repo) | A named history served by a server, mirrored from an upstream git URL. Named by the `{repo}` path segment. |
 | **Changeset** | Wren's record of one commit: the commit's tree, its parents, and the list of paths it changed **relative to its first parent** ([§4.0.5](#405-the-change-object)). Every commit the server has ingested is a changeset. Changesets are never deleted, so a commit that later becomes unreachable (for example after a force-push upstream) stays queryable by id. |
@@ -164,8 +166,9 @@ A server started with a write token adds `"write.v1"` to `features`
 |---|---|---|
 | `protocol` | integer | Protocol major version. MUST be `1` for this specification. |
 | `object_format` | string | The hash algorithm of every oid on this tier. MUST be `"sha1"` in v1 ([§1.5](#15-object-format)). |
-| `tier` | string | `"server"` or `"cache"`: which kind of tier answered. Clients MUST NOT change their behaviour based on this value ([§2.2](#22-tiers)). |
-| `features` | array of strings | Feature flags. The reference implementation advertises exactly the nine values above on both tiers (`FEATURES` in `crates/wren/src/server.rs`), plus `write.v1` on a server with a write token. |
+| `tier` | string | `"server"`, `"region"` or `"node"`: which kind of tier answered. Older caches said `"cache"`, which means `"region"`. Clients MUST NOT change how they read answers based on this value ([§2.2](#22-tiers)); tiers use it to check their upstream ([§2.3](#23-strict-tiering)). |
+| `store` | string, optional | Only on a node: the path of its object store. A client on the same machine whose store is that path lets the node write it and only verifies what it receives (§3.4 still applies). |
+| `features` | array of strings | Feature flags. The reference implementation advertises the values above plus `object-deltas.v1` and `snapshots.v1` on every tier (`FEATURES` in `crates/wren/src/server.rs`), and `write.v1` on a server with a write token. |
 | `semantics` | string | The query semantics version ([§1.2](#12-protocol-version-and-the-wren-protocol-header)). A server reports its own. A cache reports the value it last learned from its upstream, or its own built-in value if it has learned none ([§7.2](#72-marking-and-storing)). Clients MUST treat an absent field (older servers) as unknown. |
 
 Feature flags defined in v1:
@@ -182,6 +185,8 @@ Feature flags defined in v1:
 | `on-demand-sync` | An unknown revision triggers one sync with upstream before the server answers `404` ([§4.0.7](#407-unknown-revisions-and-on-demand-sync)) |
 | `error-codes` | Errors produced by handlers carry a machine-readable `code` ([§6.1](#61-errorbody)) |
 | `write.v1` | The write API of [§14](#14-writes). Only a server with a write token advertises it; a cache never does. |
+| `object-deltas.v1` | Delta frames in `POST /v1/objects` ([§3.2](#32-batch-fetch-post-v1objects)) |
+| `snapshots.v1` | Snapshots ([§15](#15-snapshots)) |
 
 Clients MUST ignore feature flags they do not recognise.
 
@@ -257,7 +262,7 @@ accepted for reads as well. The read token never grants writes
 ### 2.2 Tiers
 
 Tiers form a tree: clients talk to a cache or to the server, and each cache has
-exactly one upstream, which is a server or another cache.
+exactly one upstream, the tier directly above it ([§2.3](#23-strict-tiering)).
 
 * A cache MUST answer **the same RPCs** as the server: every route in [§3](#3-object-protocol) and
   [§4](#4-query-api), plus `/v1/capabilities` and `/healthz`, with the same
@@ -284,18 +289,45 @@ exactly one upstream, which is a server or another cache.
   serves `GET /v1/stats` (OPTIONAL, not advertised in `features`), which returns:
 
   ```json
-  {"hits":12,"misses":3,"hit_rate":0.8,"api_hits":4,"api_misses":9,"upstream_requests":10}
+  {"tier":"node","hits":12,"misses":3,"hit_rate":0.8,"memory_hits":5,"coalesced":2,
+   "api_hits":4,"api_misses":9,"upstream_requests":10,"snapshot_downloads":2,
+   "store_bytes":1048576,"budget":21474836480}
   ```
 
-  `hits` and `misses` count objects served from the local store versus fetched
-  from upstream. `hit_rate` is `hits/(hits+misses)`, or `0.0` when both are
-  zero. `api_hits` and `api_misses` count GET query requests served from, or
-  missing from, the immutable response store. `upstream_requests` counts every
-  request sent upstream. The server does not serve this route.
+  `hits` and `misses` count objects served from this tier (its store or its
+  memory) versus fetched from upstream; `memory_hits` is the part of `hits`
+  served from memory. `hit_rate` is `hits/(hits+misses)`, or `0.0` when both
+  are zero. `coalesced` counts misses that waited for another request's
+  upstream fetch instead of making their own. `api_hits` and `api_misses`
+  count GET query requests served from, or missing from, the immutable
+  response store. `upstream_requests` counts every request sent upstream.
+  `snapshot_downloads` counts snapshot files fetched ([§15](#15-snapshots)).
+  A node also reports its store size and budget. The server does not serve
+  this route.
+* A cache MAY reuse an answer to `GET /api/v1/repos/{repo}/snapshot`
+  ([§15](#15-snapshots)) for up to 10 seconds. This is the one unpinned query
+  a cache may answer itself: an older snapshot seeds a node just as well, and
+  without it every node starting at once would reach the server.
 
 *(informative)* The reference cache bounds concurrent upstream requests with a
 semaphore (default 32) and applies an upstream timeout (default 120 s), so a
-cold or flooded cache cannot overwhelm the tier above it.
+cold or flooded cache cannot overwhelm the tier above it. Concurrent misses
+for the same object, or the same query, share one upstream request.
+
+### 2.3 Strict tiering
+
+A node's upstream MUST be a region cache, and a region cache's upstream MUST
+be the server. At startup a cache reads its upstream's `/v1/capabilities`
+and refuses to start when the upstream's `tier` is not the one directly
+above it. Otherwise a region outage would send every node to the server
+directly, and a cache failure would become a server failure. The reference
+implementation has an explicit override (`--allow-tier-skip`) for small
+deployments without a region tier; it logs a warning.
+
+A client MAY send object requests to a different tier than queries and
+writes: the reference client sends them to `WREN_OBJECTS` (typically
+`unix:/path/to/daemon.sock`, the node) and everything else to
+`WREN_SERVER`.
 
 ---
 
@@ -2292,3 +2324,120 @@ control plane). It does not contact its upstream for them. A cache does not
 advertise `write.v1`. Writers talk to the server. Readers can keep using
 caches: a branch moved by a write is visible through a cache as soon as the
 server has it, because unpinned queries are always forwarded.
+
+---
+
+### 14.10 Source of truth, protection, audit
+
+A repository's refs are held either by the **git host** (write-proxy mode,
+the default: §14.8) or by **Wren** (reference: `wren server
+--source-of-truth wren`, recorded in the metadata so that every server
+agrees). When Wren holds them, a ref move is a compare-and-swap on Wren's
+ref alone, and the server keeps the host up to date asynchronously: for each
+ref whose value differs from the last value it exported, it pushes with a
+lease on that last value. A host that no longer has that value (someone
+pushed to it directly) is never overwritten; the server reports the error
+instead. Unpinned answers no longer depend on syncing; nothing is fetched
+from the host.
+
+In both modes, and for every way a ref can move (§14.5, §14.6, §14.7, and
+pushes through §16), a server MAY refuse a move with `409`
+(`"result": "rejected"`, or `ng` for a push):
+
+* **Protected refs** (reference: `--protect PATTERN`, `*` matches anything):
+  a protected ref cannot be deleted and moves only forward (the new commit
+  descends from the old one).
+* **Policy hook** (reference: `--policy-hook URL`): before a ref moves, the
+  server POSTs `{"repo", "ref", "old", "new", "via"}` (`via` is `refs`,
+  `land` or `push`; `old`/`new` are `null` for absent). Any `2xx` allows the
+  move; anything else, or no answer within 10 s, refuses it with the response
+  body as the reason.
+
+Every move is appended to the **audit log**:
+
+`GET /api/v1/repos/{repo}/audit?after=<seq>&limit=<n>` (read token) returns,
+oldest first, `[{"seq": 7, "time_ms": 1760000000000, "ref":
+"refs/heads/main", "old": "…", "new": "…", "via": "push"}, …]`.
+
+`GET /api/v1/repos` reports, per repository:
+
+```json
+"export": {"authoritative": true, "pending": 0, "lag_ms_p99": 140, "samples": 52, "error": null}
+```
+
+`pending` counts refs whose current value has not reached the host yet,
+`lag_ms_p99` is the 99th percentile of recent export delays (from the move
+in Wren to the host accepting it), and `error` is the latest export problem.
+
+## 15. Snapshots
+
+A snapshot is one segment (a git pack and its v2 index) holding a commit,
+every tree under it, and the blobs of a cone of directories. A new node
+seeds its store from one, so a fleet of nodes starting at once fetches one
+file through the tiers, not thousands of objects each.
+
+### 15.1 Current snapshot: `GET /api/v1/repos/{repo}/snapshot`
+
+```json
+{"name": "pack-7a0c…", "commit": "1c9e…", "cone": [], "objects": 4962, "size": 18874368}
+```
+
+`name` is `pack-` followed by the pack's SHA-1 checksum (its trailer), so a
+snapshot is named by its content. `cone` lists the directories whose blobs
+are included (empty: all). `404` with code `not_found` means there is no
+snapshot yet, or the tier does not publish snapshots. The answer is not
+pinned; caches forward it, except as allowed in [§2.2](#22-tiers).
+
+A server builds a snapshot of the default branch's tip periodically
+(reference: `--snapshot-every`, `--snapshot-cone`), and on
+`POST /api/v1/repos/{repo}/snapshot` with the write token ([§14.1](#141-authentication)).
+The contents are a pure function of (commit, cone), so servers sharing
+metadata produce identical files.
+
+### 15.2 Snapshot files: `GET /v1/snapshots/{name}.pack` and `.idx`
+
+Immutable (`Cache-Control: ... immutable`), and served with byte ranges:
+a request with `Range: bytes=a-` or `bytes=a-b` gets `206 Partial Content`
+with `Content-Range`, so downloads resume. Every cache MUST serve these
+routes: from its own copy, or by downloading the file from its upstream
+(once, however many requests arrive), checking it (below), and keeping it.
+
+A receiver MUST check a file before using or keeping it: the SHA-1 of a
+`.pack` without its last 20 bytes equals its last 20 bytes, which equal the
+checksum in `name`; the SHA-1 of an `.idx` without its last 20 bytes equals
+its last 20 bytes, and the 20 bytes before those equal the checksum in
+`name`. A node then installs the pair as a segment; every object in it is
+still subject to [§3.4](#34-verification) when it is read.
+
+---
+
+## 16. git protocol front end
+
+A server MAY serve git's smart HTTP protocol at `/git/{repo}` (a trailing
+`.git` is accepted), so that stock git needs no Wren client:
+
+| Route | |
+|---|---|
+| `GET /git/{repo}/info/refs?service=git-upload-pack` | Protocol v2 capability advertisement (requires `Git-Protocol: version=2`; git ≥ 2.26 sends it). Capabilities: `ls-refs=unborn`, `fetch=filter`, `object-format=sha1`. |
+| `POST /git/{repo}/git-upload-pack` | `ls-refs` (`peel`, `symrefs`, `ref-prefix`, `unborn`) and `fetch` (`want`, `have`, `done`, `filter blob:none` / `blob:limit=<n>`, `include-tag`, `thin-pack`). Shallow fetches are refused. |
+| `GET /git/{repo}/info/refs?service=git-receive-pack` | Ref advertisement for pushes (capabilities `report-status delete-refs side-band-64k quiet ofs-delta no-thin`). |
+| `POST /git/{repo}/git-receive-pack` | A push: commands and a pack. |
+
+Refs are those of §4.2; `HEAD` is the repository's default branch. A fetch
+sends the commits reachable from the wants and not from the common haves,
+and the trees and blobs under them that the client does not have (those
+under the trees of the common commits are assumed present), filtered as
+asked. Packs are generated per request and never stored; an object kept as a
+delta whose base is also sent (or, with `thin-pack`, is known to the client)
+MAY be sent as that delta.
+
+A pushed pack is indexed and checked object by object (the reference uses
+`git index-pack --strict --fix-thin`), its commits become changesets, and
+each command is a ref move under §14.10 (`via: "push"`), reported as `ok` or
+`ng <reason>` (`fetch first` for a stale old value).
+
+Authentication: HTTP Basic with any user name and a token as the password
+(read or write token to fetch, the write token to push), or a Bearer token.
+Requests without credentials get `401` with `WWW-Authenticate: Basic`. Caches
+do not serve these routes.
+

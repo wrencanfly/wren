@@ -40,3 +40,7 @@ jobs:
         run: |
           seeds=$(for i in $(seq 1 8); do echo -n "$(( ${{ github.run_number }} * 100 + i )),"; done)
           WREN_FUZZ_SEEDS=${seeds%,} cargo test --release -p wren-vcs-core --test differential -- --nocapture
+      - name: Simulate the tiers under faults, 1000 fresh seeds
+        run: |
+          WREN_SIM_SEEDS=1000 WREN_SIM_SEED_BASE=$(( ${{ github.run_number }} * 1000 )) \
+            cargo test --release -p wren-vcs --test sim tiers_under_faults -- --nocapture

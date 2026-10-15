@@ -15,6 +15,13 @@
 //!   repo take turns; see `land`.)
 //! * `revert`: the inverse changeset, optionally landed.
 //!
+//! Once Wren is the source of truth (M5), `update_ref` moves Wren's ref
+//! first and the host follows asynchronously (`export`). The host's branch
+//! protections then no longer guard writes, so Wren has its own: protected
+//! refs (no deletion, fast-forward only), a policy hook consulted before any
+//! ref moves, and an audit log of every move. They apply in both modes and
+//! to every path: the write API, `land`, and `git push`.
+//!
 //! Commits created here are ordinary git commits with git ids, so when the
 //! host's history comes back through sync they are already known.
 
@@ -31,6 +38,74 @@ use crate::object::{Kind, RawCommit, MODE_BLOB, MODE_EXEC, MODE_GITLINK, MODE_SY
 use crate::oid::Oid;
 use crate::repo::Repo;
 use crate::{bad_request, BadRequest};
+
+/// Rules every ref update must pass, in both modes and on every path.
+#[derive(Clone, Default)]
+pub struct Policy {
+    /// Glob patterns (`*` matches anything) of protected refs: they cannot
+    /// be deleted and move only forward.
+    pub protected: Vec<String>,
+    /// Asked before any ref moves; `Err(reason)` refuses.
+    #[allow(clippy::type_complexity)]
+    pub hook: Option<std::sync::Arc<dyn Fn(&RefChange) -> Result<(), String> + Send + Sync>>,
+}
+
+impl Policy {
+    pub fn is_protected(&self, name: &str) -> bool {
+        self.protected.iter().any(|p| glob(p, name))
+    }
+}
+
+fn glob(pattern: &str, s: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == s,
+        Some((pre, rest)) => {
+            let Some(tail) = s.strip_prefix(pre) else {
+                return false;
+            };
+            (0..=tail.len()).any(|i| tail.is_char_boundary(i) && glob(rest, &tail[i..]))
+        }
+    }
+}
+
+/// A proposed ref move, as the policy hook sees it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RefChange {
+    pub repo: String,
+    #[serde(rename = "ref")]
+    pub name: String,
+    pub old: Option<Oid>,
+    pub new: Option<Oid>,
+    /// `refs`, `land` or `push`.
+    pub via: String,
+}
+
+/// An audit log entry: one ref move.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub time_ms: u64,
+    #[serde(rename = "ref")]
+    pub name: String,
+    pub old: Option<Oid>,
+    pub new: Option<Oid>,
+    pub via: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExportReport {
+    pub pushed: usize,
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExportStatus {
+    pub authoritative: bool,
+    /// Refs whose current value has not reached the host yet.
+    pub pending: usize,
+    pub lag_ms_p99: Option<u64>,
+    pub samples: usize,
+    pub error: Option<String>,
+}
 
 /// One file edit in a new changeset: the path's new version, or `None` to
 /// delete it.
@@ -467,8 +542,20 @@ impl Repo {
         expected: Option<Oid>,
         new: Option<Oid>,
     ) -> Result<RefUpdate> {
+        self.update_ref_as(name, expected, new, "refs")
+    }
+
+    /// `update_ref`, recording `via` (the path the write came by: `refs`,
+    /// `land`, `push`) in the audit log.
+    pub fn update_ref_as(
+        &self,
+        name: &str,
+        expected: Option<Oid>,
+        new: Option<Oid>,
+        via: &str,
+    ) -> Result<RefUpdate> {
         let _guard = self.lock_mirror()?;
-        self.update_ref_locked(name, expected, new)
+        self.update_ref_locked(name, expected, new, via)
     }
 
     /// `update_ref` with the mirror lock held by the caller. A push reads packs
@@ -480,21 +567,29 @@ impl Repo {
         name: &str,
         expected: Option<Oid>,
         new: Option<Oid>,
+        via: &str,
     ) -> Result<RefUpdate> {
-        if !name.starts_with("refs/heads/") || name.len() <= "refs/heads/".len() {
+        let branch = name.starts_with("refs/heads/") && name.len() > "refs/heads/".len();
+        let tag = name.starts_with("refs/tags/") && name.len() > "refs/tags/".len();
+        if !branch && !tag {
             return Err(bad_request(format!(
-                "only branches can be updated, not {name:?}"
+                "only branches and tags can be updated, not {name:?}"
             )));
         }
-        if let Some(n) = new {
-            if !self.meta.has_changeset(&n)? {
-                return Err(crate::not_found(format!("unknown changeset {n}")));
-            }
-        }
+        // (target, the commit it names): a branch names a changeset; a tag
+        // a changeset or an annotated tag of one.
+        let new = match new {
+            None => None,
+            Some(n) => Some((n, self.peel_to_changeset(&n, tag)?)),
+        };
         let current = || -> Result<Option<Oid>> { Ok(self.meta.get_ref(name)?.map(|r| r.target)) };
-        if let Some(url) = &self.upstream {
+        if let Some(reason) = self.check_policy(name, expected, new, via)? {
+            return Ok(RefUpdate::Rejected { reason });
+        }
+        let authoritative = self.authoritative()?;
+        if let (Some(url), false) = (&self.upstream, authoritative) {
             let mirror = GitMirror::open(self.dir().join("mirror.git"), url, self.store.root())?;
-            match mirror.push_lease(name, expected, new)? {
+            match mirror.push_lease(name, expected, new.map(|n| n.0))? {
                 Push::Done => {}
                 Push::Stale => {
                     return Ok(RefUpdate::Stale {
@@ -504,15 +599,205 @@ impl Repo {
                 Push::Rejected(reason) => return Ok(RefUpdate::Rejected { reason }),
             }
         }
-        if self.meta.cas_ref(name, expected, new.map(|n| (n, n)))? {
+        if self.meta.cas_ref(name, expected, new)? {
+            self.record_move(name, expected, new.map(|n| n.0), via, authoritative)?;
             return Ok(RefUpdate::Updated);
         }
         // A sync that ran after the push may already have published it.
         let cur = current()?;
-        if cur == new {
+        if cur == new.map(|n| n.0) {
             return Ok(RefUpdate::Updated);
         }
         Ok(RefUpdate::Stale { current: cur })
+    }
+
+    /// The changeset `oid` names: itself, or (for a tag ref) what an
+    /// annotated tag points at.
+    fn peel_to_changeset(&self, oid: &Oid, allow_tag: bool) -> Result<Oid> {
+        let mut cur = *oid;
+        for _ in 0..16 {
+            if self.meta.has_changeset(&cur)? {
+                return Ok(cur);
+            }
+            match self.store.get(&cur)? {
+                Some((Kind::Tag, data)) if allow_tag => {
+                    cur = crate::object::Tag::parse(&data)?.object
+                }
+                _ => return Err(crate::not_found(format!("unknown changeset {oid}"))),
+            }
+        }
+        Err(bad_request(format!("{oid}: tag chain too long")))
+    }
+
+    /// Protected refs and the policy hook: `Some(reason)` refuses the move.
+    fn check_policy(
+        &self,
+        name: &str,
+        old: Option<Oid>,
+        new: Option<(Oid, Oid)>,
+        via: &str,
+    ) -> Result<Option<String>> {
+        let policy = self.policy.read().unwrap().clone();
+        if policy.is_protected(name) {
+            match (old, new) {
+                (_, None) => return Ok(Some(format!("{name} is protected: it cannot be deleted"))),
+                (Some(o), Some((_, peeled))) => {
+                    let old_commit = self.peel_to_changeset(&o, true).unwrap_or(o);
+                    if !self.is_ancestor(&old_commit, &peeled)? {
+                        return Ok(Some(format!(
+                            "{name} is protected: only fast-forward updates are allowed"
+                        )));
+                    }
+                }
+                (None, Some(_)) => {}
+            }
+        }
+        if let Some(hook) = &policy.hook {
+            let change = RefChange {
+                repo: self.name.clone(),
+                name: name.to_string(),
+                old,
+                new: new.map(|n| n.0),
+                via: via.to_string(),
+            };
+            if let Err(reason) = hook(&change) {
+                return Ok(Some(format!("policy: {reason}")));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The audit log entry for a move, and (when Wren is the source of
+    /// truth) when it happened, for the exporter's lag.
+    fn record_move(
+        &self,
+        name: &str,
+        old: Option<Oid>,
+        new: Option<Oid>,
+        via: &str,
+        authoritative: bool,
+    ) -> Result<()> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let entry = AuditEntry {
+            time_ms: now_ms,
+            name: name.to_string(),
+            old,
+            new,
+            via: via.to_string(),
+        };
+        self.meta
+            .append_log("audit", &serde_json::to_vec(&entry)?)?;
+        if authoritative {
+            self.meta
+                .set_kv(&format!("changed:{name}"), &now_ms.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// The audit log: every ref move, oldest first, after `after`.
+    pub fn audit(&self, after: i64, limit: usize) -> Result<Vec<(i64, AuditEntry)>> {
+        self.meta
+            .read_log("audit", after, limit)?
+            .into_iter()
+            .map(|(seq, d)| Ok((seq, serde_json::from_slice(&d)?)))
+            .collect()
+    }
+
+    /// When Wren is the source of truth: bring the git host up to date with
+    /// Wren's refs. Each ref is pushed with a lease on the value last
+    /// exported, so a push that bypassed Wren is never overwritten; it is
+    /// reported instead. Reconciling (rather than replaying a queue) makes
+    /// this idempotent and crash-safe: intermediate values are skipped.
+    pub fn export(&self) -> Result<ExportReport> {
+        let mut report = ExportReport::default();
+        let Some(url) = self.upstream.clone() else {
+            return Ok(report);
+        };
+        if !self.authoritative()? {
+            return Ok(report);
+        }
+        let _guard = self.lock_mirror()?;
+        let mirror = GitMirror::open(self.dir().join("mirror.git"), &url, self.store.root())?;
+        let refs = self.meta.refs()?;
+        let mut names: Vec<(String, Option<Oid>)> = refs
+            .iter()
+            .map(|r| (r.name.clone(), Some(r.target)))
+            .collect();
+        // Exported refs that Wren no longer has: deletions.
+        for k in self.meta.exported_names()? {
+            if !refs.iter().any(|r| r.name == k) {
+                names.push((k, None));
+            }
+        }
+        let mut errors = Vec::new();
+        for (name, want) in names {
+            let key = format!("exported:{name}");
+            let have: Option<Oid> = match self.meta.get_kv(&key)? {
+                Some(s) if !s.is_empty() => Some(s.parse()?),
+                _ => None,
+            };
+            if have == want {
+                continue;
+            }
+            match mirror.push_lease(&name, have, want)? {
+                Push::Done => {
+                    self.meta
+                        .set_kv(&key, &want.map(|w| w.to_hex()).unwrap_or_default())?;
+                    report.pushed += 1;
+                    if let Some(t) = self.meta.get_kv(&format!("changed:{name}"))? {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let lag = now.saturating_sub(t.parse().unwrap_or(now));
+                        let mut lags = self.export_lags.lock().unwrap();
+                        lags.push_back(lag);
+                        if lags.len() > 1000 {
+                            lags.pop_front();
+                        }
+                    }
+                }
+                Push::Stale => errors.push(format!(
+                    "{name}: the host no longer has what Wren exported; \
+                     someone pushed to it directly (not overwritten)"
+                )),
+                Push::Rejected(reason) => errors.push(format!("{name}: host refused: {reason}")),
+            }
+        }
+        self.meta.set_kv("export_error", &errors.join("; "))?;
+        report.errors = errors;
+        Ok(report)
+    }
+
+    /// Refs whose current value has not reached the host yet, and the
+    /// 99th percentile of recent export lags (ms).
+    pub fn export_status(&self) -> Result<ExportStatus> {
+        let mut pending = 0;
+        if self.authoritative()? {
+            for r in self.meta.refs()? {
+                if self
+                    .meta
+                    .get_kv(&format!("exported:{}", r.name))?
+                    .as_deref()
+                    != Some(r.target.to_hex().as_str())
+                {
+                    pending += 1;
+                }
+            }
+        }
+        let mut lags: Vec<u64> = self.export_lags.lock().unwrap().iter().copied().collect();
+        lags.sort_unstable();
+        let p99 = (!lags.is_empty()).then(|| lags[(lags.len() * 99).div_ceil(100) - 1]);
+        Ok(ExportStatus {
+            authoritative: self.authoritative()?,
+            pending,
+            lag_ms_p99: p99,
+            samples: lags.len(),
+            error: self.meta.get_kv("export_error")?.filter(|e| !e.is_empty()),
+        })
     }
 
     /// Rebase `stack` onto the tip of branch `onto` and move the branch to
@@ -560,7 +845,7 @@ impl Repo {
                     attempts: attempt,
                 });
             }
-            let outcome = self.update_ref_locked(&name, Some(tip), Some(new))?;
+            let outcome = self.update_ref_locked(&name, Some(tip), Some(new), "land")?;
             drop(guard);
             match outcome {
                 RefUpdate::Updated => {
@@ -577,7 +862,7 @@ impl Repo {
                 RefUpdate::Stale { .. } => {
                     // Someone else landed first. Learn the new tip (from the
                     // host, when it is the source of truth) and replay.
-                    if self.upstream.is_some() {
+                    if self.upstream.is_some() && !self.authoritative()? {
                         self.sync()?;
                     }
                 }

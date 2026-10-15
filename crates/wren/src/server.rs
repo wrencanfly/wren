@@ -19,6 +19,7 @@ use wren_core::changes::normalize_path;
 use wren_core::wire::{self, ObjectsRequest};
 use wren_core::{ObjectStore, Oid, Repo};
 
+mod git;
 mod writes;
 
 pub struct ServerState {
@@ -191,6 +192,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/repos/{repo}/grep", get(grep))
         .route("/api/v1/repos/{repo}/sync", post(sync))
         .route("/api/v1/repos/{repo}/snapshot", get(snapshot_latest))
+        .route("/api/v1/repos/{repo}/audit", get(audit))
         .route("/v1/snapshots/{file}", get(snapshot_file))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -205,6 +207,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         ));
     reads
         .merge(writes::routes(state.clone()))
+        .merge(git::routes())
         .route("/healthz", get(|| async { "ok" }))
         .layer(axum::middleware::map_response(protocol_header))
         .with_state(state)
@@ -398,6 +401,7 @@ pub const FEATURES: &[&str] = &[
     "on-demand-sync",
     "error-codes",
     "object-deltas.v1",
+    "snapshots.v1",
 ];
 
 /// Advertised only by a server started with a write token.
@@ -509,6 +513,7 @@ async fn list_repos(State(st): St) -> ApiResult<Json<Vec<RepoInfo>>> {
                 changesets: r.meta.changeset_count()?,
                 last_sync: r.sync_status()?.0,
                 last_sync_error: r.sync_status()?.1,
+                export: r.export_status()?,
             });
         }
         Ok(Json(out))
@@ -820,6 +825,63 @@ async fn sync(
 ) -> ApiResult<Json<wren_core::repo::SyncReport>> {
     let r = repo(&st, &name)?;
     blocking(move || Ok(Json(r.sync()?))).await
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    after: i64,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct AuditItem {
+    seq: i64,
+    #[serde(flatten)]
+    entry: wren_core::write::AuditEntry,
+}
+
+/// Every ref move (write API, land, push), oldest first.
+async fn audit(
+    State(st): St,
+    Path(name): Path<String>,
+    Query(q): Query<AuditQuery>,
+) -> ApiResult<Json<Vec<AuditItem>>> {
+    let r = repo(&st, &name)?;
+    let limit = q.limit.unwrap_or(1000).min(10_000);
+    blocking(move || {
+        Ok(Json(
+            r.audit(q.after, limit)?
+                .into_iter()
+                .map(|(seq, entry)| AuditItem { seq, entry })
+                .collect(),
+        ))
+    })
+    .await
+}
+
+/// While Wren is the source of truth, keep each repository's git host up
+/// to date (see `Repo::export`).
+pub fn spawn_exporters(state: Arc<ServerState>, every: Duration) {
+    for repo in state.repos.values().cloned() {
+        if repo.upstream.is_none() {
+            continue;
+        }
+        tokio::spawn(async move {
+            loop {
+                let r = repo.clone();
+                match tokio::task::spawn_blocking(move || r.export()).await {
+                    Ok(Ok(rep)) if !rep.errors.is_empty() => {
+                        tracing::error!(repo = %repo.name, errors = ?rep.errors, "export to the git host")
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!(repo = %repo.name, "export failed: {e:#}"),
+                    Err(e) => tracing::warn!(repo = %repo.name, "export panicked: {e}"),
+                }
+                tokio::time::sleep(every).await;
+            }
+        });
+    }
 }
 
 // ---- snapshots ------------------------------------------------------------------

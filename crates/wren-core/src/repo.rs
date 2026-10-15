@@ -29,6 +29,10 @@ pub struct Repo {
     /// Held by sync (fetch, absorb packs, ingest) and by pushes to the
     /// upstream: a push reads the mirror's packs, which absorb deletes.
     pub(crate) sync_lock: Mutex<()>,
+    /// Rules for ref updates (see `write::Policy`).
+    pub policy: std::sync::RwLock<crate::write::Policy>,
+    /// Recent export lags in milliseconds (see `export`).
+    pub(crate) export_lags: Mutex<std::collections::VecDeque<u64>>,
 }
 
 /// Exclusive use of the git mirror: within this process, and (on Postgres)
@@ -85,6 +89,8 @@ impl Repo {
             dir,
             memo: Mutex::new(Memo::default()),
             sync_lock: Mutex::new(()),
+            policy: Default::default(),
+            export_lags: Default::default(),
         })
     }
 
@@ -144,6 +150,82 @@ impl Repo {
         self.sync().map(Some)
     }
 
+    /// Whether Wren is the source of truth for this repository's refs (the
+    /// git host is then a downstream mirror, see `export`), rather than
+    /// the git host (write-proxy mode).
+    pub fn authoritative(&self) -> Result<bool> {
+        Ok(self.meta.get_kv("authority")?.as_deref() == Some("wren"))
+    }
+
+    /// Make Wren (or the git host) the source of truth. Flipping to Wren
+    /// records that the host has what Wren has now, so the exporter starts
+    /// from there. Flipping back is only safe once the export has caught
+    /// up.
+    pub fn set_authoritative(&self, wren: bool) -> Result<()> {
+        if wren == self.authoritative()? {
+            return Ok(());
+        }
+        if wren {
+            // Start from what the host has now.
+            if self.upstream.is_some() {
+                self.sync()?;
+            }
+            let _guard = self.lock_mirror()?;
+            for r in self.meta.refs()? {
+                if self.meta.get_kv(&format!("exported:{}", r.name))?.is_none() {
+                    self.meta
+                        .set_kv(&format!("exported:{}", r.name), &r.target.to_hex())?;
+                }
+            }
+            self.meta.set_kv("authority", "wren")?;
+        } else {
+            self.meta.set_kv("authority", "host")?;
+        }
+        Ok(())
+    }
+
+    /// Ingest the commits a push brought (they are in the store already):
+    /// everything reachable from `tip` that is not a changeset yet, parents
+    /// first. A tag is peeled. Returns the commit `tip` names.
+    pub fn ingest_pushed(&self, tip: &Oid) -> Result<Oid> {
+        let mut commit = *tip;
+        loop {
+            let (kind, data) = self
+                .store
+                .get(&commit)?
+                .with_context(|| format!("{commit} is missing"))?;
+            match kind {
+                Kind::Commit => break,
+                Kind::Tag => commit = Tag::parse(&data)?.object,
+                k => bail!("{tip} is a {}, not a commit or tag", k.as_str()),
+            }
+        }
+        // Depth-first, emitting a commit after its parents.
+        let mut order = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![(commit, false)];
+        while let Some((c, expanded)) = stack.pop() {
+            if expanded {
+                order.push(c);
+                continue;
+            }
+            if !seen.insert(c) || self.meta.has_changeset(&c)? {
+                continue;
+            }
+            stack.push((c, true));
+            for p in self.store.read_commit(&c)?.parents {
+                stack.push((p, false));
+            }
+        }
+        let mut report = SyncReport::default();
+        for c in &order {
+            if !self.meta.has_changeset(c)? {
+                self.ingest_commit(&mut None, c, &mut report)?;
+            }
+        }
+        Ok(commit)
+    }
+
     /// (unix time of last successful sync, error of the latest attempt)
     pub fn sync_status(&self) -> Result<(Option<i64>, Option<String>)> {
         let t = self.meta.get_kv("last_sync")?.and_then(|v| v.parse().ok());
@@ -155,6 +237,11 @@ impl Repo {
     }
 
     fn sync_inner(&self) -> Result<SyncReport> {
+        // Once Wren is the source of truth, the host is a downstream mirror:
+        // nothing is fetched from it (see `export`).
+        if self.authoritative()? {
+            return Ok(SyncReport::default());
+        }
         let _guard = self.lock_mirror()?;
         let start = Instant::now();
         let url = self.upstream.as_deref().context("repo has no upstream")?;
@@ -204,7 +291,7 @@ impl Repo {
             let mut oid = r.oid;
             let mut kind = r.kind;
             while kind == Kind::Tag {
-                let data = self.import_object(&mut cat, &oid, &mut report)?;
+                let data = self.import_object(&mut Some(&mut cat), &oid, &mut report)?;
                 let tag = Tag::parse(&data)?;
                 oid = tag.object;
                 kind = tag.kind;
@@ -221,7 +308,7 @@ impl Repo {
             if self.meta.has_changeset(oid)? {
                 continue;
             }
-            self.ingest_commit(&mut cat, oid, &mut report)?;
+            self.ingest_commit(&mut Some(&mut cat), oid, &mut report)?;
         }
 
         // Publish refs only after everything they point to is ingested, and
@@ -258,14 +345,17 @@ impl Repo {
 
     fn import_object(
         &self,
-        cat: &mut CatFile,
+        cat: &mut Option<&mut CatFile>,
         oid: &Oid,
         report: &mut SyncReport,
     ) -> Result<Vec<u8>> {
         if let Some((_, data)) = self.store.get(oid)? {
             return Ok(data);
         }
-        let (kind, data) = cat.get(oid)?;
+        let (kind, data) = cat
+            .as_deref_mut()
+            .with_context(|| format!("object {oid} is missing"))?
+            .get(oid)?;
         self.store
             .put_raw(oid, &crate::object::encode_loose(kind, &data))?;
         report.objects_imported += 1;
@@ -275,11 +365,19 @@ impl Repo {
     /// Import a tree and everything below it. Children are stored before their
     /// parent, so "tree present" implies "whole subtree present" and already
     /// known subtrees are skipped: cost scales with the change, not the repo.
-    fn import_tree(&self, cat: &mut CatFile, oid: &Oid, report: &mut SyncReport) -> Result<()> {
+    fn import_tree(
+        &self,
+        cat: &mut Option<&mut CatFile>,
+        oid: &Oid,
+        report: &mut SyncReport,
+    ) -> Result<()> {
         if self.store.has(oid) {
             return Ok(());
         }
-        let (kind, data) = cat.get(oid)?;
+        let (kind, data) = cat
+            .as_deref_mut()
+            .with_context(|| format!("tree {oid} is missing"))?
+            .get(oid)?;
         if kind != Kind::Tree {
             bail!("{oid} is not a tree");
         }
@@ -301,7 +399,12 @@ impl Repo {
     /// derived from it. Both are checked here against git's own: what
     /// derivation cannot reproduce is stored as an override, so ids never
     /// change (see `treegen`).
-    fn ingest_commit(&self, cat: &mut CatFile, oid: &Oid, report: &mut SyncReport) -> Result<()> {
+    fn ingest_commit(
+        &self,
+        cat: &mut Option<&mut CatFile>,
+        oid: &Oid,
+        report: &mut SyncReport,
+    ) -> Result<()> {
         let data = self.import_object(cat, oid, report)?;
         let commit = Commit::parse(&data)?;
         // The git mirror still reads its history from the object store, so

@@ -127,7 +127,10 @@ pub(crate) trait Backend: Send + Sync {
     fn write_batch(&self, ops: &[WriteOp]) -> Result<()>;
     fn get_kv(&self, key: &str) -> Result<Option<String>>;
     fn set_kv(&self, key: &str, value: &str) -> Result<()>;
+    fn kv_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>>;
     fn lock(&self, name: &str) -> Result<MetaLock>;
+    fn append_log(&self, stream: &str, data: &[u8]) -> Result<i64>;
+    fn read_log(&self, stream: &str, after: i64, limit: usize) -> Result<Vec<(i64, Vec<u8>)>>;
 }
 
 pub struct MetaDb {
@@ -231,9 +234,29 @@ impl MetaDb {
     pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {
         self.backend.set_kv(key, value)
     }
+    /// Refs the exporter has pushed to the git host (`exported:<ref>` keys
+    /// with a value).
+    pub fn exported_names(&self) -> Result<Vec<String>> {
+        self.backend.kv_with_prefix("exported:").map(|v| {
+            v.into_iter()
+                .filter(|(_, val)| !val.is_empty())
+                .map(|(k, _)| k["exported:".len()..].to_string())
+                .collect()
+        })
+    }
     /// Exclusive lock `name` across every server sharing this metadata (a
     /// no-op for SQLite, which has one server). Held until the guard drops.
     pub fn lock(&self, name: &str) -> Result<MetaLock> {
         self.backend.lock(name)
+    }
+    /// Append an entry to the append-only log `stream` (e.g. the audit
+    /// log); returns its sequence number.
+    pub fn append_log(&self, stream: &str, data: &[u8]) -> Result<i64> {
+        self.backend.append_log(stream, data)
+    }
+    /// Entries of `stream` with sequence numbers above `after`, oldest
+    /// first.
+    pub fn read_log(&self, stream: &str, after: i64, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
+        self.backend.read_log(stream, after, limit)
     }
 }

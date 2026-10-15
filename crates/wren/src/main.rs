@@ -100,6 +100,28 @@ enum Cmd {
         /// all). Every tree is always included.
         #[arg(long = "snapshot-cone", value_name = "DIR")]
         snapshot_cone: Vec<String>,
+        /// Who holds the truth for the repositories' refs: `host` (the git
+        /// host; Wren pushes to it first and follows, the default) or `wren`
+        /// (Wren moves its refs first, and the host becomes a downstream
+        /// mirror that Wren keeps up to date). Recorded in the metadata,
+        /// so every server agrees; omit it to keep the current setting.
+        #[arg(long, value_parser = ["host", "wren"])]
+        source_of_truth: Option<String>,
+        /// Protect refs matching this pattern (`*` matches anything, e.g.
+        /// `refs/heads/main`, `refs/heads/release/*`): no deletion, and
+        /// fast-forward updates only. Repeatable.
+        #[arg(long = "protect", value_name = "PATTERN")]
+        protect: Vec<String>,
+        /// Ask this URL before any ref moves: Wren POSTs the change as JSON
+        /// ({repo, ref, old, new, via}); any 2xx allows it, anything else
+        /// (or no answer within 10 s) refuses it with the response body as
+        /// the reason.
+        #[arg(long, value_name = "URL")]
+        policy_hook: Option<String>,
+        /// How often (milliseconds) to push Wren's refs to the git host
+        /// while Wren is the source of truth.
+        #[arg(long, default_value_t = 200)]
+        export_every_ms: u64,
     },
     /// Run a caching tier in front of a server or another cache.
     Cache {
@@ -566,6 +588,40 @@ fn date(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// The policy hook: a blocking call (ref updates run on blocking threads)
+/// that POSTs the change and allows it on any 2xx. Fails closed.
+#[allow(clippy::type_complexity)]
+fn policy_hook_fn(
+    url: String,
+) -> Result<Arc<dyn Fn(&wren_core::write::RefChange) -> Result<(), String> + Send + Sync>> {
+    let handle = tokio::runtime::Handle::current();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    Ok(Arc::new(move |change: &wren_core::write::RefChange| {
+        let (client, url, change) = (client.clone(), url.clone(), change.clone());
+        handle.block_on(async move {
+            let resp = client
+                .post(&url)
+                .json(&change)
+                .send()
+                .await
+                .map_err(|e| format!("the policy hook is unreachable: {e}"))?;
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(if body.trim().is_empty() {
+                    format!("refused ({status})")
+                } else {
+                    body.trim().to_string()
+                })
+            }
+        })
+    }))
+}
+
 /// `123`, `64KiB`, `256MiB`, `50GiB`, `1TiB` (also KB/MB/GB/TB as powers of
 /// 1000).
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -606,6 +662,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             segments,
             snapshot_every,
             snapshot_cone,
+            source_of_truth,
+            protect,
+            policy_hook,
+            export_every_ms,
         } => {
             let meta = match meta {
                 Some(url) => wren_core::meta::MetaConfig::Postgres(url),
@@ -668,6 +728,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if token.is_none() && !listen.ip().is_loopback() {
                 tracing::warn!("listening on {listen} without --token: every mirrored repository is readable by anyone who can reach this port");
             }
+            if let Some(sot) = &source_of_truth {
+                for r in map.values() {
+                    r.set_authoritative(sot == "wren")?;
+                }
+            }
+            let hook = match policy_hook {
+                Some(url) => Some(policy_hook_fn(url)?),
+                None => None,
+            };
+            for r in map.values() {
+                *r.policy.write().unwrap() = wren_core::write::Policy {
+                    protected: protect.clone(),
+                    hook: hook.clone(),
+                };
+            }
             let mut state = server::ServerState::new(store, map, token, write_token);
             state.snapshots = server::SnapshotConfig {
                 dir: Some(data.join("snapshots")),
@@ -677,6 +752,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let state = Arc::new(state);
             server::spawn_pollers(state.clone(), (poll > 0).then(|| Duration::from_secs(poll)));
             server::spawn_snapshotters(state.clone());
+            server::spawn_exporters(state.clone(), Duration::from_millis(export_every_ms));
             let listener = tokio::net::TcpListener::bind(listen).await?;
             tracing::info!(
                 "wren server listening on http://{listen} ({} repos)",

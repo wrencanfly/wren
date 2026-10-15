@@ -54,6 +54,9 @@ pub struct Pack {
     data: Data,
     idx: Mmap,
     count: usize,
+    /// (offset, position in the index), sorted by offset; built on first
+    /// use (to find where an entry ends and which object is at an offset).
+    by_offset: std::sync::OnceLock<Vec<(u64, u32)>>,
 }
 
 enum Data {
@@ -125,6 +128,7 @@ impl Pack {
             data: Data::Local(pack),
             idx,
             count,
+            by_offset: Default::default(),
         })
     }
 
@@ -173,6 +177,7 @@ impl Pack {
             data: Data::Local(map(&idx_path)?), // replaced below
             idx,
             count,
+            by_offset: Default::default(),
         };
         let mut ends: Vec<u64> = (0..count).map(|i| pack.offset_at(i)).collect();
         ends.push(seg.size.saturating_sub(20));
@@ -242,6 +247,56 @@ impl Pack {
             let large = off_table + n * 4 + (v & 0x7fff_ffff) as usize * 8;
             u64::from_be_bytes(self.idx[large..large + 8].try_into().unwrap())
         }
+    }
+
+    fn len(&self) -> u64 {
+        match &self.data {
+            Data::Local(m) => m.len() as u64,
+            Data::Remote(r) => r.len,
+        }
+    }
+
+    fn by_offset(&self) -> &[(u64, u32)] {
+        self.by_offset.get_or_init(|| {
+            let mut v: Vec<(u64, u32)> = (0..self.count)
+                .map(|i| (self.offset_at(i), i as u32))
+                .collect();
+            v.sort_unstable();
+            v
+        })
+    }
+
+    /// The object whose entry starts at `offset`.
+    fn oid_at_offset(&self, offset: u64) -> Option<Oid> {
+        let v = self.by_offset();
+        let i = v.binary_search_by_key(&offset, |e| e.0).ok()?;
+        Oid::from_bytes(self.oid_at(v[i].1 as usize)).ok()
+    }
+
+    /// Where the entry starting at `offset` ends.
+    fn entry_end(&self, offset: u64) -> u64 {
+        let v = self.by_offset();
+        let i = v.partition_point(|e| e.0 <= offset);
+        v.get(i).map_or(self.len().saturating_sub(20), |e| e.0)
+    }
+
+    /// If the entry at `offset` is stored as a delta: its base's id, the
+    /// delta's inflated size, and the compressed delta exactly as stored.
+    fn stored_delta(&self, offset: u64) -> Result<Option<(Oid, u64, Vec<u8>)>> {
+        let (e, bytes) = self.entry(offset)?;
+        let base = match e.base {
+            Base::None => return Ok(None),
+            Base::Ref(b) => b,
+            Base::Offset(o) => match self.oid_at_offset(o) {
+                Some(b) => b,
+                None => return Ok(None),
+            },
+        };
+        let end = (self.entry_end(offset) - offset) as usize;
+        let z = bytes
+            .get(e.data..end.min(bytes.len()))
+            .context("delta entry out of range")?;
+        Ok(Some((base, e.size as u64, z.to_vec())))
     }
 
     /// Every object id in the pack.
@@ -540,6 +595,81 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// A git pack written to memory, entry by entry: whole objects, or deltas
+/// against a base given by id (`REF_DELTA`), copied as stored.
+pub struct PackWriter {
+    out: Vec<u8>,
+    sum: Sha1,
+    count: u32,
+    written: u32,
+}
+
+fn entry_header(t: u8, size: u64) -> Vec<u8> {
+    let mut e = Vec::new();
+    let mut size = size;
+    let mut c = (t << 4) | (size & 15) as u8;
+    size >>= 4;
+    while size > 0 {
+        e.push(c | 0x80);
+        c = (size & 0x7f) as u8;
+        size >>= 7;
+    }
+    e.push(c);
+    e
+}
+
+impl PackWriter {
+    pub fn new(count: u32) -> PackWriter {
+        let mut w = PackWriter {
+            out: Vec::new(),
+            sum: Sha1::new(),
+            count,
+            written: 0,
+        };
+        let mut header = b"PACK\0\0\0\x02".to_vec();
+        header.extend_from_slice(&count.to_be_bytes());
+        w.emit(&header);
+        w
+    }
+
+    fn emit(&mut self, b: &[u8]) {
+        self.sum.update(b);
+        self.out.extend_from_slice(b);
+    }
+
+    pub fn whole(&mut self, kind: Kind, data: &[u8]) -> Result<()> {
+        let mut z = flate2::write::ZlibEncoder::new(
+            entry_header(type_of(kind), data.len() as u64),
+            flate2::Compression::default(),
+        );
+        z.write_all(data)?;
+        let e = z.finish()?;
+        self.emit(&e);
+        self.written += 1;
+        Ok(())
+    }
+
+    pub fn ref_delta(&mut self, base: &Oid, size: u64, compressed: &[u8]) {
+        let mut e = entry_header(OBJ_REF_DELTA, size);
+        e.extend_from_slice(base.as_bytes());
+        self.emit(&e);
+        self.emit(compressed);
+        self.written += 1;
+    }
+
+    pub fn finish(mut self) -> Result<Vec<u8>> {
+        ensure!(
+            self.written == self.count,
+            "pack announced {} objects but has {}",
+            self.count,
+            self.written
+        );
+        let sum: [u8; 20] = self.sum.finalize().into();
+        self.out.extend_from_slice(&sum);
+        Ok(self.out)
+    }
+}
+
 /// Write `objects` into `dir` as a new segment: an undeltified git pack and
 /// its v2 index (written last). Returns the `.pack` path. Duplicate ids are
 /// written once.
@@ -797,6 +927,17 @@ impl Packs {
     /// Whether a segment already known has `oid` (no listing).
     pub fn has_known(&self, oid: &Oid) -> bool {
         self.locate_known(oid).is_some()
+    }
+
+    /// If `oid` is stored as a delta: (base id, inflated delta size, the
+    /// compressed delta as stored). Lets a pack sent to git reuse the deltas
+    /// git computed instead of sending whole objects.
+    pub fn stored_delta(&self, oid: &Oid) -> Result<Option<(Oid, u64, Vec<u8>)>> {
+        // Known segments only: a miss is answered with the whole object.
+        match self.locate_known(oid) {
+            Some((pack, offset)) => pack.stored_delta(offset),
+            None => Ok(None),
+        }
     }
 
     /// The object, with its delta chain resolved.
