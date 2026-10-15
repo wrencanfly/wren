@@ -194,6 +194,32 @@ impl GitMirror {
         Ok(None)
     }
 
+    /// Point the mirror's refs at `refs` (name, target), so the next fetch
+    /// tells the host what is already here. Used when servers do not share
+    /// the mirror: another server may have synced or landed since.
+    pub fn set_refs(&self, refs: &[(String, Oid)]) -> Result<()> {
+        let mut child = git(&self.path)
+            .args(["update-ref", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        {
+            let mut stdin = BufWriter::new(child.stdin.take().unwrap());
+            for (name, oid) in refs {
+                writeln!(stdin, "update {name} {oid}")?;
+            }
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!(
+                "git update-ref failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
+    }
+
     pub fn list_refs(&self) -> Result<Vec<UpstreamRef>> {
         let out = run({
             let mut c = git(&self.path);

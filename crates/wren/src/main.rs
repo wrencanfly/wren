@@ -89,6 +89,13 @@ enum Cmd {
         /// repositories, and any of them can answer any request.
         #[arg(long, env = "WREN_META_URL", hide_env_values = true)]
         meta: Option<String>,
+        /// Keep segments in a bucket shared by all servers, e.g.
+        /// `s3://bucket/wren`, `gs://bucket/wren` or `file:///srv/segments`
+        /// (credentials from the usual AWS_* / GOOGLE_* / AZURE_* variables).
+        /// With --meta, servers then need no shared filesystem: each keeps
+        /// its own --data directory as a cache.
+        #[arg(long, env = "WREN_SEGMENTS_URL")]
+        segments: Option<String>,
     },
     /// Run a caching tier in front of a server or another cache.
     Cache {
@@ -516,6 +523,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             token,
             write_token,
             meta,
+            segments,
         } => {
             let meta = match meta {
                 Some(url) => wren_core::meta::MetaConfig::Postgres(url),
@@ -525,7 +533,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 anyhow::bail!("--write-token must differ from --token");
             }
             let (objects, repos_dir) = data_layout(&data);
-            let store = Arc::new(ObjectStore::open(objects)?);
+            let remote = match &segments {
+                Some(url) => Some(Arc::new(wren_core::segments::Remote::open(url)?)),
+                None => None,
+            };
+            let store = Arc::new(ObjectStore::open_with(objects, remote)?);
             let mut map: BTreeMap<String, Arc<Repo>> = BTreeMap::new();
             for spec in &repos {
                 let (name, url) = spec.split_once('=').context("--repo expects NAME=URL")?;

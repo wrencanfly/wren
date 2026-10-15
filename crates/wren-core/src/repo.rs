@@ -96,6 +96,9 @@ impl Repo {
     pub(crate) fn lock_mirror(&self) -> Result<MirrorLock<'_>> {
         let local = self.sync_lock.lock().unwrap();
         let shared = self.meta.lock("mirror")?;
+        // git reads the store through alternates, so it must be complete
+        // on local disk: fetch what other servers added to the bucket.
+        self.store.hydrate()?;
         Ok(MirrorLock {
             _local: local,
             _shared: shared,
@@ -121,6 +124,26 @@ impl Repo {
         r
     }
 
+    /// Sync, unless the store's segments are shared through a bucket and
+    /// some server (any of them) synced less than `max_age` ago. Servers
+    /// sharing a repository then take turns instead of all fetching, and
+    /// one that skips needs no complete local copy (a sync downloads every
+    /// segment first; see `lock_mirror`). Returns `None` when skipped.
+    pub fn sync_unless_fresh(&self, max_age: std::time::Duration) -> Result<Option<SyncReport>> {
+        if self.store.remote().is_some() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if let (Some(t), None) = self.sync_status()? {
+                if now - t < max_age.as_secs() as i64 {
+                    return Ok(None);
+                }
+            }
+        }
+        self.sync().map(Some)
+    }
+
     /// (unix time of last successful sync, error of the latest attempt)
     pub fn sync_status(&self) -> Result<(Option<i64>, Option<String>)> {
         let t = self.meta.get_kv("last_sync")?.and_then(|v| v.parse().ok());
@@ -136,6 +159,16 @@ impl Repo {
         let start = Instant::now();
         let url = self.upstream.as_deref().context("repo has no upstream")?;
         let mirror = GitMirror::open(self.dir.join("mirror.git"), url, self.store.root())?;
+        if self.store.remote().is_some() {
+            // This server's mirror may be behind the shared metadata.
+            let refs: Vec<(String, Oid)> = self
+                .meta
+                .refs()?
+                .into_iter()
+                .map(|r| (r.name, r.target))
+                .collect();
+            mirror.set_refs(&refs)?;
+        }
         // The host can move a ref between the ref advertisement and the
         // fetch (another writer landing), which makes the fetch fail with
         // "not our ref". Such failures are transient: retry.
@@ -191,7 +224,10 @@ impl Repo {
             self.ingest_commit(&mut cat, oid, &mut report)?;
         }
 
-        // Publish refs only after everything they point to is ingested.
+        // Publish refs only after everything they point to is ingested, and
+        // readable by every server (fetched packs are uploaded as they are
+        // absorbed; this seals anything written loose).
+        self.store.publish()?;
         let current: HashMap<String, RefRow> = self
             .meta
             .refs()?

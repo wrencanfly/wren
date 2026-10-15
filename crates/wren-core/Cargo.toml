@@ -9,9 +9,11 @@ name = "wren_core"
 [dependencies]
 anyhow = "1.0.104"
 flate2 = "1.1.10"
+futures = "0.3.34"
 hex = "0.4.3"
 imara-diff = { version = "0.2.0", default-features = false }
 memmap2 = "0.9.5"
+object_store = { version = "0.14.2", features = ["aws", "gcp", "azure"] }
 postgres = "0.19.10"
 rayon = "1.12.0"
 regex = "1.11"
@@ -21,4 +23,6 @@ serde_json = "1.0.154"
 sha1 = "0.11.0"
 similar = "3.2.0"
 tempfile = "3.27.0"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "fs", "io-util"] }
+url = "2.5.4"
 zstd = "0.13.3"

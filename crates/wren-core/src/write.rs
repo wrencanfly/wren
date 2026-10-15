@@ -256,6 +256,9 @@ impl Repo {
         // The commit object is derived data, but stored: pushing to the git
         // host and serving checkouts read it from the object store.
         let oid = self.store.put(Kind::Commit, &raw)?;
+        // Every server must be able to read the new objects before the
+        // changeset is visible to any of them.
+        self.store.publish()?;
         if self.meta.has_changeset(&oid)? {
             return Ok(oid);
         }

@@ -1,4 +1,5 @@
-//! Three stateless servers on one Postgres and one data directory.
+//! Three stateless servers on one Postgres, sharing objects either through
+//! one data directory or (no shared filesystem) through a bucket.
 //!
 //! They start together (their initial syncs serialize on an advisory lock),
 //! two of them land commits concurrently, and the third answers queries and
@@ -72,7 +73,16 @@ fn wait_for(mut f: impl FnMut() -> bool, what: &str) {
 }
 
 #[test]
-fn three_servers_share_one_repository() {
+fn three_servers_share_one_data_directory() {
+    three_servers(false);
+}
+
+#[test]
+fn three_servers_share_a_bucket() {
+    three_servers(true);
+}
+
+fn three_servers(bucket: bool) {
     let Some(pg) = TestPg::start() else { return };
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -97,7 +107,7 @@ fn three_servers_share_one_repository() {
         ],
     );
 
-    let data = root.join("data");
+    let segments = format!("file://{}", root.join("bucket").display());
     let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
     let urls: Vec<String> = ports
         .iter()
@@ -105,11 +115,19 @@ fn three_servers_share_one_repository() {
         .collect();
     let _servers: Vec<Proc> = ports
         .iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(i, p)| {
+            let data = match bucket {
+                true => root.join(format!("data{i}")),
+                false => root.join("data"),
+            };
+            let mut c = Command::new(WREN);
+            c.args(["server", "--data", data.to_str().unwrap()]);
+            if bucket {
+                c.args(["--segments", &segments]);
+            }
             Proc(
-                Command::new(WREN)
-                    .args(["server", "--data", data.to_str().unwrap()])
-                    .args(["--listen", &format!("127.0.0.1:{p}"), "--poll", "0"])
+                c.args(["--listen", &format!("127.0.0.1:{p}"), "--poll", "0"])
                     .args(["--meta", pg.url(), "--write-token", "w"])
                     .arg("--repo")
                     .arg(format!("demo={}", host.display()))
@@ -197,6 +215,17 @@ fn three_servers_share_one_repository() {
         std::fs::read_to_string(ws.join("agents/2")).unwrap(),
         "from server 3\n"
     );
+
+    if bucket {
+        // The ingest's pack plus one sealed segment per landed commit, at
+        // least; the servers' data directories share nothing.
+        let segments = std::fs::read_dir(root.join("bucket"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "idx"))
+            .count();
+        assert!(segments >= 3, "{segments} segments in the bucket");
+    }
 
     // The host has a linear history with both.
     let parents = git(&host, &["log", "--format=%P", "main"]);

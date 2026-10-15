@@ -10,77 +10,200 @@
 //! Objects are found through the `.idx` (fan-out table + binary search) and
 //! rebuilt by inflating the entry and applying its delta chain. Resolved
 //! delta bases are kept in a small cache shared by all readers.
+//!
+//! With a bucket (see `segments`), segments other servers uploaded are read
+//! in place: the `.idx` is downloaded whole, the `.pack` in blocks, on
+//! demand, into a sparse local file. `hydrate` completes them into local
+//! files when git needs to read them. `write_pack` turns objects this server
+//! created into a segment of its own.
 
-use std::collections::{HashMap, VecDeque};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
 use flate2::{Decompress, FlushDecompress, Status};
 use memmap2::Mmap;
+use sha1::{Digest, Sha1};
 
 use crate::object::Kind;
 use crate::oid::Oid;
+use crate::segments::{Remote, RemoteSegment};
 
 const OBJ_OFS_DELTA: u8 = 6;
 const OBJ_REF_DELTA: u8 = 7;
 /// Delta chains in git packs are at most 50 deep by default; refuse cycles
 /// and absurd chains in damaged packs.
 const MAX_CHAIN: usize = 10_000;
+/// Remote segments are read and cached locally in blocks of this size.
+const BLOCK: u64 = 1 << 20;
+/// At most this many blocks per ranged request.
+const MAX_RUN: u64 = 16;
 
 pub struct Pack {
     /// Unique per opened pack, for cache keys. (A pack's position in the
     /// list changes as segments are added, so it cannot be the key.)
     id: usize,
+    /// `pack-<hash>`
+    name: String,
     path: PathBuf,
-    pack: Mmap,
+    data: Data,
     idx: Mmap,
     count: usize,
+}
+
+enum Data {
+    /// A complete local file.
+    Local(Mmap),
+    /// A segment in a bucket, read in blocks that are kept in a sparse
+    /// local file.
+    Remote(RemoteData),
+}
+
+struct RemoteData {
+    remote: Arc<Remote>,
+    file: File,
+    len: u64,
+    /// One bit per block: present in `file`.
+    have: Mutex<Vec<u64>>,
+    have_path: PathBuf,
+    /// Offsets of every entry, sorted, then the trailer's: an entry ends
+    /// where the next one starts, so it can be fetched exactly.
+    ends: Vec<u64>,
+}
+
+static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn check_idx(idx: &[u8], what: &Path) -> Result<usize> {
+    ensure!(
+        idx.len() >= 8 + 1024 && idx[..8] == [0xff, b't', b'O', b'c', 0, 0, 0, 2],
+        "{} is not a version 2 pack index",
+        what.display()
+    );
+    let count = be32(idx, 8 + 255 * 4) as usize;
+    ensure!(
+        idx.len() >= 8 + 1024 + count * (20 + 4 + 4) + 40,
+        "{} is truncated",
+        what.display()
+    );
+    Ok(count)
+}
+
+fn map(path: &Path) -> Result<Mmap> {
+    let f = File::open(path).with_context(|| format!("{}", path.display()))?;
+    // SAFETY: segments are immutable once their .idx exists; nothing
+    // writes to a mapped file.
+    Ok(unsafe { Mmap::map(&f)? })
+}
+
+fn stem(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 impl Pack {
     /// Open `pack-*.pack` and its `.idx`.
     pub fn open(pack_path: &Path) -> Result<Pack> {
+        let pack = map(pack_path)?;
         let idx_path = pack_path.with_extension("idx");
-        // SAFETY: segments are immutable once their .idx exists; nothing
-        // writes to a mapped file.
-        let pack = unsafe { Mmap::map(&File::open(pack_path)?)? };
-        let idx = unsafe {
-            Mmap::map(&File::open(&idx_path).with_context(|| format!("{}", idx_path.display()))?)?
-        };
+        let idx = map(&idx_path)?;
         ensure!(
             pack.len() >= 32 && &pack[..4] == b"PACK",
             "{} is not a pack",
             pack_path.display()
         );
-        ensure!(
-            idx.len() >= 8 + 1024 && idx[..8] == [0xff, b't', b'O', b'c', 0, 0, 0, 2],
-            "{} is not a version 2 pack index",
-            idx_path.display()
-        );
-        let count = be32(&idx, 8 + 255 * 4) as usize;
-        ensure!(
-            idx.len() >= 8 + 1024 + count * (20 + 4 + 4) + 40,
-            "{} is truncated",
-            idx_path.display()
-        );
-        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let count = check_idx(&idx, &idx_path)?;
         Ok(Pack {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: stem(pack_path),
             path: pack_path.to_path_buf(),
-            pack,
+            data: Data::Local(pack),
             idx,
             count,
         })
+    }
+
+    /// Open a segment in `remote`, caching it under `cache`: the `.idx` is
+    /// downloaded whole (and checked), the `.pack` block by block on demand.
+    fn open_remote(remote: &Arc<Remote>, cache: &Path, seg: &RemoteSegment) -> Result<Pack> {
+        std::fs::create_dir_all(cache)?;
+        let idx_path = cache.join(format!("{}.idx", seg.name));
+        if !idx_path.exists() {
+            let bytes = remote.get(&format!("{}.idx", seg.name))?;
+            let n = bytes.len();
+            ensure!(
+                n >= 40 && Sha1::digest(&bytes[..n - 20])[..] == bytes[n - 20..],
+                "{}.idx in {} is corrupt",
+                seg.name,
+                remote.url()
+            );
+            write_atomic(&idx_path, &bytes)?;
+        }
+        let idx = map(&idx_path)?;
+        let count = check_idx(&idx, &idx_path)?;
+        let path = cache.join(format!("{}.pack", seg.name));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        if file.metadata()?.len() != seg.size {
+            file.set_len(seg.size)?; // sparse
+        }
+        let have_path = cache.join(format!("{}.have", seg.name));
+        let blocks = seg.size.div_ceil(BLOCK) as usize;
+        let mut have = vec![0u64; blocks.div_ceil(64)];
+        if let Ok(b) = std::fs::read(&have_path) {
+            if b.len() == have.len() * 8 {
+                for (w, c) in have.iter_mut().zip(b.chunks(8)) {
+                    *w = u64::from_le_bytes(c.try_into().unwrap());
+                }
+            }
+        }
+        let mut pack = Pack {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: seg.name.clone(),
+            path,
+            data: Data::Local(map(&idx_path)?), // replaced below
+            idx,
+            count,
+        };
+        let mut ends: Vec<u64> = (0..count).map(|i| pack.offset_at(i)).collect();
+        ends.push(seg.size.saturating_sub(20));
+        ends.sort_unstable();
+        pack.data = Data::Remote(RemoteData {
+            remote: remote.clone(),
+            file,
+            len: seg.size,
+            have: Mutex::new(have),
+            have_path,
+            ends,
+        });
+        Ok(pack)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn count(&self) -> usize {
         self.count
+    }
+
+    /// Whether the pack is read from a bucket (not yet a complete local
+    /// file).
+    pub fn is_remote(&self) -> bool {
+        matches!(self.data, Data::Remote(_))
     }
 
     fn oid_at(&self, i: usize) -> &[u8] {
@@ -126,13 +249,34 @@ impl Pack {
         (0..self.count).map(|i| Oid::from_bytes(self.oid_at(i)).unwrap())
     }
 
-    /// Parse the entry header at `offset`: (type, inflated size, offset of
-    /// the delta base or the base's id, offset of the zlib data).
-    fn entry(&self, offset: u64) -> Result<Entry> {
-        let data = &self.pack[..];
-        let mut p = offset as usize;
-        ensure!(p < data.len(), "offset {offset} beyond the pack");
-        let mut c = data[p];
+    /// The bytes of the entry at `offset` (for a local pack, everything
+    /// from there to the end).
+    fn bytes(&self, offset: u64) -> Result<Cow<'_, [u8]>> {
+        match &self.data {
+            Data::Local(m) => {
+                ensure!(offset < m.len() as u64, "offset {offset} beyond the pack");
+                Ok(Cow::Borrowed(&m[offset as usize..]))
+            }
+            Data::Remote(r) => {
+                let i = r.ends.partition_point(|&o| o <= offset);
+                let end = *r
+                    .ends
+                    .get(i)
+                    .with_context(|| format!("offset {offset} beyond {}", self.name))?;
+                r.ensure(&self.name, offset..end)?;
+                let mut buf = vec![0u8; (end - offset) as usize];
+                read_at(&r.file, &mut buf, offset)?;
+                Ok(Cow::Owned(buf))
+            }
+        }
+    }
+
+    /// Parse the entry at `offset`: (type, inflated size, the delta base,
+    /// position of the zlib data in the returned bytes).
+    fn entry(&self, offset: u64) -> Result<(Entry, Cow<'_, [u8]>)> {
+        let data = self.bytes(offset)?;
+        let mut p = 0;
+        let mut c = *data.first().context("empty entry")?;
         p += 1;
         let kind = (c >> 4) & 7;
         let mut size = (c & 15) as u64;
@@ -164,18 +308,21 @@ impl Pack {
             1..=4 => Base::None,
             k => bail!("unknown pack entry type {k} at {offset}"),
         };
-        Ok(Entry {
-            kind,
-            size: size as usize,
-            base,
-            data: p,
-        })
+        Ok((
+            Entry {
+                kind,
+                size: size as usize,
+                base,
+                data: p,
+            },
+            data,
+        ))
     }
 
-    fn inflate(&self, e: &Entry) -> Result<Vec<u8>> {
+    fn inflate(&self, e: &Entry, bytes: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(e.size);
         let mut z = Decompress::new(true);
-        let status = z.decompress_vec(&self.pack[e.data..], &mut out, FlushDecompress::Finish)?;
+        let status = z.decompress_vec(&bytes[e.data..], &mut out, FlushDecompress::Finish)?;
         ensure!(
             status == Status::StreamEnd && out.len() == e.size,
             "corrupt entry in {}",
@@ -183,6 +330,125 @@ impl Pack {
         );
         Ok(out)
     }
+
+    /// Download every block of a remote pack and check its checksum
+    /// against its trailer and its index.
+    fn fetch_all(&self) -> Result<()> {
+        let Data::Remote(r) = &self.data else {
+            return Ok(());
+        };
+        r.ensure(&self.name, 0..r.len)?;
+        let mut h = Sha1::new();
+        let mut buf = vec![0u8; 1 << 20];
+        let body = r.len - 20;
+        let mut at = 0;
+        while at < body {
+            let n = (body - at).min(buf.len() as u64) as usize;
+            read_at(&r.file, &mut buf[..n], at)?;
+            h.update(&buf[..n]);
+            at += n as u64;
+        }
+        let mut trailer = [0u8; 20];
+        read_at(&r.file, &mut trailer, body)?;
+        let idx_says = &self.idx[self.idx.len() - 40..self.idx.len() - 20];
+        ensure!(
+            h.finalize()[..] == trailer && trailer[..] == *idx_says,
+            "{} from {} does not match its checksum",
+            self.name,
+            r.remote.url()
+        );
+        r.file.sync_all()?;
+        Ok(())
+    }
+}
+
+impl RemoteData {
+    /// Make sure bytes `range` are in the local file.
+    fn ensure(&self, name: &str, range: Range) -> Result<()> {
+        if range.start >= range.end {
+            return Ok(());
+        }
+        let first = range.start / BLOCK;
+        let last = (range.end - 1) / BLOCK;
+        let missing: Vec<u64> = {
+            let have = self.have.lock().unwrap();
+            (first..=last)
+                .filter(|&b| have[(b / 64) as usize] & (1 << (b % 64)) == 0)
+                .collect()
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // Contiguous runs of missing blocks, one ranged read each. Two
+        // readers may fetch the same block; the bytes are the same.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for b in missing {
+            match runs.last_mut() {
+                Some((s, e)) if *e == b && b - *s < MAX_RUN => *e = b + 1,
+                _ => runs.push((b, b + 1)),
+            }
+        }
+        let ranges: Vec<std::ops::Range<u64>> = runs
+            .iter()
+            .map(|&(s, e)| s * BLOCK..(e * BLOCK).min(self.len))
+            .collect();
+        let got = self
+            .remote
+            .get_ranges(&format!("{name}.pack"), ranges.clone())?;
+        for (r, bytes) in ranges.iter().zip(&got) {
+            ensure!(
+                bytes.len() as u64 == r.end - r.start,
+                "short read from {name}.pack"
+            );
+            write_at(&self.file, bytes, r.start)?;
+        }
+        self.file.sync_data()?;
+        let snapshot = {
+            let mut have = self.have.lock().unwrap();
+            for &(s, e) in &runs {
+                for b in s..e {
+                    have[(b / 64) as usize] |= 1 << (b % 64);
+                }
+            }
+            have.clone()
+        };
+        let bytes: Vec<u8> = snapshot.iter().flat_map(|w| w.to_le_bytes()).collect();
+        write_atomic(&self.have_path, &bytes)?;
+        Ok(())
+    }
+}
+
+type Range = std::ops::Range<u64>;
+
+#[cfg(unix)]
+fn read_at(f: &File, buf: &mut [u8], at: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    Ok(f.read_exact_at(buf, at)?)
+}
+
+#[cfg(unix)]
+fn write_at(f: &File, buf: &[u8], at: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    Ok(f.write_all_at(buf, at)?)
+}
+
+static TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tmp_name(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    path.with_file_name(name)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = tmp_name(path);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 enum Base {
@@ -210,6 +476,15 @@ fn kind_of(t: u8) -> Result<Kind> {
         4 => Kind::Tag,
         _ => bail!("not a base object type: {t}"),
     })
+}
+
+fn type_of(k: Kind) -> u8 {
+    match k {
+        Kind::Commit => 1,
+        Kind::Tree => 2,
+        Kind::Blob => 3,
+        Kind::Tag => 4,
+    }
 }
 
 /// Apply a git delta to `base`.
@@ -265,6 +540,90 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Write `objects` into `dir` as a new segment: an undeltified git pack and
+/// its v2 index (written last). Returns the `.pack` path. Duplicate ids are
+/// written once.
+pub fn write_pack(dir: &Path, objects: &[(Oid, Kind, &[u8])]) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let mut seen = HashSet::new();
+    let objects: Vec<&(Oid, Kind, &[u8])> = objects.iter().filter(|o| seen.insert(o.0)).collect();
+    let tmp_pack = tmp_name(&dir.join("pack"));
+    let mut out = std::io::BufWriter::new(File::create(&tmp_pack)?);
+    let mut sum = Sha1::new();
+    let mut emit = |out: &mut std::io::BufWriter<File>, b: &[u8]| -> Result<()> {
+        sum.update(b);
+        out.write_all(b)?;
+        Ok(())
+    };
+    let mut header = b"PACK\0\0\0\x02".to_vec();
+    header.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    emit(&mut out, &header)?;
+    let mut offset = header.len() as u64;
+    // (oid, crc32, offset)
+    let mut entries: Vec<(Oid, u32, u64)> = Vec::with_capacity(objects.len());
+    for (oid, kind, data) in objects {
+        let mut e = Vec::new();
+        let mut size = data.len() as u64;
+        let mut c = (type_of(*kind) << 4) | (size & 15) as u8;
+        size >>= 4;
+        while size > 0 {
+            e.push(c | 0x80);
+            c = (size & 0x7f) as u8;
+            size >>= 7;
+        }
+        e.push(c);
+        let mut z = flate2::write::ZlibEncoder::new(e, flate2::Compression::default());
+        z.write_all(data)?;
+        let e = z.finish()?;
+        let mut crc = flate2::Crc::new();
+        crc.update(&e);
+        entries.push((*oid, crc.sum(), offset));
+        emit(&mut out, &e)?;
+        offset += e.len() as u64;
+    }
+    let checksum: [u8; 20] = sum.finalize().into();
+    out.write_all(&checksum)?;
+    out.into_inner()?.sync_all()?;
+
+    entries.sort_by_key(|e| e.0);
+    let mut idx = vec![0xff, b't', b'O', b'c', 0, 0, 0, 2];
+    let mut fan = [0u32; 256];
+    for e in &entries {
+        for f in &mut fan[e.0.as_bytes()[0] as usize..] {
+            *f += 1;
+        }
+    }
+    for f in fan {
+        idx.extend_from_slice(&f.to_be_bytes());
+    }
+    for e in &entries {
+        idx.extend_from_slice(e.0.as_bytes());
+    }
+    for e in &entries {
+        idx.extend_from_slice(&e.1.to_be_bytes());
+    }
+    let mut large = Vec::new();
+    for e in &entries {
+        if e.2 < 0x8000_0000 {
+            idx.extend_from_slice(&(e.2 as u32).to_be_bytes());
+        } else {
+            idx.extend_from_slice(&(0x8000_0000 | (large.len() / 8) as u32).to_be_bytes());
+            large.extend_from_slice(&e.2.to_be_bytes());
+        }
+    }
+    idx.extend_from_slice(&large);
+    idx.extend_from_slice(&checksum);
+    let idx_sum: [u8; 20] = Sha1::digest(&idx).into();
+    idx.extend_from_slice(&idx_sum);
+
+    let pack = dir.join(format!("pack-{}.pack", hex::encode(checksum)));
+    std::fs::rename(&tmp_pack, &pack)?;
+    let tmp_idx = tmp_name(&pack.with_extension("idx"));
+    std::fs::write(&tmp_idx, &idx)?;
+    std::fs::rename(&tmp_idx, pack.with_extension("idx"))?;
+    Ok(pack)
+}
+
 /// Resolved objects that delta chains start from, shared by all readers.
 /// Bounded by total bytes; the oldest entries go first.
 /// (pack id, offset) -> resolved object.
@@ -300,23 +659,33 @@ impl BaseCache {
     }
 }
 
-/// All segments of a store.
+/// All segments of a store: complete local files in `dir`, and (with a
+/// bucket) segments read from the bucket and cached in `dir/../remote`.
 pub struct Packs {
     dir: PathBuf,
-    packs: std::sync::RwLock<Vec<Arc<Pack>>>,
+    remote: Option<(Arc<Remote>, PathBuf)>,
+    packs: RwLock<Vec<Arc<Pack>>>,
     cache: Mutex<BaseCache>,
-    /// When the directory was last listed. Another process sharing the
-    /// store (another server) may add segments; a miss re-lists the
-    /// directory, at most once per `RELIST`.
-    listed: Mutex<std::time::Instant>,
+    /// When the last listing started. Another process (another server) may
+    /// add segments at any time, so a lookup that misses lists again,
+    /// unless a listing started after the lookup did; concurrent misses
+    /// share one listing.
+    listed: Mutex<Instant>,
 }
-
-const RELIST: std::time::Duration = std::time::Duration::from_millis(20);
 
 impl Packs {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Packs> {
+        Packs::open_with(dir, None)
+    }
+
+    /// Segments in `dir`, plus those in `remote` (cached in `cache`).
+    pub fn open_with(
+        dir: impl Into<PathBuf>,
+        remote: Option<(Arc<Remote>, PathBuf)>,
+    ) -> Result<Packs> {
         let p = Packs {
             dir: dir.into(),
+            remote,
             packs: Default::default(),
             cache: Mutex::new(BaseCache {
                 map: HashMap::new(),
@@ -324,7 +693,7 @@ impl Packs {
                 bytes: 0,
                 limit: 256 << 20,
             }),
-            listed: Mutex::new(std::time::Instant::now()),
+            listed: Mutex::new(Instant::now()),
         };
         p.refresh()?;
         Ok(p)
@@ -334,10 +703,11 @@ impl Packs {
         &self.dir
     }
 
-    /// Pick up segments added since the last call (only those whose `.idx`
-    /// exists, which is written last).
+    /// Pick up segments added since the last call: local ones whose `.idx`
+    /// exists (it is written last), and complete ones in the bucket. A
+    /// segment read from the bucket is replaced by its local file once
+    /// there is one.
     pub fn refresh(&self) -> Result<usize> {
-        *self.listed.lock().unwrap() = std::time::Instant::now();
         let mut found: Vec<PathBuf> = match std::fs::read_dir(&self.dir) {
             Ok(rd) => rd
                 .flatten()
@@ -348,28 +718,59 @@ impl Packs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        found.sort();
+        // Oldest first, so that the newest end up in front.
+        found.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        let remote_found = match &self.remote {
+            Some((r, _)) => r.list()?,
+            None => Vec::new(),
+        };
+        let local_names: HashSet<String> = found.iter().map(|p| stem(p)).collect();
         let mut packs = self.packs.write().unwrap();
-        let known: std::collections::HashSet<PathBuf> =
-            packs.iter().map(|p| p.path.clone()).collect();
-        let mut added = 0;
-        for f in found {
-            if !known.contains(&f) {
-                packs.push(Arc::new(Pack::open(&f)?));
-                added += 1;
+        // Remote entries that are now local files.
+        packs.retain(|p| !(p.is_remote() && local_names.contains(&p.name)));
+        let known: HashSet<String> = packs.iter().map(|p| p.name.clone()).collect();
+        let mut added = Vec::new();
+        if let Some((remote, cache)) = &self.remote {
+            for seg in &remote_found {
+                if !known.contains(&seg.name) && !local_names.contains(&seg.name) {
+                    added.push(Arc::new(Pack::open_remote(remote, cache, seg)?));
+                }
             }
         }
-        // Newest first: recent objects are the ones most often asked for.
-        if added > 0 {
-            packs.sort_by_key(|p| {
-                std::cmp::Reverse(std::fs::metadata(&p.path).and_then(|m| m.modified()).ok())
-            });
+        for f in found {
+            if !known.contains(&stem(&f)) {
+                added.push(Arc::new(Pack::open(&f)?));
+            }
         }
-        Ok(added)
+        let n = added.len();
+        // Newest first: recent objects are the ones most often asked for.
+        added.reverse();
+        added.extend(packs.drain(..));
+        *packs = added;
+        Ok(n)
+    }
+
+    /// List again unless a listing started after `since`.
+    fn relist_after(&self, since: Instant) -> Result<()> {
+        let mut last = self.listed.lock().unwrap();
+        if *last > since {
+            return Ok(());
+        }
+        let start = Instant::now();
+        self.refresh()?;
+        *last = start;
+        Ok(())
     }
 
     pub fn count(&self) -> usize {
         self.packs.read().unwrap().len()
+    }
+
+    /// (segments read from the bucket, complete local segments)
+    pub fn counts(&self) -> (usize, usize) {
+        let packs = self.packs.read().unwrap();
+        let remote = packs.iter().filter(|p| p.is_remote()).count();
+        (remote, packs.len() - remote)
     }
 
     fn locate_known(&self, oid: &Oid) -> Option<(Arc<Pack>, u64)> {
@@ -379,26 +780,28 @@ impl Packs {
             .find_map(|p| p.find(oid).map(|o| (p.clone(), o)))
     }
 
-    /// Find `oid`, re-listing the directory once if it is not in a known
-    /// segment and the last listing is older than `RELIST`.
-    fn locate(&self, oid: &Oid) -> Option<(Arc<Pack>, u64)> {
+    /// Find `oid`; on a miss, list the segments again (see `listed`).
+    fn locate(&self, oid: &Oid) -> Result<Option<(Arc<Pack>, u64)>> {
+        let start = Instant::now();
         if let Some(hit) = self.locate_known(oid) {
-            return Some(hit);
+            return Ok(Some(hit));
         }
-        let stale = self.listed.lock().unwrap().elapsed() >= RELIST;
-        if stale && self.refresh().unwrap_or(0) > 0 {
-            return self.locate_known(oid);
-        }
-        None
+        self.relist_after(start)?;
+        Ok(self.locate_known(oid))
     }
 
     pub fn has(&self, oid: &Oid) -> bool {
-        self.locate(oid).is_some()
+        self.locate(oid).ok().flatten().is_some()
+    }
+
+    /// Whether a segment already known has `oid` (no listing).
+    pub fn has_known(&self, oid: &Oid) -> bool {
+        self.locate_known(oid).is_some()
     }
 
     /// The object, with its delta chain resolved.
     pub fn get(&self, oid: &Oid) -> Result<Option<(Kind, Vec<u8>)>> {
-        let Some((pack, offset)) = self.locate(oid) else {
+        let Some((pack, offset)) = self.locate(oid)? else {
             return Ok(None);
         };
         let (kind, data) = self.resolve(&pack, offset)?;
@@ -409,9 +812,10 @@ impl Packs {
     }
 
     fn resolve(&self, pack: &Arc<Pack>, offset: u64) -> Result<(Kind, Arc<Vec<u8>>)> {
-        // Walk down to a cached or undeltified base, then apply the deltas
-        // back up. Bases referenced by id may live in another segment.
-        let mut chain: Vec<(Arc<Pack>, Entry, u64)> = Vec::new();
+        // Walk down to a cached or undeltified base, collecting the deltas,
+        // then apply them back up. Bases referenced by id may live in
+        // another segment.
+        let mut chain: Vec<(usize, u64, Vec<u8>)> = Vec::new(); // (pack id, offset, delta)
         let (mut pack, mut offset) = (pack.clone(), offset);
         let (kind, mut data) = loop {
             ensure!(
@@ -422,21 +826,22 @@ impl Packs {
             if let Some(hit) = self.cache.lock().unwrap().get((pack.id, offset)) {
                 break hit;
             }
-            let e = pack.entry(offset)?;
+            let (e, bytes) = pack.entry(offset)?;
             match e.base {
                 Base::None => {
                     let k = kind_of(e.kind)?;
-                    let d = Arc::new(pack.inflate(&e)?);
+                    let d = Arc::new(pack.inflate(&e, &bytes)?);
                     break (k, d);
                 }
                 Base::Offset(b) => {
-                    chain.push((pack.clone(), e, offset));
+                    chain.push((pack.id, offset, pack.inflate(&e, &bytes)?));
                     offset = b;
                 }
                 Base::Ref(base) => {
-                    chain.push((pack.clone(), e, offset));
+                    chain.push((pack.id, offset, pack.inflate(&e, &bytes)?));
+                    drop(bytes);
                     (pack, offset) = self
-                        .locate(&base)
+                        .locate(&base)?
                         .with_context(|| format!("delta base {base} is missing"))?;
                 }
             }
@@ -448,17 +853,57 @@ impl Packs {
                 .unwrap()
                 .put((pack.id, offset), kind, data.clone());
         }
-        while let Some((cpack, e, coff)) = chain.pop() {
-            let delta = cpack.inflate(&e)?;
+        while let Some((cid, coff, delta)) = chain.pop() {
             data = Arc::new(apply_delta(&data, &delta)?);
             if !chain.is_empty() {
                 self.cache
                     .lock()
                     .unwrap()
-                    .put((cpack.id, coff), kind, data.clone());
+                    .put((cid, coff), kind, data.clone());
             }
         }
         Ok((kind, data))
+    }
+
+    /// Download every segment that is only in the bucket and make it a
+    /// complete local file in `dir` (where git, through alternates, can
+    /// read it). Returns the number of segments downloaded.
+    pub fn hydrate(&self) -> Result<usize> {
+        if self.remote.is_none() {
+            return Ok(0);
+        }
+        self.relist_after(Instant::now())?;
+        let remote: Vec<Arc<Pack>> = self
+            .packs
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|p| p.is_remote())
+            .cloned()
+            .collect();
+        std::fs::create_dir_all(&self.dir)?;
+        for p in &remote {
+            p.fetch_all()?;
+            let dest = self.dir.join(format!("{}.pack", p.name));
+            // A hard link keeps the open cache file valid; the .idx goes
+            // last, as for any segment.
+            if !dest.exists() {
+                let tmp = tmp_name(&dest);
+                std::fs::hard_link(&p.path, &tmp)
+                    .or_else(|_| std::fs::copy(&p.path, &tmp).map(|_| ()))?;
+                std::fs::rename(&tmp, &dest)?;
+            }
+            let tmp = tmp_name(&dest.with_extension("idx"));
+            std::fs::copy(p.path.with_extension("idx"), &tmp)?;
+            std::fs::rename(&tmp, dest.with_extension("idx"))?;
+            if let Data::Remote(r) = &p.data {
+                let _ = std::fs::remove_file(&r.have_path);
+            }
+            let _ = std::fs::remove_file(&p.path);
+            let _ = std::fs::remove_file(p.path.with_extension("idx"));
+        }
+        self.refresh()?;
+        Ok(remote.len())
     }
 }
 

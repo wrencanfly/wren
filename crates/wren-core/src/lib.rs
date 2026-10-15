@@ -16,6 +16,7 @@ pub mod object;
 pub mod oid;
 pub mod pack;
 pub mod repo;
+pub mod segments;
 pub mod sparse;
 pub mod store;
 #[doc(hidden)]

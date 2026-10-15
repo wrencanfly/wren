@@ -345,6 +345,8 @@ async fn blobs(
             let bytes = b.bytes()?.unwrap_or_default();
             oids.push(r.store.put(Kind::Blob, &bytes)?);
         }
+        // Any server may be asked to use them next.
+        r.store.publish()?;
         Ok(Json(BlobsResp { oids }))
     })
     .await

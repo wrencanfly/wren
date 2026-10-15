@@ -1,6 +1,6 @@
 # 设计：Wren 向 Scion 架构迁移
 
-> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15**，其余待做。
+> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15，M3d ✅ 2026-10-15**，其余待做。
 > 范围：用户选择"全面 Scion 化"，即下文 M1–M7 全部纳入路线图。
 > 这推翻了 v0.1 的定位（只读、git 主机是数据源、"不做服务端写入"），也推翻了
 > [reviews/04](reviews/04-positioning-vs-intent.md) 和 [reviews/08](reviews/08-synthesis.md)
@@ -267,7 +267,7 @@ M3 拆成四步：
 | M3a | pack 段存储、进程内 pack 读取器（idx 二分、delta 链、基对象缓存）、整包吸收 | ✅ 2026-10-14 |
 | M3b | 线路 delta 帧：增量获取 ≤ thin pack 的 3 倍 | ✅ 2026-10-15 |
 | M3c | `MetaStore` 接口与 Postgres；多台无状态 server | ✅ 2026-10-15 |
-| M3d | 段放到 S3/GCS（段不可变，适合按范围读取），本地磁盘缓存 | 待做 |
+| M3d | 段放到 S3/GCS（段不可变，适合按范围读取），本地磁盘缓存 | ✅ 2026-10-15 |
 
 **M3a 实测（git/git，85,545 个提交）：**
 
@@ -325,10 +325,49 @@ M3 拆成四步：
 | `log -- path` | 12 ms | 16 ms |
 | 检出 | — | 无差别 |
 
-限制：数据目录（对象库和 git mirror）目前要放在共享文件系统上；对象存储后端是 M3d。
+M3c 时的限制（数据目录要放在共享文件系统上）由 M3d 解除。
 
-服务端自己创建的对象（M2 写入）仍以 loose 形式写入，git 可读；把它们定期封成段
-（类似 memtable → segment）留到 M3c 一起做。
+**M3d 实现（对象存储里的段）：**
+
+- `wren server --segments s3://bucket/prefix`（也支持 `gs://`、`az://`、`file://`），
+  用 `object_store` 库访问；凭据走通常的 `AWS_*` / `GOOGLE_*` / `AZURE_*` 环境变量。
+  有了它和 `--meta`，各台 server 不再共享任何文件系统，每台的 `--data` 只是本地缓存。
+- 一个段是 bucket 里的两个键：先传 `.pack`，最后传 `.idx`；列表里只算有 `.idx` 的段。
+  键永不覆盖、永不删除，所以按范围读取和本地缓存都不需要协调。
+- **按范围读取**：别的 server 上传的段，`.idx` 整个下载（校验 SHA-1），`.pack` 按
+  1 MiB 块按需读取，存进本地稀疏文件，块位图落盘。一个条目的结束位置就是下一个
+  条目的偏移（从 idx 排序得到），所以每次只读需要的块。
+- **未命中就重新列一次**：查不到对象时重新列 bucket，除非某次列表是在这次查询
+  开始之后才开始的；并发的未命中共用一次列表。M3c 里"20 ms 内不重列"会漏掉刚上传
+  的段，这里一并修掉。写对象前的去重检查不列 bucket，最坏多写一份。
+- **服务端写的对象先封段再发布**（原计划留到 M3c 的 memtable → segment）：有 bucket 时，
+  `create_changeset` 在写 changeset 行之前、blob 上传接口在返回之前、sync 在发布 ref
+  之前，把本机所有 loose 对象封成一个不带 delta 的 git pack（自己写的 pack/idx v2
+  写入器，`git verify-pack` 校验），上传后才删 loose 文件。并发调用者等同一次封段完成，
+  所以"调用返回时，调用前写的对象都已在 bucket 里"。
+- **git mirror 需要完整的本地副本**：mirror 通过 alternates 读对象库，所以 sync、推送、
+  land 拿 mirror 锁之后先 hydrate：把只在 bucket 里的段下载完整、核对 pack 校验和
+  （与 trailer 和 idx 记录的都一致），再放进本地 `pack/`。fetch 前把 mirror 的 ref 设成
+  共享数据库里的 ref，免得落后的 mirror 重复下载、重复上传。
+- **轮流 sync**：有 bucket 时，如果任何一台 server 在半个轮询周期内 sync 过，本轮就跳过。
+  这样只做查询的 server 不会因为 sync 而下载全部段。
+- 测试：两个互不共享目录的对象库通过 `file://` bucket 共享 loose 封段、git 的 delta
+  pack（按范围读，只下载部分块，再 hydrate 后 `git verify-pack`）；bucket 里的段被
+  篡改时 hydrate 报校验和错误；三台 server 进程各用自己的数据目录、共用 Postgres
+  和 bucket 的端到端测试。
+- git/git 实测（bucket 是本机 `file://`，网络延迟另计）：
+
+| | server A（摄入方） | server B（空数据目录） |
+|---|---:|---:|
+| 首次摄入（含上传） | 约 86 s | — |
+| bucket | 319 MiB，2 个段 | |
+| 启动到可服务 | — | 90 ms，本地 11.5 MiB（只有 idx） |
+| 冷 / 热 blame | 39 / 15 ms | 56 / 19 ms |
+| `log -- path` | 9 ms | 16 ms |
+| 冷节点完整检出（18 MiB） | 0.66 s | 1.0 s（读入约 74 MiB 的块） |
+| 第一次 sync（含 hydrate 320 MiB） | — | 1.1 s |
+
+块粒度是 1 MiB，完整检出时 B 读入的块约是对象大小的 4 倍；以后可以按访问模式调块大小。
 
 ### 4.3 `MetaStore` 接口
 
@@ -346,7 +385,8 @@ M3 拆成四步：
 
 - ✅ git/git 的存储量不超过 git pack 的 2 倍（M3a 后约 1.06 倍，此前约 15 倍）。
 - ✅ `HEAD~15` 的增量获取不超过 thin pack 的 3 倍：M3b 后 13.0 KB 对 14 KB（0.93 倍；无 delta 时 640 KB）。`HEAD~50`：734 KB 对 1.35 MB。
-- ✅ 3 台 server 共用 Postgres 时，端到端测试全部通过（`crates/wren/tests/multi_server.rs`）。
+- ✅ 3 台 server 共用 Postgres 时，端到端测试全部通过（`crates/wren/tests/multi_server.rs`）；
+  M3d 后，三台各用自己的数据目录、只共用 Postgres 和 bucket 也全部通过。
 
 ---
 

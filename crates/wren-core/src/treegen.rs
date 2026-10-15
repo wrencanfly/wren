@@ -134,11 +134,10 @@ impl Derivable for GitTree {
             return Ok(GitTree(t));
         }
         let changes = changes::decode_changes(&cs.changes)?;
-        Ok(GitTree(apply(
-            &repo.store,
-            parents.first().map(|p| p.0),
-            &changes,
-        )?))
+        let tree = apply(&repo.store, parents.first().map(|p| p.0), &changes)?;
+        // The value is about to be shared; so must the trees it names.
+        repo.store.publish()?;
+        Ok(GitTree(tree))
     }
 
     fn encode(&self) -> Vec<u8> {

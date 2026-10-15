@@ -409,10 +409,12 @@ pub fn spawn_pollers(state: Arc<ServerState>, interval: Option<Duration>) {
             continue;
         }
         tokio::spawn(async move {
+            // With a shared bucket, skip a round another server just did.
+            let fresh = interval.map_or(Duration::from_secs(30), |d| d / 2);
             loop {
                 let r = repo.clone();
-                match tokio::task::spawn_blocking(move || r.sync()).await {
-                    Ok(Ok(rep)) if rep.new_changesets > 0 || rep.refs_updated > 0 => {
+                match tokio::task::spawn_blocking(move || r.sync_unless_fresh(fresh)).await {
+                    Ok(Ok(Some(rep))) if rep.new_changesets > 0 || rep.refs_updated > 0 => {
                         tracing::info!(repo = %repo.name, ?rep, "synced")
                     }
                     Ok(Ok(_)) => {}
