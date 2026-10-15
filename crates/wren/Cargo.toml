@@ -3,6 +3,10 @@ name = "wren-vcs"
 version = "0.1.0"
 edition.workspace = true
 
+[lib]
+name = "wren_vcs"
+path = "src/lib.rs"
+
 [[bin]]
 name = "wren"
 path = "src/main.rs"

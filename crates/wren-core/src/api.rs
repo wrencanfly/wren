@@ -44,6 +44,10 @@ pub struct Capabilities {
     /// Version of the query answers' semantics (see [`QUERY_SEMANTICS`]).
     #[serde(default)]
     pub semantics: String,
+    /// A node daemon's object store, so that clients on the same machine
+    /// that use that store let the daemon write it (they only verify).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
 }
 
 pub const PROTOCOL_VERSION: u32 = 1;

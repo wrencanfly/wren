@@ -865,6 +865,50 @@ impl Packs {
         Ok((kind, data))
     }
 
+    /// The local segments: (name, size of the `.pack`).
+    pub fn local_segments(&self) -> Vec<(String, u64)> {
+        self.packs
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|p| !p.is_remote())
+            .map(|p| {
+                let size = match &p.data {
+                    Data::Local(m) => m.len() as u64,
+                    Data::Remote(r) => r.len,
+                };
+                (p.name.clone(), size)
+            })
+            .collect()
+    }
+
+    /// The ids of every object in segment `name`.
+    pub fn segment_oids(&self, name: &str) -> Vec<Oid> {
+        self.packs
+            .read()
+            .unwrap()
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.oids().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop a local segment: forget it, then delete its `.idx` (which hides
+    /// it from git and other processes) and its `.pack`. Readers that
+    /// already hold it keep a valid mapping until they let go.
+    pub fn remove(&self, name: &str) -> Result<()> {
+        self.packs.write().unwrap().retain(|p| p.name != name);
+        let pack = self.dir.join(format!("{name}.pack"));
+        for ext in ["idx", "rev", "pack"] {
+            match std::fs::remove_file(pack.with_extension(ext)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     /// Download every segment that is only in the bucket and make it a
     /// complete local file in `dir` (where git, through alternates, can
     /// read it). Returns the number of segments downloaded.

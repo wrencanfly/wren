@@ -21,6 +21,11 @@ pub struct Client {
     pub server: String,
     pub repo: String,
     http: reqwest::Client,
+    /// The object plane, when it is not `server` (WREN_OBJECTS): usually
+    /// the node's daemon. Queries and writes still go to `server`.
+    objects: Option<(reqwest::Client, String)>,
+    /// The object plane's own store, if it said (a node daemon does).
+    objects_store: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
     pub stats: Arc<FetchStats>,
 }
 
@@ -68,6 +73,22 @@ impl Client {
             v.set_sensitive(true);
             headers.insert(reqwest::header::AUTHORIZATION, v);
         }
+        let objects = std::env::var("WREN_OBJECTS")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                let b = reqwest::Client::builder()
+                    .pool_max_idle_per_host(PARALLEL)
+                    .default_headers(headers.clone())
+                    .timeout(std::time::Duration::from_secs(300));
+                match v.strip_prefix("unix:") {
+                    Some(path) => (
+                        b.unix_socket(path).build().unwrap(),
+                        "http://wren-daemon".to_string(),
+                    ),
+                    None => (b.build().unwrap(), v.trim_end_matches('/').to_string()),
+                }
+            });
         Client {
             server: server.trim_end_matches('/').to_string(),
             repo: repo.to_string(),
@@ -77,8 +98,37 @@ impl Client {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap(),
+            objects,
+            objects_store: Arc::default(),
             stats: Arc::default(),
         }
+    }
+
+    /// Whether objects fetched into `store` are written by the object plane
+    /// itself: a node daemon serving this very store. The client then only
+    /// verifies what it receives.
+    async fn daemon_owns(&self, store: &ObjectStore) -> bool {
+        let Some((http, base)) = &self.objects else {
+            return false;
+        };
+        let theirs = self
+            .objects_store
+            .get_or_init(|| async {
+                let caps: Capabilities = http
+                    .get(format!("{base}/v1/capabilities"))
+                    .send()
+                    .await
+                    .ok()?
+                    .json()
+                    .await
+                    .ok()?;
+                caps.store.map(PathBuf::from)
+            })
+            .await;
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+        theirs
+            .as_deref()
+            .is_some_and(|t| canon(t).is_some() && canon(t) == canon(store.root()))
     }
 
     fn url(&self, path: &str) -> String {
@@ -291,13 +341,16 @@ impl Client {
         bases: Vec<Option<Oid>>,
     ) -> Result<()> {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
-        let resp = self
-            .http
-            .post(format!("{}/v1/objects", self.server))
+        let (http, base) = match &self.objects {
+            Some((c, b)) => (c, b.as_str()),
+            None => (&self.http, self.server.as_str()),
+        };
+        let resp = http
+            .post(format!("{base}/v1/objects"))
             .json(&ObjectsRequest { oids, bases })
             .send()
             .await
-            .with_context(|| format!("connecting to {}", self.server))?;
+            .with_context(|| format!("connecting to {base}"))?;
         let resp = Self::check(resp).await?;
         let mut body = resp.bytes_stream().map_err(anyhow::Error::from);
         let mut dec = FrameDecoder::default();
@@ -321,13 +374,19 @@ impl Client {
                 .count() as u64,
             Ordering::Relaxed,
         );
-        // Verify every object against its id before it enters the store.
+        // Verify every object against its id before it enters the store
+        // (or, when a daemon owns the store, before trusting it is there).
+        let owned = self.daemon_owns(&store).await;
         tokio::task::spawn_blocking(move || -> Result<()> {
             use rayon::prelude::*;
             pending
                 .par_iter()
                 .try_for_each(|(oid, payload)| -> Result<()> {
-                    wire::store_frame(&store, oid, payload)?;
+                    if owned {
+                        wire::verify_frame(&store, oid, payload)?;
+                    } else {
+                        wire::store_frame(&store, oid, payload)?;
+                    }
                     Ok(())
                 })
         })

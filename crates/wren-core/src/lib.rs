@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod blame;
+pub mod bounded;
 pub mod changes;
 pub mod derived;
 pub mod git_source;
@@ -17,6 +18,7 @@ pub mod oid;
 pub mod pack;
 pub mod repo;
 pub mod segments;
+pub mod snapshot;
 pub mod sparse;
 pub mod store;
 #[doc(hidden)]

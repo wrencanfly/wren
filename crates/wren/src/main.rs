@@ -1,8 +1,4 @@
-mod cache;
-mod checkout;
-mod client;
-mod mcp;
-mod server;
+use wren_vcs::{cache, checkout, mcp, server};
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -18,7 +14,7 @@ use wren_core::api::*;
 use wren_core::write::Landed;
 use wren_core::{ObjectStore, Repo};
 
-use crate::client::{
+use wren_vcs::client::{
     find_checkout_config, ChangesetRequest, Client, Content, Edit, FileChange, LandOnto,
     LandRequest, Person, RevertRequest,
 };
@@ -96,6 +92,14 @@ enum Cmd {
         /// its own --data directory as a cache.
         #[arg(long, env = "WREN_SEGMENTS_URL")]
         segments: Option<String>,
+        /// Publish a snapshot of each repository's default branch this
+        /// often (seconds; 0 = never). New node daemons seed from it.
+        #[arg(long, default_value_t = 0)]
+        snapshot_every: u64,
+        /// Directory whose blobs snapshots include (repeatable; default:
+        /// all). Every tree is always included.
+        #[arg(long = "snapshot-cone", value_name = "DIR")]
+        snapshot_cone: Vec<String>,
     },
     /// Run a caching tier in front of a server or another cache.
     Cache {
@@ -117,6 +121,59 @@ enum Cmd {
         /// Token this cache presents to its upstream.
         #[arg(long, env = "WREN_UPSTREAM_TOKEN", hide_env_values = true)]
         upstream_token: Option<String>,
+        /// This cache's tier. A region cache's upstream must be the server;
+        /// a node cache's must be a region cache (prefer `wren daemon` for
+        /// nodes).
+        #[arg(long, default_value = "region", value_parser = ["region", "node"])]
+        tier: String,
+        /// Bytes of recently served objects to keep in memory (e.g. 256MiB).
+        #[arg(long, default_value = "256MiB", value_parser = parse_size)]
+        memory: u64,
+        /// Start even if the upstream is not exactly the tier above (e.g. a
+        /// region cache in front of another region cache, or a node
+        /// pointing straight at the server in a small deployment).
+        #[arg(long)]
+        allow_tier_skip: bool,
+    },
+    /// Run the node tier: one per machine, serving the checkouts on it over
+    /// a unix socket, with a bounded object store.
+    Daemon {
+        /// The node's object store; checkouts on this machine use it too
+        /// (`wren checkout --store`, or WREN_STORE).
+        #[arg(long, env = "WREN_STORE")]
+        store: PathBuf,
+        /// Unix socket to serve on (default: <store>/daemon.sock). Clients
+        /// use it through WREN_OBJECTS=unix:<path>.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Also serve over TCP.
+        #[arg(long)]
+        listen: Option<SocketAddr>,
+        /// The region cache above this node.
+        #[arg(long)]
+        upstream: String,
+        /// Store budget (e.g. 50GiB). Over it, the oldest generations of
+        /// blobs are evicted; trees and leased checkouts are kept.
+        #[arg(long, default_value = "20GiB", value_parser = parse_size)]
+        budget: u64,
+        /// Days a checkout's lease protects its objects.
+        #[arg(long, default_value_t = 7)]
+        lease_days: u64,
+        /// Seed an empty store from this repository's snapshot.
+        #[arg(long, value_name = "REPO")]
+        snapshot: Option<String>,
+        #[arg(long, default_value = "256MiB", value_parser = parse_size)]
+        memory: u64,
+        #[arg(long, default_value_t = 32)]
+        upstream_concurrency: usize,
+        #[arg(long, default_value_t = 120)]
+        upstream_timeout: u64,
+        /// Token this node presents to its upstream.
+        #[arg(long, env = "WREN_UPSTREAM_TOKEN", hide_env_values = true)]
+        upstream_token: Option<String>,
+        /// See `wren cache --allow-tier-skip`.
+        #[arg(long)]
+        allow_tier_skip: bool,
     },
     /// Materialize a commit on disk (optionally sparse, optionally as a git repo).
     Checkout {
@@ -509,6 +566,29 @@ fn date(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// `123`, `64KiB`, `256MiB`, `50GiB`, `1TiB` (also KB/MB/GB/TB as powers of
+/// 1000).
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (n, unit) = s.split_at(split);
+    let n: u64 = n.parse().map_err(|_| format!("bad size {s:?}"))?;
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kib" | "k" => 1 << 10,
+        "mib" | "m" => 1 << 20,
+        "gib" | "g" => 1 << 30,
+        "tib" | "t" => 1 << 40,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "tb" => 1_000_000_000_000,
+        u => return Err(format!("bad size unit {u:?}")),
+    };
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("{s} is too large"))
+}
+
 fn data_layout(data: &std::path::Path) -> (PathBuf, PathBuf) {
     (data.join("objects"), data.join("repos"))
 }
@@ -524,6 +604,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             write_token,
             meta,
             segments,
+            snapshot_every,
+            snapshot_cone,
         } => {
             let meta = match meta {
                 Some(url) => wren_core::meta::MetaConfig::Postgres(url),
@@ -586,8 +668,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if token.is_none() && !listen.ip().is_loopback() {
                 tracing::warn!("listening on {listen} without --token: every mirrored repository is readable by anyone who can reach this port");
             }
-            let state = Arc::new(server::ServerState::new(store, map, token, write_token));
+            let mut state = server::ServerState::new(store, map, token, write_token);
+            state.snapshots = server::SnapshotConfig {
+                dir: Some(data.join("snapshots")),
+                cone: snapshot_cone,
+                every: (snapshot_every > 0).then(|| Duration::from_secs(snapshot_every)),
+            };
+            let state = Arc::new(state);
             server::spawn_pollers(state.clone(), (poll > 0).then(|| Duration::from_secs(poll)));
+            server::spawn_snapshotters(state.clone());
             let listener = tokio::net::TcpListener::bind(listen).await?;
             tracing::info!(
                 "wren server listening on http://{listen} ({} repos)",
@@ -603,27 +692,117 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             upstream_timeout,
             token,
             upstream_token,
+            tier,
+            memory,
+            allow_tier_skip,
         } => {
-            let state = Arc::new(cache::CacheState {
-                store: Arc::new(ObjectStore::open(dir.join("objects"))?),
-                api_dir: dir.join("api"),
-                upstream: upstream.trim_end_matches('/').to_string(),
-                http: reqwest::Client::builder()
-                    .timeout(Duration::from_secs(upstream_timeout))
-                    .build()?,
-                token,
-                upstream_token,
-                upstream_permits: tokio::sync::Semaphore::new(upstream_concurrency),
-                stats: Default::default(),
-                semantics: Default::default(),
-            });
-            state.discover_semantics().await;
+            let tier = match tier.as_str() {
+                "node" => cache::Tier::Node,
+                _ => cache::Tier::Region,
+            };
+            let state = Arc::new(cache::CacheState::new(
+                cache::CacheConfig {
+                    tier,
+                    store_dir: dir.join("objects"),
+                    dir: dir.clone(),
+                    upstream,
+                    token,
+                    upstream_token,
+                    upstream_concurrency,
+                    memory: memory as usize,
+                    budget: None,
+                },
+                Arc::new(wren_vcs::transport::Reqwest::new(Duration::from_secs(
+                    upstream_timeout,
+                ))?),
+            )?);
+            state
+                .check_upstream(allow_tier_skip, Duration::from_secs(upstream_timeout))
+                .await?;
             let listener = tokio::net::TcpListener::bind(listen).await?;
             tracing::info!(
-                "wren cache listening on http://{listen}, upstream {}",
+                "wren cache ({}) listening on http://{listen}, upstream {}",
+                tier.name(),
                 state.upstream
             );
             axum::serve(listener, cache::router(state)).await?;
+        }
+        Cmd::Daemon {
+            store,
+            socket,
+            listen,
+            upstream,
+            budget,
+            lease_days,
+            snapshot,
+            memory,
+            upstream_concurrency,
+            upstream_timeout,
+            upstream_token,
+            allow_tier_skip,
+        } => {
+            std::fs::create_dir_all(&store)?;
+            let state = Arc::new(cache::CacheState::new(
+                cache::CacheConfig {
+                    tier: cache::Tier::Node,
+                    store_dir: store.clone(),
+                    dir: store.join("daemon"),
+                    upstream,
+                    token: None,
+                    upstream_token,
+                    upstream_concurrency,
+                    memory: memory as usize,
+                    budget: Some((budget, Duration::from_secs(lease_days * 86400))),
+                },
+                Arc::new(wren_vcs::transport::Reqwest::new(Duration::from_secs(
+                    upstream_timeout,
+                ))?),
+            )?);
+            state
+                .check_upstream(allow_tier_skip, Duration::from_secs(upstream_timeout))
+                .await?;
+            if let Some(repo) = &snapshot {
+                let n = state.seed_from_snapshot(repo).await?;
+                if n > 0 {
+                    tracing::info!("seeded {n} objects from {repo}'s snapshot");
+                }
+            }
+            // Periodic maintenance, besides the runs triggered by arrivals.
+            {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if let Err(e) = st.maintain().await {
+                            tracing::warn!("maintenance failed: {e:#}");
+                        }
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                });
+            }
+            let socket = socket.unwrap_or_else(|| store.join("daemon.sock"));
+            let _ = std::fs::remove_file(&socket);
+            let unix = tokio::net::UnixListener::bind(&socket)
+                .with_context(|| format!("binding {}", socket.display()))?;
+            tracing::info!(
+                "wren daemon serving {} on {} (budget {budget} bytes), upstream {}",
+                store.display(),
+                socket.display(),
+                state.upstream
+            );
+            let router = cache::router(state);
+            match listen {
+                Some(addr) => {
+                    let tcp = tokio::net::TcpListener::bind(addr).await?;
+                    let r2 = router.clone();
+                    let (a, b) =
+                        tokio::join!(async move { axum::serve(unix, router).await }, async move {
+                            axum::serve(tcp, r2).await
+                        });
+                    a?;
+                    b?;
+                }
+                None => axum::serve(unix, router).await?,
+            }
         }
         Cmd::Checkout {
             dest,

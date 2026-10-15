@@ -32,6 +32,18 @@ pub struct ServerState {
     pub write_token: Option<String>,
     /// Per repo: when the last on-demand sync finished (see `resolve`).
     pub on_demand: BTreeMap<String, Mutex<Option<Instant>>>,
+    pub snapshots: SnapshotConfig,
+}
+
+/// Where snapshots (see `wren_core::snapshot`) are kept, and what they hold.
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotConfig {
+    /// Directory of snapshot files; `None` disables snapshots.
+    pub dir: Option<std::path::PathBuf>,
+    /// Directories whose blobs are included (empty: all).
+    pub cone: Vec<String>,
+    /// Rebuild from the default branch this often (and at startup).
+    pub every: Option<Duration>,
 }
 
 /// On-demand syncs of one repo are at least this far apart, so a stream of
@@ -55,6 +67,7 @@ impl ServerState {
             token,
             write_token,
             on_demand,
+            snapshots: SnapshotConfig::default(),
         }
     }
 
@@ -177,6 +190,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/repos/{repo}/bisect", get(bisect))
         .route("/api/v1/repos/{repo}/grep", get(grep))
         .route("/api/v1/repos/{repo}/sync", post(sync))
+        .route("/api/v1/repos/{repo}/snapshot", get(snapshot_latest))
+        .route("/v1/snapshots/{file}", get(snapshot_file))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             freshness_header,
@@ -399,6 +414,7 @@ async fn capabilities(State(st): St) -> Json<Capabilities> {
         tier: "server".into(),
         features,
         semantics: QUERY_SEMANTICS.into(),
+        store: None,
     })
 }
 
@@ -804,4 +820,136 @@ async fn sync(
 ) -> ApiResult<Json<wren_core::repo::SyncReport>> {
     let r = repo(&st, &name)?;
     blocking(move || Ok(Json(r.sync()?))).await
+}
+
+// ---- snapshots ------------------------------------------------------------------
+
+fn snapshot_dir(st: &ServerState) -> ApiResult<std::path::PathBuf> {
+    st.snapshots.dir.clone().ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "this server does not publish snapshots".into(),
+        )
+    })
+}
+
+/// The repository's current snapshot. Not pinned: it changes as the
+/// default branch moves, so it is never cached.
+async fn snapshot_latest(
+    State(st): St,
+    Path(name): Path<String>,
+) -> ApiResult<Json<wren_core::snapshot::SnapshotInfo>> {
+    let r = repo(&st, &name)?;
+    snapshot_dir(&st)?;
+    blocking(move || {
+        wren_core::snapshot::current(&r)?
+            .map(Json)
+            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no snapshot yet".into()))
+    })
+    .await
+}
+
+/// Build the repository's snapshot now (write token).
+pub(crate) async fn snapshot_build(
+    st: Arc<ServerState>,
+    name: String,
+) -> ApiResult<Json<wren_core::snapshot::SnapshotInfo>> {
+    let r = repo(&st, &name)?;
+    let dir = snapshot_dir(&st)?;
+    let cone = st.snapshots.cone.clone();
+    blocking(move || Ok(Json(wren_core::snapshot::publish(&r, "HEAD", &cone, &dir)?))).await
+}
+
+/// A snapshot file, by content hash: immutable, served with ranges so
+/// that downloads resume.
+async fn snapshot_file(
+    State(st): St,
+    Path(file): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    let dir = snapshot_dir(&st)?;
+    let st2 = st.clone();
+    let path = blocking(move || {
+        for r in st2.repos.values() {
+            if let Some(p) = wren_core::snapshot::locate(r, &dir, &file)? {
+                return Ok(p);
+            }
+        }
+        Err(ApiError(StatusCode::NOT_FOUND, "no such snapshot".into()))
+    })
+    .await?;
+    Ok(serve_file(&path, &headers, st.private()).await?)
+}
+
+/// Serve an immutable file, honouring `Range: bytes=a-` and `bytes=a-b`.
+pub async fn serve_file(
+    path: &std::path::Path,
+    headers: &axum::http::HeaderMap,
+    private: bool,
+) -> Result<Response> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut f = tokio::fs::File::open(path).await?;
+    let len = f.metadata().await?.len();
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("bytes="))
+        .and_then(|v| v.split_once('-'))
+        .and_then(|(a, b)| {
+            let a: u64 = a.parse().ok()?;
+            let b: u64 = if b.is_empty() {
+                len.checked_sub(1)?
+            } else {
+                b.parse::<u64>().ok()?.min(len.checked_sub(1)?)
+            };
+            (a <= b).then_some((a, b))
+        });
+    let (status, start, end) = match range {
+        Some((a, b)) => (StatusCode::PARTIAL_CONTENT, a, b + 1),
+        None => (StatusCode::OK, 0, len),
+    };
+    f.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut body = vec![0u8; (end - start) as usize];
+    f.read_exact(&mut body).await?;
+    let mut resp = (
+        status,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CACHE_CONTROL, immutable(private)),
+            (header::ACCEPT_RANGES, "bytes"),
+        ],
+        body,
+    )
+        .into_response();
+    if status == StatusCode::PARTIAL_CONTENT {
+        if let Ok(v) = format!("bytes {start}-{}/{len}", end - 1).parse() {
+            resp.headers_mut().insert(header::CONTENT_RANGE, v);
+        }
+    }
+    Ok(resp)
+}
+
+/// Rebuild each repository's snapshot now and then every `every`.
+pub fn spawn_snapshotters(state: Arc<ServerState>) {
+    let (Some(dir), Some(every)) = (state.snapshots.dir.clone(), state.snapshots.every) else {
+        return;
+    };
+    for repo in state.repos.values().cloned() {
+        let (dir, cone) = (dir.clone(), state.snapshots.cone.clone());
+        tokio::spawn(async move {
+            loop {
+                let (r, d, c) = (repo.clone(), dir.clone(), cone.clone());
+                match tokio::task::spawn_blocking(move || {
+                    wren_core::snapshot::publish(&r, "HEAD", &c, &d)
+                })
+                .await
+                {
+                    Ok(Ok(info)) => tracing::debug!(repo = %repo.name, ?info, "snapshot"),
+                    Ok(Err(e)) => tracing::warn!(repo = %repo.name, "snapshot failed: {e:#}"),
+                    Err(e) => tracing::warn!(repo = %repo.name, "snapshot panicked: {e}"),
+                }
+                tokio::time::sleep(every).await;
+            }
+        });
+    }
 }

@@ -68,6 +68,15 @@ pub struct FileOut {
 /// roughly the change, not every changed object whole.
 const LAST_ROOT: &str = "wren-last-root";
 
+/// Gives a lease back when dropped.
+struct Release(PathBuf, String);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        wren_core::bounded::release(&self.0, &self.1);
+    }
+}
+
 fn last_root(store: &ObjectStore) -> Option<Oid> {
     let s = std::fs::read_to_string(store.root().join(LAST_ROOT)).ok()?;
     let oid: Oid = s.trim().parse().ok()?;
@@ -88,9 +97,18 @@ pub async fn checkout(client: &Client, opts: Options) -> Result<Report> {
     if opts.dest.exists() && std::fs::read_dir(&opts.dest)?.next().is_some() {
         bail!("{} exists and is not empty", opts.dest.display());
     }
-    let store = Arc::new(ObjectStore::open(&opts.store_dir)?);
     let sparse = Sparse::new(&opts.sparse);
     let commit_oid = client.resolve(&opts.rev).await?;
+    // A node daemon keeps the objects of a leased commit. Taken before the
+    // store is opened, so that what this checkout finds there stays. A
+    // --git checkout keeps its lease (git reads its objects from the store
+    // through alternates, without asking anyone); a plain one has its
+    // files when done and gives the lease back.
+    std::fs::create_dir_all(&opts.store_dir)?;
+    let lease_name = wren_core::bounded::lease_name(&opts.dest);
+    wren_core::bounded::lease(&opts.store_dir, &lease_name, &[commit_oid])?;
+    let _release = (!opts.git).then(|| Release(opts.store_dir.clone(), lease_name.clone()));
+    let store = Arc::new(ObjectStore::open(&opts.store_dir)?);
     client.ensure(&store, &[commit_oid]).await?;
     let commit = store.read_commit(&commit_oid)?;
 

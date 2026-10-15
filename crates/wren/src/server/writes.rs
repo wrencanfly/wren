@@ -33,6 +33,10 @@ pub fn routes(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
         .route("/api/v1/repos/{repo}/land", post(land))
         .route("/api/v1/repos/{repo}/refs", post(update_ref))
         .route("/api/v1/repos/{repo}/revert", post(revert))
+        .route(
+            "/api/v1/repos/{repo}/snapshot",
+            post(|State(st): St, Path(name): Path<String>| super::snapshot_build(st, name)),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(MAX_WRITE_BODY))
         .layer(axum::middleware::from_fn_with_state(
             state,

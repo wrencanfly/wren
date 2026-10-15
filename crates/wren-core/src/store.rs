@@ -163,14 +163,23 @@ impl ObjectStore {
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return Ok(0);
         }
-        let r = self.seal_loose();
+        let r = self.seal_loose().map(|s| s.map_or(0, |s| s.1));
         if r.is_err() {
             self.dirty.store(true, Ordering::SeqCst);
         }
         r
     }
 
-    fn seal_loose(&self) -> Result<usize> {
+    /// Seal every loose object into one new segment (uploaded first when
+    /// there is a bucket). Returns the segment's name and object count, or
+    /// `None` when there were no loose objects.
+    pub fn seal(&self) -> Result<Option<(String, usize)>> {
+        let _seal = self.sealing.lock().unwrap();
+        self.dirty.store(false, Ordering::SeqCst);
+        self.seal_loose()
+    }
+
+    fn seal_loose(&self) -> Result<Option<(String, usize)>> {
         let mut files = Vec::new();
         let mut objects = Vec::new();
         for fan in fs::read_dir(&self.root)?.flatten() {
@@ -189,7 +198,7 @@ impl ObjectStore {
             }
         }
         if objects.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
         let tmp = self.root.join(format!(
             "seal-{}-{}",
@@ -201,6 +210,10 @@ impl ObjectStore {
             .map(|(o, k, d)| (*o, *k, d.as_slice()))
             .collect();
         let pack = crate::pack::write_pack(&tmp, &refs)?;
+        let name = pack
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         self.add_pack(&pack)?;
         let _ = fs::remove_dir_all(&tmp);
         // Readers that miss a loose file fall back to the segment, which
@@ -208,7 +221,7 @@ impl ObjectStore {
         for f in files {
             let _ = fs::remove_file(f);
         }
-        Ok(objects.len())
+        Ok(Some((name, objects.len())))
     }
 
     /// With a bucket: download every segment this store only reads from

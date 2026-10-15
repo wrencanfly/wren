@@ -149,6 +149,27 @@ pub fn store_frame(store: &ObjectStore, oid: &Oid, payload: &Payload) -> Result<
     }
 }
 
+/// Verify a received frame against its id without storing it (the store's
+/// owner, a node daemon, already has). Returns whether it was present.
+pub fn verify_frame(store: &ObjectStore, oid: &Oid, payload: &Payload) -> Result<bool> {
+    match payload {
+        Payload::Missing => Ok(false),
+        Payload::Loose(raw) => {
+            object::decode_loose_verified(oid, raw)?;
+            Ok(true)
+        }
+        Payload::Delta(_) => {
+            // The daemon decoded and stored it; check what it stored.
+            let (kind, data) = store
+                .get(oid)?
+                .with_context(|| format!("{oid} is not in the shared store"))?;
+            let actual = Oid::hash_object(kind.as_str(), &data);
+            ensure!(actual == *oid, "object {oid} failed verification");
+            Ok(true)
+        }
+    }
+}
+
 /// Answer one requested object from `store`: whole, as a delta against
 /// `base` when that is smaller, or missing.
 pub fn encode_from_store(
