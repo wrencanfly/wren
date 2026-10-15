@@ -18,7 +18,9 @@
 //! mount journals every path it changes, and `wren fsmonitor-hook` answers
 //! git's "what changed since token T" from that journal. So `git status`
 //! looks only at what was written, instead of stat'ing (and fetching) every
-//! file. The untracked cache does the same for directory scans.
+//! file. The untracked cache does the same for directory scans. (git
+//! treats FUSE as a remote filesystem and turns fsmonitor off there unless
+//! `fsmonitor.allowRemote` is set, which the mount does.)
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -1064,6 +1066,7 @@ pub async fn setup_git(
     let mut config = format!(
         "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = false\n\
          \tfsmonitor = \"{}\"\n\tuntrackedCache = true\n\
+         [fsmonitor]\n\tallowRemote = true\n\
          [extensions]\n\tpartialclone = origin\n\
          [remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\
          \tpromisor = true\n\tpartialclonefilter = blob:none\n",
