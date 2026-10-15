@@ -19,6 +19,7 @@ use wren_core::changes::normalize_path;
 use wren_core::wire::{self, ObjectsRequest};
 use wren_core::{ObjectStore, Oid, Repo};
 
+pub mod access;
 mod git;
 mod writes;
 
@@ -34,6 +35,9 @@ pub struct ServerState {
     /// Per repo: when the last on-demand sync finished (see `resolve`).
     pub on_demand: BTreeMap<String, Mutex<Option<Instant>>>,
     pub snapshots: SnapshotConfig,
+    /// Read tokens restricted to some directories (see `access`).
+    pub acl: Vec<access::AclEntry>,
+    pub rate_limit: Option<access::RateLimit>,
 }
 
 /// Where snapshots (see `wren_core::snapshot`) are kept, and what they hold.
@@ -69,6 +73,8 @@ impl ServerState {
             write_token,
             on_demand,
             snapshots: SnapshotConfig::default(),
+            acl: Vec::new(),
+            rate_limit: None,
         }
     }
 
@@ -193,6 +199,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/repos/{repo}/sync", post(sync))
         .route("/api/v1/repos/{repo}/snapshot", get(snapshot_latest))
         .route("/api/v1/repos/{repo}/audit", get(audit))
+        .route("/api/v1/repos/{repo}/paths", get(find_paths))
         .route("/v1/snapshots/{file}", get(snapshot_file))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -201,6 +208,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .layer(axum::middleware::from_fn(move |req, next| {
             pinned_queries_are_immutable(private, req, next)
         }))
+        .layer(axum::middleware::from_fn(access::enforce))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_read_token,
@@ -208,6 +216,10 @@ pub fn router(state: Arc<ServerState>) -> Router {
     reads
         .merge(writes::routes(state.clone()))
         .merge(git::routes())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            access::rate_limit,
+        ))
         .route("/healthz", get(|| async { "ok" }))
         .layer(axum::middleware::map_response(protocol_header))
         .with_state(state)
@@ -286,7 +298,7 @@ pub async fn require_token(
 /// Reads need the read token (when one is configured) or the write token.
 async fn require_read_token(
     State(st): St,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     if let Some(t) = &st.token {
@@ -297,6 +309,16 @@ async fn require_read_token(
                     .as_deref()
                     .is_some_and(|w| constant_time_eq(got.as_bytes(), w.as_bytes()))
         });
+        // A restricted token: allowed, with its grant attached (`access`).
+        let grant = if ok {
+            None
+        } else {
+            writes::bearer(&req).and_then(|got| st.grant_for(got))
+        };
+        if let Some(g) = grant {
+            req.extensions_mut().insert(g);
+            return next.run(req).await;
+        }
         if !ok {
             return ApiError(
                 StatusCode::UNAUTHORIZED,
@@ -562,6 +584,9 @@ async fn resolve(
 struct CommitQ {
     #[serde(default)]
     changes: bool,
+    /// Also report renames and copies (git -M -C).
+    #[serde(default)]
+    renames: bool,
 }
 
 async fn commit(
@@ -572,7 +597,11 @@ async fn commit(
     let r = repo(&st, &name)?;
     blocking(move || {
         let oid = st.resolve(&r, &rev)?;
-        Ok(Json(r.commit_info(&oid, q.changes)?))
+        let mut info = r.commit_info(&oid, q.changes)?;
+        if q.renames {
+            info.copies = Some(r.derived::<wren_core::renames::Copies>(&oid)?.0.clone());
+        }
+        Ok(Json(info))
     })
     .await
 }
@@ -584,6 +613,9 @@ struct LogQ {
     limit: Option<usize>,
     #[serde(default)]
     changes: bool,
+    /// Follow the file `path` across renames (git log --follow).
+    #[serde(default)]
+    follow: bool,
 }
 
 async fn log(
@@ -594,7 +626,24 @@ async fn log(
     let r = repo(&st, &name)?;
     blocking(move || {
         let tip = st.resolve(&r, q.rev.as_deref().unwrap_or("HEAD"))?;
-        let oids = r.log(&tip, q.path.as_deref(), q.limit.unwrap_or(50).min(10_000))?;
+        let limit = q.limit.unwrap_or(50).min(10_000);
+        if q.follow {
+            let path = q
+                .path
+                .as_deref()
+                .ok_or_else(|| wren_core::bad_request("follow needs a path"))?;
+            let commits = r
+                .log_follow(&tip, path, limit)?
+                .into_iter()
+                .map(|(o, p)| {
+                    let mut info = r.commit_info(&o, q.changes)?;
+                    info.path = Some(p);
+                    Ok(info)
+                })
+                .collect::<Result<_>>()?;
+            return Ok(Json(LogResponse { commits }));
+        }
+        let oids = r.log(&tip, q.path.as_deref(), limit)?;
         let commits = oids
             .iter()
             .map(|o| r.commit_info(o, q.changes))
@@ -689,6 +738,9 @@ struct DiffQ {
     #[serde(default)]
     patch: bool,
     path: Option<String>,
+    /// Also report renames and copies (git -M -C).
+    #[serde(default)]
+    renames: bool,
 }
 
 async fn diff(
@@ -708,6 +760,11 @@ async fn diff(
                 })?,
             };
         let mut changes = r.diff(&base, &head)?;
+        let copies = if q.renames {
+            Some(wren_core::renames::detect(&r.store, &changes, true)?)
+        } else {
+            None
+        };
         if let Some(p) = q
             .path
             .as_deref()
@@ -725,6 +782,7 @@ async fn diff(
             base,
             head,
             changes,
+            copies,
             patch,
         }))
     })
@@ -825,6 +883,33 @@ async fn sync(
 ) -> ApiResult<Json<wren_core::repo::SyncReport>> {
     let r = repo(&st, &name)?;
     blocking(move || Ok(Json(r.sync()?))).await
+}
+
+#[derive(Deserialize)]
+struct PathsQ {
+    rev: Option<String>,
+    q: String,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct PathsResponse {
+    paths: Vec<wren_core::pathindex::FoundPath>,
+}
+
+/// Paths at a revision whose name contains a substring (case-insensitive).
+async fn find_paths(
+    State(st): St,
+    Path(name): Path<String>,
+    Query(q): Query<PathsQ>,
+) -> ApiResult<Json<PathsResponse>> {
+    let r = repo(&st, &name)?;
+    blocking(move || {
+        let rev = st.resolve(&r, q.rev.as_deref().unwrap_or("HEAD"))?;
+        let paths = r.find_paths(&rev, &q.q, q.limit.unwrap_or(100).min(10_000))?;
+        Ok(Json(PathsResponse { paths }))
+    })
+    .await
 }
 
 #[derive(Deserialize)]

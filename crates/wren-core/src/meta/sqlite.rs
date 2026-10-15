@@ -516,6 +516,18 @@ impl Backend for SqliteMeta {
     }
     /// One server per SQLite database: the repository's in-process lock is
     /// all the exclusion there is to have.
+    fn paths_after(&self, after: &str, limit: usize) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT DISTINCT path FROM path_index WHERE path > ?1 ORDER BY path LIMIT ?2",
+            )?;
+            let rows = st
+                .query_map(params![after, limit as i64], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok(rows)
+        })
+    }
+
     fn kv_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
         self.with(|c| {
             let mut st = c.prepare_cached(

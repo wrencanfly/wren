@@ -17,6 +17,8 @@ pub mod meta;
 pub mod object;
 pub mod oid;
 pub mod pack;
+pub mod pathindex;
+pub mod renames;
 pub mod repo;
 pub mod segments;
 pub mod snapshot;

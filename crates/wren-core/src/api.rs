@@ -61,7 +61,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// changes what it returns (e.g. a different line-diff heuristic in blame),
 /// this is bumped, and caches key stored answers by it so old and new answers
 /// never mix. Sent on every response as the `wren-semantics` header.
-pub const QUERY_SEMANTICS: &str = "1";
+pub const QUERY_SEMANTICS: &str = "2";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RefInfo {
@@ -90,6 +90,12 @@ pub struct CommitInfo {
     pub depth: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changes: Option<Vec<Change>>,
+    /// Renames and copies among `changes` (with `renames=1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copies: Option<Vec<crate::renames::CopyInfo>>,
+    /// In `log --follow`: the file's name in this commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// `GET .../bisect?good=&bad=`: one step of first-parent bisection.
@@ -133,6 +139,9 @@ pub struct DiffResponse {
     pub base: Oid,
     pub head: Oid,
     pub changes: Vec<Change>,
+    /// Renames and copies among `changes` (with `renames=1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copies: Option<Vec<crate::renames::CopyInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patch: Option<String>,
 }
@@ -199,6 +208,8 @@ impl Repo {
             } else {
                 None
             },
+            copies: None,
+            path: None,
         })
     }
 

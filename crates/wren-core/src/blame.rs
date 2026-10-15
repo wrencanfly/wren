@@ -33,7 +33,8 @@ use crate::repo::Repo;
 /// added the step number, and switched the line diff from a minimal Myers
 /// diff to git's (Myers with git's slider/indent heuristic), so rows of v1
 /// must not be mixed in.
-const KIND: &str = "blame.v2";
+/// v3 follows renames (git `-M`, as `git blame` does by default).
+const KIND: &str = "blame.v3";
 
 /// Every change of a file whose (non-zero) step number is a multiple of this
 /// is persisted as a checkpoint.
@@ -137,6 +138,10 @@ struct Chain {
     /// The persisted change just before the oldest step (or the requested
     /// change, if `steps` is empty). None if the oldest step created the file.
     base: Option<Oid>,
+    /// When the oldest step created the file by renaming another: the old
+    /// path and the first parent, whose blame of the old path the oldest
+    /// step starts from.
+    renamed: Option<(String, Oid)>,
 }
 
 /// A blob id and its contents.
@@ -232,6 +237,7 @@ impl Repo {
                     return Ok(Chain {
                         steps,
                         base: Some(c),
+                        renamed: None,
                     });
                 }
                 let blob = blob.with_context(|| format!("blame: {path} missing at change {c}"))?;
@@ -241,14 +247,39 @@ impl Repo {
                         bail!("blame: history of {path} is inconsistent at {c}");
                     }
                 }
+                if prev.is_none() {
+                    // Created here: renamed from another file?
+                    let parent = self.node(&c)?.parents.first().copied();
+                    if let (Some(parent), Some(old)) = (parent, self.renamed_from(&c, path)?) {
+                        if let Some(old_blob) = self.file_blob(&parent, &old)? {
+                            steps.push(Step {
+                                commit: c,
+                                blob,
+                                prev: Some(old_blob),
+                            });
+                            return Ok(Chain {
+                                steps,
+                                base: None,
+                                renamed: Some((old, parent)),
+                            });
+                        }
+                    }
+                    steps.push(Step {
+                        commit: c,
+                        blob,
+                        prev: None,
+                    });
+                    return Ok(Chain {
+                        steps,
+                        base: None,
+                        renamed: None,
+                    });
+                }
                 steps.push(Step {
                     commit: c,
                     blob,
                     prev,
                 });
-                if prev.is_none() {
-                    return Ok(Chain { steps, base: None });
-                }
                 tip = c;
             }
             match page.last() {
@@ -269,8 +300,7 @@ impl Repo {
         let Some(blob) = self.file_blob(rev, &path)? else {
             return Ok(None);
         };
-        let chain = self.change_chain(rev, &path)?;
-        let (data, newest) = self.derive_chain(&path, chain)?;
+        let (data, newest) = self.blame_data(rev, &path)?;
         let content = match newest {
             Some((b, content)) if b == blob => content,
             _ => Arc::new(self.store.read_blob(&blob)?),
@@ -298,17 +328,26 @@ impl Repo {
         ))
     }
 
+    /// Blame data for the file `path` (normalized) as of `rev`, and the
+    /// newest change's blob and contents if they were read.
+    fn blame_data(&self, rev: &Oid, path: &str) -> Result<(BlameData, Option<Blob>)> {
+        let chain = self.change_chain(rev, path)?;
+        self.derive_chain(path, chain)
+    }
+
     /// Blame data at the newest change of `chain`, plus that change's blob
     /// and contents if they were read. Persists the result and checkpoints.
     fn derive_chain(&self, path: &str, chain: Chain) -> Result<(BlameData, Option<Blob>)> {
-        let mut prev: Option<BlameData> = match chain.base {
-            Some(b) => Some(BlameData::decode(
+        let mut prev: Option<BlameData> = match (chain.base, &chain.renamed) {
+            (Some(b), _) => Some(BlameData::decode(
                 &self
                     .meta
                     .get_derived(KIND, &key(path, &b))?
                     .context("blame: persisted value vanished")?,
             )?),
-            None => None,
+            // Renamed: start from the old file's blame at the parent.
+            (None, Some((old, parent))) => Some(self.blame_data(parent, old)?.0),
+            (None, None) => None,
         };
         let mut steps = chain.steps;
         if steps.is_empty() {

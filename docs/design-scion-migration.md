@@ -1,6 +1,6 @@
 # 设计：Wren 向 Scion 架构迁移
 
-> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15，M3d ✅ 2026-10-15，M4 ✅ 2026-10-15，M5 ✅ 2026-10-15**，其余待做。
+> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15，M3d ✅ 2026-10-15，M4 ✅ 2026-10-15，M5 ✅ 2026-10-15，M6 ✅ 2026-10-15**，M7 待评估。
 > 范围：用户选择"全面 Scion 化"，即下文 M1–M7 全部纳入路线图。
 > 这推翻了 v0.1 的定位（只读、git 主机是数据源、"不做服务端写入"），也推翻了
 > [reviews/04](reviews/04-positioning-vs-intent.md) 和 [reviews/08](reviews/08-synthesis.md)
@@ -642,6 +642,57 @@ write-proxy 模式下 push 同步先到主机。
 - **按客户端限流**：每个 token 一个令牌桶。
 
 ---
+
+
+### 7.1 实现（M6 ✅）
+
+**path history 成为派生类型**（`wren_core::pathindex`）
+
+- `PathIndex` 是一个普通的 `Derivable`：值是 changeset 改动的路径（含各级父目录）和
+  代数号，由 changeset 和父节点的值定义。它的值物化进 `path_index` 表（`log -- path`
+  和 blame 按 (path, generation) 读这张表），和 changeset 在同一个事务里写入。
+- 通用派生机制新增 `RECURSIVE = false`：只依赖本 changeset 的类型（如重命名）按需
+  单独派生，不会顺着祖先一路补算。
+
+**重命名和复制**（`wren_core::renames`，派生类型 `Copies`，按需派生并持久化）
+
+- 精确：删除和新增的 blob 相同（多个候选时优先同名文件）。
+- 相似度：逐字照搬 git 的 `diffcore-delta`：按换行或每 64 字节切块、滚动哈希模
+  107927、统计共同字节，分数 = 共同字节 / 较大文件大小，阈值 50%，并带 git 的大小
+  预筛。候选按分数降序、同名优先分配，每个源最多一次重命名。
+- 复制（`-C`）：源还包括同一 changeset 里被修改文件的旧版本。
+- `log --follow`：按路径索引往回走；遇到"这个提交创建了该文件"且它是重命名而来，
+  就换成旧名从第一父节点继续。
+- **blame 跨重命名**（和 `git blame` 默认一致）：链走到文件被创建的那一步时，如果
+  是重命名，就以第一父节点上旧路径的 blame 为起点，对旧 blob → 新 blob 做一次行
+  diff。持久化的 blame 换成 `blame.v3`；**查询语义版本升到 2**，各层缓存里的旧答案
+  因此自动失效。
+- API：`log?follow=1&path=…`（每条带 `path`）、`diff?renames=1` 和
+  `commits/{rev}?changes=1&renames=1`（`copies` 字段）；CLI：`wren log --follow`、
+  `wren diff -M --name-status`（输出与 `git diff -M --name-status` 逐行相同）。
+- 差分测试（`crates/wren-core/tests/renames.rs`）：随机线性历史，含纯重命名、小改
+  动重命名、改写后重命名（git 不配对），对比 `git diff-tree -M`（配对和相似度分数）、
+  `git log --follow`、`git blame`，25 个种子全部一致。每个提交只有一个候选源；多个
+  同样好的候选时，git 还会用基名启发式，结果可能不同（已写明）。
+
+**路径搜索**：所有曾经新增过的路径（小写）的 trigram，作为派生行 `path3:<三字节><路径>`
+在摄入时写入；旧数据库第一次查询时从路径索引回填一次。查询 ≥ 3 个字符时取各
+trigram 的路径集合求交、校验子串，再保留在该版本存在的路径；更短的查询遍历树。
+`GET /api/v1/repos/{repo}/paths?q=…&rev=…`，CLI `wren find`。内容的 trigram 索引仍未做。
+
+**目录级 ACL**（`--acl FILE`，需要 `--token`）
+
+- 受限 token 只能用查询 API：别的仓库当作不存在；`file`、`blame`、`log` 必须给出
+  授权目录内的路径（不能列整个历史）；`tree` 只列授权目录和通往它们的目录；`diff`、
+  `commits/{rev}`、`log`、`grep`、`paths` 的结果按授权路径过滤，并标为 `no-store`。
+- 对象面（`/v1/objects`、快照）、git 前端、写入和审计日志一律拒绝受限 token。原因
+  就是计划里写的难点：对象按哈希寻址，缓存无法判断对象属于哪个目录，一个提交的
+  根树就能牵出全部对象。所以计划中"签发授权 + 逐级验证路径"的对象面方案没有做，
+  改为受限 token 不碰对象面；cache 仍是一个信任域，受限 token 直连 server。
+- 授权目录内提交的提交信息和作者仍然可见。
+
+**按客户端限流**（`--rate-limit N`）：每个客户端（按凭据，没有凭据按 IP）一个令牌桶，
+每秒 N 个、突发 2N，超出返回 `429` 和 `Retry-After`。
 
 ## 8. M7：虚拟化检出（可选，D3）
 

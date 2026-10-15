@@ -128,6 +128,7 @@ pub(crate) trait Backend: Send + Sync {
     fn get_kv(&self, key: &str) -> Result<Option<String>>;
     fn set_kv(&self, key: &str, value: &str) -> Result<()>;
     fn kv_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>>;
+    fn paths_after(&self, after: &str, limit: usize) -> Result<Vec<String>>;
     fn lock(&self, name: &str) -> Result<MetaLock>;
     fn append_log(&self, stream: &str, data: &[u8]) -> Result<i64>;
     fn read_log(&self, stream: &str, after: i64, limit: usize) -> Result<Vec<(i64, Vec<u8>)>>;
@@ -233,6 +234,10 @@ impl MetaDb {
     }
     pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {
         self.backend.set_kv(key, value)
+    }
+    /// Distinct paths in the path index after `after`, in order.
+    pub fn paths_after(&self, after: &str, limit: usize) -> Result<Vec<String>> {
+        self.backend.paths_after(after, limit)
     }
     /// Refs the exporter has pushed to the git host (`exported:<ref>` keys
     /// with a value).

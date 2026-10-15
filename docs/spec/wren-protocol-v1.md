@@ -54,6 +54,7 @@ to do; they do not mean the draft is final.
 14. [Writes](#14-writes)
 15. [Snapshots](#15-snapshots)
 16. [git protocol front end](#16-git-protocol-front-end)
+17. [Access control and rate limits](#17-access-control-and-rate-limits)
 
 ---
 
@@ -155,7 +156,7 @@ shape is identical on every tier.
     "on-demand-sync",
     "error-codes"
   ],
-  "semantics": "1"
+  "semantics": "2"
 }
 ```
 
@@ -850,6 +851,7 @@ check that the server knows a commit.
 | `path` | no | none | Restrict to commits whose changeset touched this path ([§4.0.4](#404-path-parameters)). |
 | `limit` | no | `50` | Maximum number of commits. Values above `10000` are silently clamped to `10000`. `0` returns an empty list. |
 | `changes` | no | `false` | Include `changes` in each CommitInfo. |
+| `follow` | no | `false` | With a file `path`: continue under the file's earlier name across renames (git `log --follow`, rename detection as in [§4.10](#410-diff)). Each CommitInfo then carries `path`, the file's name in that commit. |
 
 **Response** `200`:
 
@@ -1022,6 +1024,16 @@ call they make uses full oids, so every call is a pinned query
 | `base` | no | first parent of `head` | Revision of the old side. If omitted and `head` is a root commit, the request fails with `400` (`root commit has no parent; pass base`). |
 | `path` | no | none | Keep only changes whose path equals the normalised `path` or lies below it. |
 | `patch` | no | `false` | Also render a unified diff. |
+| `renames` | no | `false` | Also report renames and copies among the changes (`copies`, below). |
+
+With `renames=true` the response has `copies`: `[{"from": "docs/guide.md",
+"to": "docs/manual.md", "score": 96, "kind": "rename"}]`. Detection follows
+git's `-M -C` at 50%: exact matches first, then git's similarity estimate
+(`diffcore-delta`) between deleted (and, for copies, modified) files and added
+files, best scores first, each source renamed at most once. `score` is git's
+similarity index (100: identical). `changes` is unchanged: a rename still
+appears there as a deletion and an addition. `GET commits/{rev}?changes=true&renames=true`
+reports the same for a commit against its first parent.
 
 **Response** `200`:
 
@@ -1066,6 +1078,11 @@ byte-identical to `git diff` (see [Open issues](#13-open-issues), item 16).
 |---|---|---|---|
 | `rev` | no | `HEAD` | Revision. |
 | `path` | yes in practice | `""` | File to blame. An empty or missing path is the root directory, so it yields `404`. |
+
+Blame follows renames on the first-parent history, as `git blame
+--first-parent` does: when the file was created by renaming another
+([§4.10](#410-diff)), its lines are traced into the earlier name. (Since
+query semantics version `2`.)
 
 **Response** `200`:
 
@@ -1216,6 +1233,14 @@ is classified as a client error ([§6.2](#62-status-codes),
 [Open issues](#13-open-issues), item 23). A failed attempt is recorded in
 `last_sync_error` ([§4.1](#41-list-repositories)). A cache forwards this
 request upstream and never caches it.
+
+### 4.16 Paths
+
+`GET /api/v1/repos/{repo}/paths?q=<text>&rev=<rev>&limit=<n>` lists files and
+directories at `rev` (default `HEAD`) whose path contains `q`,
+case-insensitively, sorted, at most `limit` (default 100, at most 10 000):
+`{"paths": [{"path": "src/secret/keys.rs", "type": "file"}]}` (`type`:
+`file`, `dir`, `symlink`, `submodule`). Pinned like any other query.
 
 ### 4.15 Grep
 
@@ -1426,6 +1451,7 @@ Errors produced by Wren handlers and middleware have
 | `403` | `forbidden` |
 | `409` | `conflict` |
 | `413` | `too_large` |
+| `429` | `rate_limited` (with `Retry-After`, seconds) |
 | `502`, `504` | `upstream_unavailable` (no tier sends `504` today) |
 | any other, in practice `500` | `internal` |
 
@@ -2440,4 +2466,31 @@ Authentication: HTTP Basic with any user name and a token as the password
 (read or write token to fetch, the write token to push), or a Bearer token.
 Requests without credentials get `401` with `WWW-Authenticate: Basic`. Caches
 do not serve these routes.
+
+---
+
+## 17. Access control and rate limits
+
+**Restricted read tokens.** A server MAY accept read tokens limited to some
+repositories and, within them, to some directories (reference: `--acl
+FILE`). Such a token can use only the query API, and:
+
+* repositories outside its grant answer `404`;
+* `file`, `blame` and `log` need a `path` inside a granted directory
+  (`404` for `file`/`blame`, `403` for `log`; `log` cannot list the whole
+  history);
+* `tree` lists granted directories and the directories leading to them;
+  other directories answer `404`;
+* `diff`, `commits/{rev}`, `log` (with changes), `grep` and `paths` answers
+  are filtered to granted paths and carry `Cache-Control: no-store`;
+* the object plane (§3), snapshots (§15), the git front end (§16), writes
+  (§14) and the audit log refuse the token: an object's hash does not say
+  which directory it belongs to, so the object plane cannot be filtered.
+
+Caches do not know about restricted tokens; such tokens talk to the server.
+Commit metadata of commits that touched granted paths stays visible.
+
+**Rate limits.** A server MAY limit each client (reference: per credential,
+or per address without one; `--rate-limit N` per second with a burst of
+`2N`) and answer `429` with code `rate_limited` and `Retry-After`.
 

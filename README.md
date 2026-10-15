@@ -82,7 +82,7 @@ principle and says where it still differs.
 | No packfiles and no maintenance; contents in object storage; distributed metadata | Immutable segments (git's pack format, never repacked): git/git in 331 MiB. Delta frames on the wire. Segments in S3, GCS or Azure, read by range; Postgres metadata shared by stateless servers | ✅ M3 |
 | A daemon per node with a bounded cache, seeded from snapshots; strict tiering | `wren daemon`: generational eviction under a byte budget, leases for git checkouts, snapshot seeding; node → region → server enforced at startup; turmoil simulation of the tiers with fault injection | ✅ M4 |
 | The server is the source of truth; older git clients still work | Stock git clones, fetches (partial clones too) and pushes through Wren's git protocol front end; with `--source-of-truth wren` the git host becomes a downstream mirror. Protected refs, a policy hook and an audit log replace the host's protections | ✅ M5 |
-| Path history, copy detection and search indexes; directory permissions | Planned | M6 |
+| Path history, copy detection and search indexes; directory permissions | The path index is a derived type; renames and copies are detected as git does (`log --follow`, blame across renames, `diff -M`); path search by trigrams; read tokens restricted to directories; per-client rate limits | ✅ M6 |
 | Virtualized checkouts | Optional | M7 |
 
 |  |  |
@@ -314,8 +314,9 @@ gates for each milestone.
   strict tiering, and simulation tests of the tiers with fault injection.
 - **M5, source of truth.** Done: a git protocol front end so stock git can clone,
   fetch and push through Wren, with the git host as a downstream mirror.
-- **M6, indexes and permissions.** Path history through the derived-data
-  mechanism, copy and rename detection, search indexes, directory ACLs.
+- **M6, indexes and permissions.** Done: path history through the
+  derived-data mechanism, rename and copy detection, path search, directory
+  ACLs for queries, per-client rate limits. Content search indexes remain.
 - **Upstream.** Send the [sparse/promisor report](docs/upstream/git-sparse-promisor.md)
   to the git list, and refine the [draft git protocol v2 extensions](docs/upstream/git-protocol-v2-query.md).
 

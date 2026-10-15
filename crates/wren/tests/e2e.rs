@@ -505,7 +505,13 @@ fn end_to_end() {
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
         assert!(text.contains("wren-protocol: 1"), "{text}");
-        assert!(text.contains("wren-semantics: 1"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "wren-semantics: {}",
+                wren_core::api::QUERY_SEMANTICS
+            )),
+            "{text}"
+        );
         assert!(text.contains("\"protocol\":1"), "{text}");
     }
 

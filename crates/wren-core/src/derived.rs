@@ -26,6 +26,10 @@ use crate::repo::Repo;
 pub trait Derivable: Sized + Send + Sync + 'static {
     /// Stable name; part of the storage key.
     const KIND: &'static str;
+    /// Whether a value depends on the parents' values. A type that depends
+    /// on its changeset alone (e.g. its renames) is derived on its own,
+    /// without walking to ancestors that lack a value.
+    const RECURSIVE: bool = true;
 
     /// Compute the value for `cs` from the values of its parents (in parent
     /// order). Implementations may read other derived values of ancestors.
@@ -80,6 +84,17 @@ impl Repo {
     /// histories do not overflow the stack.
     pub fn derived<D: Derivable>(&self, oid: &Oid) -> Result<Arc<D>> {
         if let Some(v) = self.derived_if_present::<D>(oid)? {
+            return Ok(v);
+        }
+        if !D::RECURSIVE {
+            let row = self
+                .meta
+                .changeset(oid)?
+                .ok_or_else(|| crate::not_found(format!("unknown changeset {oid}")))?;
+            let v = Arc::new(D::derive(self, &row, &[])?);
+            self.meta
+                .put_derived(D::KIND, oid.as_bytes(), &v.encode())?;
+            self.memo.lock().unwrap().put(*oid, v.clone());
             return Ok(v);
         }
         let mut done: HashMap<Oid, Arc<D>> = HashMap::new();

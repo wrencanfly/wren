@@ -2965,6 +2965,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turmoil",
+ "url",
  "wren-vcs-core",
 ]
 

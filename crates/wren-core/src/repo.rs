@@ -466,30 +466,38 @@ impl Repo {
         changes: &[Change],
         tree: Oid,
     ) -> Result<()> {
-        // Generation number, from the (already ingested) parents. The path
-        // index needs it, and it must be written in the same transaction as
-        // the changeset: a changeset that exists is never re-ingested, so an
-        // index row lost to a crash between two writes would never come back.
-        let mut generation = 1;
-        for p in &row.parents {
-            generation = generation.max(self.node(p)?.generation + 1);
-        }
-        // Every changed path and each of its parent directories.
-        let mut paths = BTreeSet::new();
-        for c in changes {
-            let mut p = c.path.as_str();
-            paths.insert(p.to_string());
-            while let Some(i) = p.rfind('/') {
-                p = &p[..i];
-                paths.insert(p.to_string());
-            }
-        }
+        // The path index (a derived type, see `pathindex`) is derived
+        // eagerly and written in the same transaction as the changeset,
+        // materialized into its table: a changeset that exists is never
+        // re-ingested, so an index row lost to a crash between two writes
+        // would never come back. Its generation comes from the (already
+        // ingested) parents.
+        let generation = 1 + row
+            .parents
+            .iter()
+            .map(|p| self.node(p).map(|n| n.generation))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        let index = crate::pathindex::PathIndex {
+            generation,
+            paths: crate::pathindex::changed_paths(changes),
+        };
+        let index_value = index.encode();
+        let trigrams = crate::pathindex::trigram_keys(changes);
         let oid = &row.oid;
         let mut ops = vec![WriteOp::Changeset(row)];
-        ops.extend(paths.iter().map(|p| WriteOp::PathIndex {
-            path: p,
-            generation,
-            oid,
+        ops.extend(index.rows(oid));
+        ops.push(WriteOp::Derived {
+            kind: crate::pathindex::PathIndex::KIND,
+            key: oid.as_bytes(),
+            value: &index_value,
+        });
+        ops.extend(trigrams.iter().map(|k| WriteOp::Derived {
+            kind: crate::pathindex::TRIGRAMS,
+            key: k,
+            value: b"",
         }));
         // The tree is derived data, but descendants derive theirs from it,
         // so it is persisted with the changeset.

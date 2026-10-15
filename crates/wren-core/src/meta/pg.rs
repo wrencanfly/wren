@@ -532,6 +532,18 @@ impl Backend for PgMeta {
         })
     }
 
+    fn paths_after(&self, after: &str, limit: usize) -> Result<Vec<String>> {
+        let q = self
+            .sql("SELECT DISTINCT path FROM {s}.path_index WHERE path > $1 ORDER BY path LIMIT $2");
+        let (after, limit) = (after.to_string(), limit as i64);
+        self.run(move |c| {
+            Ok(c.query(&q, &[&after, &limit])?
+                .iter()
+                .map(|r| r.get(0))
+                .collect())
+        })
+    }
+
     fn kv_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
         let q = self.sql(
             "SELECT key, value FROM {s}.kv WHERE substr(key, 1, length($1)) = $1 ORDER BY key",

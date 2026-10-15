@@ -122,6 +122,14 @@ enum Cmd {
         /// while Wren is the source of truth.
         #[arg(long, default_value_t = 200)]
         export_every_ms: u64,
+        /// Read tokens restricted to directories (a JSON file; see
+        /// `server::access`). Needs --token.
+        #[arg(long, value_name = "FILE")]
+        acl: Option<PathBuf>,
+        /// Requests per second per client (token, or address without one);
+        /// bursts of twice that. Beyond it: 429.
+        #[arg(long, value_name = "N")]
+        rate_limit: Option<f64>,
     },
     /// Run a caching tier in front of a server or another cache.
     Cache {
@@ -229,6 +237,19 @@ enum Cmd {
         path: Option<String>,
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
+        /// Follow a file across renames (like git log --follow).
+        #[arg(long)]
+        follow: bool,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Find paths whose name contains a string (case-insensitive).
+    Find {
+        query: String,
+        #[arg(long, default_value = "HEAD")]
+        rev: String,
+        #[arg(short = 'n', long, default_value_t = 100)]
+        limit: usize,
         #[command(flatten)]
         target: Target,
     },
@@ -256,6 +277,9 @@ enum Cmd {
         name_status: bool,
         #[arg(long)]
         path: Option<String>,
+        /// Detect renames and copies (with --name-status: R/C lines).
+        #[arg(short = 'M', long = "find-renames")]
+        renames: bool,
         #[command(flatten)]
         target: Target,
     },
@@ -666,6 +690,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             protect,
             policy_hook,
             export_every_ms,
+            acl,
+            rate_limit,
         } => {
             let meta = match meta {
                 Some(url) => wren_core::meta::MetaConfig::Postgres(url),
@@ -743,7 +769,23 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     hook: hook.clone(),
                 };
             }
+            let acl = match acl {
+                Some(f) => {
+                    anyhow::ensure!(
+                        token.is_some(),
+                        "--acl needs --token: without it every repository is open to anyone"
+                    );
+                    let parsed: server::access::AclFile = serde_json::from_slice(
+                        &std::fs::read(&f).with_context(|| format!("reading {}", f.display()))?,
+                    )
+                    .with_context(|| format!("parsing {}", f.display()))?;
+                    parsed.tokens
+                }
+                None => Vec::new(),
+            };
             let mut state = server::ServerState::new(store, map, token, write_token);
+            state.acl = acl;
+            state.rate_limit = rate_limit.map(server::access::RateLimit::new);
             state.snapshots = server::SnapshotConfig {
                 dir: Some(data.join("snapshots")),
                 cone: snapshot_cone,
@@ -758,7 +800,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 "wren server listening on http://{listen} ({} repos)",
                 state.repos.len()
             );
-            axum::serve(listener, server::router(state)).await?;
+            axum::serve(
+                listener,
+                server::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
         }
         Cmd::Cache {
             upstream,
@@ -926,6 +972,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             rev,
             path,
             limit,
+            follow,
             target,
         } => {
             let c = need_repo(&target).await?;
@@ -934,11 +981,24 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if let Some(p) = &path {
                 q.push(("path", p));
             }
+            if follow {
+                anyhow::ensure!(path.is_some(), "--follow needs a path (after --)");
+                q.push(("follow", "true"));
+            }
             let r: LogResponse = c.get("log", &q).await?;
             if target.json {
                 return print_json(&r).map(|_| ExitCode::SUCCESS);
             }
+            let mut name: Option<String> = None;
             for ci in r.commits {
+                if follow && ci.path != name {
+                    if let Some(p) = &ci.path {
+                        if let Some(newer) = &name {
+                            println!("  (earlier: {p}, renamed to {newer} above)");
+                        }
+                        name = Some(p.clone());
+                    }
+                }
                 let first = ci.message.lines().next().unwrap_or("");
                 println!(
                     "{} {} {:<16} {}",
@@ -947,6 +1007,28 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     truncate(&ci.author.name, 16),
                     first
                 );
+            }
+        }
+        Cmd::Find {
+            query,
+            rev,
+            limit,
+            target,
+        } => {
+            let c = need_repo(&target).await?;
+            let limit_s = limit.to_string();
+            let r: serde_json::Value = c
+                .get(
+                    "paths",
+                    &[("q", query.as_str()), ("rev", &rev), ("limit", &limit_s)],
+                )
+                .await?;
+            if target.json {
+                return print_json(&r).map(|_| ExitCode::SUCCESS);
+            }
+            for p in r["paths"].as_array().into_iter().flatten() {
+                let suffix = if p["type"] == "dir" { "/" } else { "" };
+                println!("{}{suffix}", p["path"].as_str().unwrap_or(""));
             }
         }
         Cmd::Show { rev, target } => {
@@ -1002,6 +1084,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             base,
             name_status,
             path,
+            renames,
             target,
         } => {
             let c = need_repo(&target).await?;
@@ -1015,13 +1098,42 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if !name_status {
                 q.push(("patch", "true"));
             }
+            if renames {
+                q.push(("renames", "true"));
+            }
             let d: DiffResponse = c.get("diff", &q).await?;
             if target.json {
                 return print_json(&d).map(|_| ExitCode::SUCCESS);
             }
             if name_status {
-                for ch in d.changes {
-                    println!("{}\t{}", ch.status.letter(), ch.path);
+                // Renames replace their delete/add pair, as in git.
+                let copies = d.copies.unwrap_or_default();
+                let renamed_from: std::collections::HashSet<&str> = copies
+                    .iter()
+                    .filter(|c| c.kind == wren_core::renames::CopyKind::Rename)
+                    .map(|c| c.from.as_str())
+                    .collect();
+                let mut lines: Vec<(String, String)> = Vec::new();
+                for ch in &d.changes {
+                    if let Some(c) = copies.iter().find(|c| c.to == ch.path) {
+                        let l = match c.kind {
+                            wren_core::renames::CopyKind::Rename => 'R',
+                            wren_core::renames::CopyKind::Copy => 'C',
+                        };
+                        lines.push((
+                            c.to.clone(),
+                            format!("{l}{:03}\t{}\t{}", c.score, c.from, c.to),
+                        ));
+                    } else if !renamed_from.contains(ch.path.as_str()) {
+                        lines.push((
+                            ch.path.clone(),
+                            format!("{}\t{}", ch.status.letter(), ch.path),
+                        ));
+                    }
+                }
+                lines.sort();
+                for (_, l) in lines {
+                    println!("{l}");
                 }
             } else {
                 print!("{}", d.patch.unwrap_or_default());

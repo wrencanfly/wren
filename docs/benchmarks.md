@@ -132,22 +132,34 @@ Delta frames and packed storage are on the roadmap.
 
 | | |
 |---|---|
-| Initial sync (all objects + 85,545 changesets + commit graph + path index) | about 55 s since M3a (fetched pack kept whole); 173–217 s before, when it was exploded into loose objects |
+| Initial sync (all objects + 85,545 changesets + commit graph + path index) | about 61 s since M6 (55 s in M3a; M6 adds the derived path index values and path-search trigrams); 173–217 s before M3a, when packs were exploded into loose objects |
 | Objects imported | 421,115, in one segment |
 | Server-side git mirror after sync | 4.3 MiB (refs only; fetched packs move into the object store as segments) |
 | Object store after sync | 331 MiB on disk (see [Costs](#costs)) |
 
 ## Blame agreement with git
 
-- **Renames.** Git blame follows whole-file renames
-  (`builtin-blame.c` → `builtin/blame.c`) and Wren does not.
-- **Agreement.** On the 884 lines git did not trace through a rename, Wren
-  agrees on **all 884**. It used to agree on 873 (98.8%), with a minimal Myers
-  diff. It now uses git's own choice of diff: Myers followed by hunk sliding
-  with the indent heuristic (imara-diff).
-- **Remaining differences.** The two implementations can still align a hunk
-  differently in rare cases: 185 of the 188 diffs in this file's history are
-  identical to git's, and the other 3 change no line of the final blame.
+Compared with `git blame --first-parent` at `master`, line by line (the
+commit each line is attributed to, and its line number there):
+
+| File | Lines | Agree | Notes |
+|---|---:|---:|---|
+| `builtin/blame.c` | 1,334 | 1,324 (99.3%) | renamed twice (`builtin-pickaxe.c` → `builtin-blame.c` → `builtin/blame.c`) |
+| `builtin/log.c` | 2,820 | 2,812 (99.7%) | renamed once |
+| `diff.c` | 7,860 | 7,812 (99.4%) | never renamed |
+
+- **Renames.** Since M6 Wren follows renames as git does (before, the 450
+  lines of `builtin/blame.c` that git traces through its renames were all
+  attributed to the rename commit; on the other 884 lines Wren agreed on all
+  884).
+- **Remaining differences.** Both use Myers with hunk sliding and the indent
+  heuristic, but on files with many repeated lines the two diff
+  implementations occasionally align a hunk differently, and the difference
+  is inherited by later versions. The differential test suite, whose lines are
+  unique, agrees on every line.
+- `log --follow --first-parent -- builtin/blame.c` lists the same 270 commits
+  as git, across both renames, in 13 ms (git's `log --follow`, which walks
+  every parent: 524 ms).
 
 ## Corrections
 
