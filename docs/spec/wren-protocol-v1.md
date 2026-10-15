@@ -2444,7 +2444,7 @@ A server MAY serve git's smart HTTP protocol at `/git/{repo}` (a trailing
 
 | Route | |
 |---|---|
-| `GET /git/{repo}/info/refs?service=git-upload-pack` | Protocol v2 capability advertisement (requires `Git-Protocol: version=2`; git ≥ 2.26 sends it). Capabilities: `ls-refs=unborn`, `fetch=filter`, `object-format=sha1`. |
+| `GET /git/{repo}/info/refs?service=git-upload-pack` | Protocol v2 capability advertisement (requires `Git-Protocol: version=2`; git ≥ 2.26 sends it). Capabilities: `ls-refs=unborn`, `fetch=shallow filter`, `object-format=sha1`. `shallow` lets shallow repositories (Wren's `--git` checkouts and mounts) fetch lazily; their `shallow` lines are accepted, `deepen` requests are refused. |
 | `POST /git/{repo}/git-upload-pack` | `ls-refs` (`peel`, `symrefs`, `ref-prefix`, `unborn`) and `fetch` (`want`, `have`, `done`, `filter blob:none` / `blob:limit=<n>`, `include-tag`, `thin-pack`). Shallow fetches are refused. |
 | `GET /git/{repo}/info/refs?service=git-receive-pack` | Ref advertisement for pushes (capabilities `report-status delete-refs side-band-64k quiet ofs-delta no-thin`). |
 | `POST /git/{repo}/git-receive-pack` | A push: commands and a pack. |

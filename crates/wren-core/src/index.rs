@@ -54,6 +54,27 @@ const SKIP_WORKTREE: u16 = 0x4000;
 const EXTENDED: u16 = 0x4000;
 
 pub fn write_index(path: &Path, entries: &mut [IndexEntry]) -> Result<()> {
+    write_index_with(path, entries, None, &[])
+}
+
+/// A directory for git's cache-tree extension (`TREE`): its path ("" for
+/// the root) and its tree id. Entry and subtree counts are computed from
+/// the index entries.
+pub struct CachedTree {
+    pub path: String,
+    pub oid: Oid,
+}
+
+/// `write_index`, optionally with git's fsmonitor extension (`FSMN`, version
+/// 2): `token` is what git will hand the fsmonitor hook next, and every
+/// entry is marked valid (an empty "dirty" bitmap), so git trusts the index
+/// for every path the hook does not report as changed, without a stat.
+pub fn write_index_with(
+    path: &Path,
+    entries: &mut [IndexEntry],
+    fsmonitor_token: Option<&str>,
+    trees: &[CachedTree],
+) -> Result<()> {
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let extended = entries.iter().any(|e| e.skip_worktree);
     let version: u32 = if extended { 3 } else { 2 };
@@ -90,6 +111,74 @@ pub fn write_index(path: &Path, entries: &mut [IndexEntry]) -> Result<()> {
     if entries.iter().any(|e| e.path.last() == Some(&b'/')) {
         b.extend(b"sdir");
         b.extend(0u32.to_be_bytes());
+    }
+    if !trees.is_empty() {
+        // Cache tree: every directory's tree id is already known, so git
+        // writes a commit's tree by recomputing only the directories whose
+        // entries changed (and checks only their blobs).
+        let mut ext = Vec::new();
+        let ids: std::collections::HashMap<&str, &Oid> =
+            trees.iter().map(|t| (t.path.as_str(), &t.oid)).collect();
+        // Children of each directory, sorted as git sorts paths.
+        let mut children: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for t in trees.iter().filter(|t| !t.path.is_empty()) {
+            let parent = t.path.rsplit_once('/').map_or("", |(p, _)| p);
+            children.entry(parent).or_default().push(&t.path);
+        }
+        for v in children.values_mut() {
+            v.sort_by(|a, b| {
+                let (a, b) = (format!("{a}/"), format!("{b}/"));
+                a.cmp(&b)
+            });
+        }
+        let count = |dir: &str| {
+            let prefix = format!("{dir}/");
+            entries
+                .iter()
+                .filter(|e| dir.is_empty() || e.path.starts_with(prefix.as_bytes()))
+                .count()
+        };
+        fn walk(
+            dir: &str,
+            ids: &std::collections::HashMap<&str, &Oid>,
+            children: &std::collections::BTreeMap<&str, Vec<&str>>,
+            count: &dyn Fn(&str) -> usize,
+            ext: &mut Vec<u8>,
+        ) {
+            let name = dir.rsplit('/').next().unwrap_or(dir);
+            let subs = children.get(dir).map_or(&[][..], |v| v.as_slice());
+            ext.extend(name.as_bytes());
+            ext.push(0);
+            ext.extend(format!("{} {}\n", count(dir), subs.len()).as_bytes());
+            ext.extend(ids[dir].0);
+            for s in subs {
+                walk(s, ids, children, count, ext);
+            }
+        }
+        if ids.contains_key("") {
+            walk("", &ids, &children, &count, &mut ext);
+            b.extend(b"TREE");
+            b.extend((ext.len() as u32).to_be_bytes());
+            b.extend(ext);
+        }
+    }
+    if let Some(token) = fsmonitor_token {
+        let mut ext = Vec::new();
+        ext.extend(2u32.to_be_bytes());
+        ext.extend(token.as_bytes());
+        ext.push(0);
+        // An empty EWAH bitmap: bit size 0, one (empty) run-length word,
+        // and the position of that word.
+        let mut ewah = Vec::new();
+        ewah.extend(0u32.to_be_bytes());
+        ewah.extend(1u32.to_be_bytes());
+        ewah.extend(0u64.to_be_bytes());
+        ewah.extend(0u32.to_be_bytes());
+        ext.extend((ewah.len() as u32).to_be_bytes());
+        ext.extend(ewah);
+        b.extend(b"FSMN");
+        b.extend((ext.len() as u32).to_be_bytes());
+        b.extend(ext);
     }
     let digest = Sha1::digest(&b);
     b.extend(digest.as_slice());

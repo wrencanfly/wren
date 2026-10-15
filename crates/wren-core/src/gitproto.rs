@@ -119,7 +119,10 @@ pub fn upload_pack_advertisement() -> Vec<u8> {
         "version 2\n".to_string(),
         format!("agent={AGENT}\n"),
         "ls-refs=unborn\n".into(),
-        "fetch=filter\n".into(),
+        // `shallow`: a shallow repository (a `--git` checkout or mount)
+        // must see it before it lazily fetches; its `shallow` lines are
+        // accepted, `deepen` requests are refused.
+        "fetch=shallow filter\n".into(),
         "object-format=sha1\n".into(),
     ] {
         pkt_str(&mut out, &line);
@@ -247,9 +250,12 @@ fn fetch(repo: &Repo, args: &[String]) -> Result<Vec<u8>> {
             include_tag = true;
         } else if a == "thin-pack" {
             thin = true;
-        } else if a.starts_with("deepen") || a.starts_with("shallow ") {
+        } else if a.starts_with("deepen") {
             bail!("shallow fetches are not supported; use a partial clone (--filter=blob:none)");
         }
+        // `shallow <oid>`: the client's own shallow boundary (sent by a
+        // shallow repository's lazy fetches). It changes nothing for what
+        // is sent without `deepen`.
         // ofs-delta, no-progress, wait-for-done: nothing to do.
     }
     let mut out = Vec::new();

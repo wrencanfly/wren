@@ -1,6 +1,6 @@
 # 设计：Wren 向 Scion 架构迁移
 
-> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15，M3d ✅ 2026-10-15，M4 ✅ 2026-10-15，M5 ✅ 2026-10-15，M6 ✅ 2026-10-15**，M7 待评估。
+> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15，M3d ✅ 2026-10-15，M4 ✅ 2026-10-15，M5 ✅ 2026-10-15，M6 ✅ 2026-10-15，M7 ✅ 2026-10-15（Linux）**。
 > 范围：用户选择"全面 Scion 化"，即下文 M1–M7 全部纳入路线图。
 > 这推翻了 v0.1 的定位（只读、git 主机是数据源、"不做服务端写入"），也推翻了
 > [reviews/04](reviews/04-positioning-vs-intent.md) 和 [reviews/08](reviews/08-synthesis.md)
@@ -701,7 +701,51 @@ trigram 的路径集合求交、校验子串，再保留在该版本存在的路
   sparse index。
 - 推荐等 M1–M6 完成后再评估。
 
----
+### 8.1 评估与实现（M7 ✅，Linux）
+
+M1–M6 完成后按 D3 评估：值得做，因为它把"检出"的成本从"要用的目录"进一步降到
+"真正读到的文件"，而 git 兼容的难点可以用 git 自己的机制解决，不需要改 git。先做
+Linux（FUSE）；macOS 的 FSKit 需要一个签名的 app extension，没有做。
+
+`wren mount <dir> [--rev R] [--git]`（`--features vfs`，需要 fuse3）：
+
+- **下层**：提交的整棵树一开始就全部可见，但什么都不取。列目录或查找时才取那一层
+  的树；打开或 stat 文件时才取它的 blob（大小在 blob 里）。经节点对象库和对象面
+  （`WREN_OBJECTS`，通常是 daemon）取，和普通检出走同一条路。
+- **上层**：写入只进覆盖层目录，从不写进对象库。以写方式打开时复制上来（`O_TRUNC`
+  时不取旧内容）；新文件、目录、符号链接直接建在上层；删除提交里的文件或目录记
+  whiteout；删掉再建的目录是 opaque 的（不再透出提交里的内容）；重命名提交里的目录
+  返回 `EXDEV`，工具会退回到复制加删除。submodule 显示为空目录（和未初始化时一样）。
+  覆盖层在卸载后保留，再次挂载时改动还在。
+- **git**：`--git` 时 `.git` 放在覆盖层里：
+  - 索引列出提交的全部文件（要取全部树，不取 blob），带 **fsmonitor 扩展**（全部
+    标为有效）和 **cache-tree 扩展**（每个目录的树 id）；
+  - 挂载进程把每个改动的路径写进日志，`wren fsmonitor-hook` 按 git 的 hook 协议 v2
+    回答"某个 token 之后改了哪些路径"；
+  - 打开 untracked cache。
+  这样 `git status` 只看写过的路径，不 stat 也不取其余文件；`git commit` 只重算
+  改动过的目录，只检查那些目录里的 blob（缺的经 promisor 从 Wren 的 git 前端按需取）。
+- 实现中发现并修掉 M5 的一个兼容问题：shallow 仓库（`--git` 检出和挂载都是）在
+  按需取之前要求服务端在 v2 能力里声明 `shallow`；现在声明 `fetch=shallow filter`，
+  接受 `shallow` 行，`deepen` 仍然拒绝。
+
+测试（`crates/wren/tests/vfs.rs`，Linux CI 必须运行）：挂载后什么 blob 都没取；读到
+才取；`git status` 在禁止按需取（`GIT_NO_LAZY_FETCH=1`）时仍然干净且不读未改动的
+文件；改、增、删、建目录、重命名后 `git status` 的输出完全正确；`git add -A` 和
+`git commit` 同样不按需取；目录重命名返回 `EXDEV`；卸载再挂载后改动还在。
+
+git/git 实测（容器里，本机 server）：
+
+| | `wren mount --git` | `wren checkout --git`（全量） |
+|---|---:|---:|
+| 就绪 | 44 ms（取 222 个树） | 316 ms（取 4,962 个对象） |
+| `ls -R`（5,449 项） | 38 ms，不取 blob | — |
+| 第一次 `git status` | 52 ms（读了 19 个 `.gitignore` 等） | 118 ms |
+| 之后的 `git status` | 8–11 ms | — |
+| 改根目录一个文件后 `git commit` | 1.4 s（按需取根目录的约 30 个 blob） | — |
+
+限制：只有 Linux；git 在改动目录里检查 blob 时逐个按需取（每个一次往返）；没有
+写回服务端的通道（改动用 `git commit` + `git push`，或 `wren commit`）。
 
 ## 9. 定位反转、风险和代价
 

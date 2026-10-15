@@ -243,6 +243,35 @@ enum Cmd {
         #[command(flatten)]
         target: Target,
     },
+    /// Mount a commit as a virtual checkout: everything visible at once,
+    /// fetched only when read; writes go to an overlay. Linux, built with
+    /// `--features vfs`, needs fuse3. Runs until unmounted (`wren umount`).
+    Mount {
+        mountpoint: PathBuf,
+        #[arg(long, default_value = "HEAD")]
+        rev: String,
+        /// Where writes go (default: next to the mount point).
+        #[arg(long)]
+        overlay: Option<PathBuf>,
+        /// The node's object store (as for checkouts).
+        #[arg(long, env = "WREN_STORE")]
+        store: Option<PathBuf>,
+        /// Also make it a git working tree (fsmonitor keeps `git status`
+        /// from reading every file).
+        #[arg(long)]
+        git: bool,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Unmount a `wren mount`.
+    Umount { mountpoint: PathBuf },
+    /// git's fsmonitor hook for a `wren mount --git` (called by git).
+    #[command(hide = true)]
+    FsmonitorHook {
+        overlay: PathBuf,
+        version: String,
+        token: String,
+    },
     /// Find paths whose name contains a string (case-insensitive).
     Find {
         query: String,
@@ -1009,6 +1038,98 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 );
             }
         }
+        #[cfg(all(feature = "vfs", target_os = "linux"))]
+        Cmd::Mount {
+            mountpoint,
+            rev,
+            overlay,
+            store,
+            git,
+            target,
+        } => {
+            let c = need_repo(&target).await?;
+            let store_dir = match store {
+                Some(s) => s,
+                None => default_store()?,
+            };
+            let store = Arc::new(ObjectStore::open(&store_dir)?);
+            let commit = c.resolve(&rev).await?;
+            c.ensure(&store, &[commit]).await?;
+            let info = store.read_commit(&commit)?;
+            std::fs::create_dir_all(&mountpoint)?;
+            let mountpoint = mountpoint.canonicalize()?;
+            let overlay = overlay.unwrap_or_else(|| {
+                let mut o = mountpoint.clone().into_os_string();
+                o.push(".wren-overlay");
+                PathBuf::from(o)
+            });
+            std::fs::create_dir_all(&overlay)?;
+            let overlay = overlay.canonicalize()?;
+            if git {
+                let refs: Vec<RefInfo> = c.get("refs", &[]).await?;
+                let branch = refs
+                    .iter()
+                    .find(|r| r.name == format!("refs/heads/{rev}") && r.commit == commit)
+                    .map(|_| rev.clone());
+                wren_vcs::vfs::setup_git(
+                    &c,
+                    &store,
+                    commit,
+                    info.tree,
+                    &overlay,
+                    &wren_vcs::vfs::GitOptions {
+                        branch,
+                        origin: format!("{}/git/{}", c.server, c.repo),
+                    },
+                )
+                .await?;
+            }
+            let fs = wren_vcs::vfs::WrenFs::new(
+                c.clone(),
+                store,
+                info.tree,
+                wren_vcs::vfs::commit_time(info.committer.time),
+                overlay.clone(),
+            )?;
+            eprintln!(
+                "mounted {} at {} (writes in {}); `wren umount {}` to stop",
+                commit.short(),
+                mountpoint.display(),
+                overlay.display(),
+                mountpoint.display()
+            );
+            let mp = mountpoint.clone();
+            tokio::task::spawn_blocking(move || wren_vcs::vfs::run(fs, &mp)).await??;
+        }
+        #[cfg(not(all(feature = "vfs", target_os = "linux")))]
+        Cmd::Mount { .. } => {
+            anyhow::bail!(
+                "this wren was built without virtual checkouts (Linux, cargo build --features vfs)"
+            );
+        }
+        Cmd::Umount { mountpoint } => {
+            let st = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mountpoint)
+                .status()
+                .or_else(|_| {
+                    std::process::Command::new("umount")
+                        .arg(&mountpoint)
+                        .status()
+                })?;
+            anyhow::ensure!(st.success(), "could not unmount {}", mountpoint.display());
+        }
+        #[cfg(all(feature = "vfs", target_os = "linux"))]
+        Cmd::FsmonitorHook {
+            overlay,
+            version,
+            token,
+        } => {
+            let out = wren_vcs::vfs::fsmonitor_hook(&overlay, &version, &token)?;
+            std::io::stdout().write_all(&out)?;
+        }
+        #[cfg(not(all(feature = "vfs", target_os = "linux")))]
+        Cmd::FsmonitorHook { .. } => anyhow::bail!("built without virtual checkouts"),
         Cmd::Find {
             query,
             rev,
@@ -1445,7 +1566,10 @@ fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("WREN_LOG")
-                .unwrap_or_else(|_| "info".into()),
+                .unwrap_or_else(|_| "info".into())
+                // The FUSE library logs every unsupported operation (and a
+                // second unmount attempt after `wren umount`) as a warning.
+                .add_directive("fuser=error".parse().expect("directive")),
         )
         .with_writer(std::io::stderr)
         .init();
