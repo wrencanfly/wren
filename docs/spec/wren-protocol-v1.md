@@ -169,7 +169,7 @@ A server started with a write token adds `"write.v1"` to `features`
 | `object_format` | string | The hash algorithm of every oid on this tier. MUST be `"sha1"` in v1 ([§1.5](#15-object-format)). |
 | `tier` | string | `"server"`, `"region"` or `"node"`: which kind of tier answered. Older caches said `"cache"`, which means `"region"`. Clients MUST NOT change how they read answers based on this value ([§2.2](#22-tiers)); tiers use it to check their upstream ([§2.3](#23-strict-tiering)). |
 | `store` | string, optional | Only on a node: the path of its object store. A client on the same machine whose store is that path lets the node write it and only verifies what it receives (§3.4 still applies). |
-| `features` | array of strings | Feature flags. The reference implementation advertises the values above plus `object-deltas.v1` and `snapshots.v1` on every tier (`FEATURES` in `crates/wren/src/server.rs`), and `write.v1` on a server with a write token. |
+| `features` | array of strings | Feature flags. The reference implementation advertises the values above plus `object-deltas.v1` and `snapshots.v1` on every tier (`FEATURES` in `crates/wren/src/server.rs`), `scoped-objects.v1` on servers, and `write.v1` and `merge.v1` on a server with a write token. |
 | `semantics` | string | The query semantics version ([§1.2](#12-protocol-version-and-the-wren-protocol-header)). A server reports its own. A cache reports the value it last learned from its upstream, or its own built-in value if it has learned none ([§7.2](#72-marking-and-storing)). Clients MUST treat an absent field (older servers) as unknown. |
 
 Feature flags defined in v1:
@@ -188,6 +188,8 @@ Feature flags defined in v1:
 | `write.v1` | The write API of [§14](#14-writes). Only a server with a write token advertises it; a cache never does. |
 | `object-deltas.v1` | Delta frames in `POST /v1/objects` ([§3.2](#32-batch-fetch-post-v1objects)) |
 | `snapshots.v1` | Snapshots ([§15](#15-snapshots)) |
+| `merge.v1` | Server-side merges, `POST /api/v1/repos/{repo}/merge` ([§14.11](#1411-merge)) |
+| `scoped-objects.v1` | Object requests with a `scope`, for tokens restricted to directories ([§17](#17-access-control-and-rate-limits)) |
 
 Clients MUST ignore feature flags they do not recognise.
 
@@ -1160,6 +1162,7 @@ or is a directory or a gitlink. Symlinks are blamed as their target string.
 |---|---|---|---|
 | `rev` | no | `HEAD` | Revision. |
 | `path` | no | `""` (root) | Directory to list. |
+| `sizes` | no | `false` | Also give each blob's size in bytes, so that a client (a virtual checkout answering `stat`) needs no blob for it. |
 
 **Response** `200`:
 
@@ -1181,6 +1184,7 @@ or is a directory or a gitlink. Symlinks are blamed as their target string.
 | `entries[].mode` | Six-digit **octal string**: `100644`, `100755`, `120000`, `040000`, `160000`. Legacy modes are normalised. |
 | `entries[].kind` | `"blob"` (files and symlinks), `"tree"`, or `"commit"` (gitlink). |
 | `entries[].oid` | Entry id. |
+| `entries[].size` | Only with `sizes=true`, and only for blobs: the blob's size. |
 
 The listing is not recursive. Errors: `404` (`no directory "<path>" at <oid>`) if
 `path` does not exist or is not a directory.
@@ -1300,6 +1304,19 @@ needs no checkout. Implemented in `crates/wren-core/src/grep.rs`.
 * The result is a pure function of the history, `pattern`, `path`,
   `ignore_case`, and `limit`. A request with a full commit id as `rev` is
   pinned ([§7.1](#71-pinned-queries)).
+
+**Content index (informative).** A server MAY keep an index that tells it
+which files cannot match, and skip reading them; the answer MUST be the same
+as without it. The reference server keeps a trigram index of the blobs of
+each default branch (`--content-index-every`, default every 10 s;
+`crates/wren-core/src/search.rs`): a pattern's required literal strings
+(through concatenations, groups and repetitions of at least one; never
+through alternations, nor, with `ignore_case`, through letters whose case
+folding leaves ASCII, such as `k` and `s`) give trigrams, and a file is read
+only if its blob is not indexed (newer than the index, or over 1 MiB) or
+holds all of them. Binary blobs are recorded as binary and never read. Since
+blobs are content-addressed, the index helps at every revision, not only at
+the indexed one.
 
 For patterns that mean the same as a POSIX extended regular expression and in
 Rust `regex` syntax, the `(path, line)` pairs equal those of
@@ -1783,8 +1800,9 @@ object authorization, which v1 does not provide (§13, item 10).
   Ordinary git pushes to the host keep working and reach Wren through sync:
   periodic, on demand when a request names an unknown revision (§4.0.7), or
   explicit (§4.14). Checkouts created with `--git` are configured for this.
-  Tags cannot be written, and there is no server-side merge of two branches
-  (only rebase).
+  Tags cannot be written. Server-side merges (§14.11) refuse what git's
+  merge does beyond path-by-path merging (renames carried across, criss-cross
+  histories whose merge bases conflict).
 * **First-parent history only** for `log`, `blame`, changesets, `landed`, and
   `bisect`. There is no full-graph log.
 * **Only `refs/heads/*` and `refs/tags/*`.**
@@ -2368,8 +2386,8 @@ pushed to it directly) is never overwritten; the server reports the error
 instead. Unpinned answers no longer depend on syncing; nothing is fetched
 from the host.
 
-In both modes, and for every way a ref can move (§14.5, §14.6, §14.7, and
-pushes through §16), a server MAY refuse a move with `409`
+In both modes, and for every way a ref can move (§14.5, §14.6, §14.7,
+§14.11, and pushes through §16), a server MAY refuse a move with `409`
 (`"result": "rejected"`, or `ng` for a push):
 
 * **Protected refs** (reference: `--protect PATTERN`, `*` matches anything):
@@ -2377,7 +2395,7 @@ pushes through §16), a server MAY refuse a move with `409`
   descends from the old one).
 * **Policy hook** (reference: `--policy-hook URL`): before a ref moves, the
   server POSTs `{"repo", "ref", "old", "new", "via"}` (`via` is `refs`,
-  `land` or `push`; `old`/`new` are `null` for absent). Any `2xx` allows the
+  `land`, `merge` or `push`; `old`/`new` are `null` for absent). Any `2xx` allows the
   move; anything else, or no answer within 10 s, refuses it with the response
   body as the reason.
 
@@ -2396,6 +2414,57 @@ oldest first, `[{"seq": 7, "time_ms": 1760000000000, "ref":
 `pending` counts refs whose current value has not reached the host yet,
 `lag_ms_p99` is the 99th percentile of recent export delays (from the move
 in Wren to the host accepting it), and `error` is the latest export problem.
+
+### 14.11 Merge
+
+`POST /api/v1/repos/{repo}/merge`
+
+```json
+{"commit": "<revision>", "into": "main", "author": {"name": "...", "email": "..."}}
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `commit` | revision | yes | What to merge, e.g. a feature branch. |
+| `into` | string | yes | The branch to merge into (`main` or `refs/heads/main`). |
+| `author` | Person | yes | |
+| `committer` | Person | no | Default: the author. |
+| `message` | string | no | Default: `Merge commit '<oid>' into <branch>`. |
+| `fast_forward` | boolean | no | Default `false` (like `git merge --no-ff`). When `true` and `commit` already contains the branch tip, the branch just moves to `commit`. |
+
+The server merges `commit` into the branch's tip with a three-way merge over
+their merge base, as `git merge` would: paths only one side changed take
+that side's version, and files both sides changed are merged with git's own
+`git merge-file`. The merge commit has parents `[tip, commit]`, and its
+changes are recorded relative to the first parent. The branch moves with a
+compare-and-swap (in write-proxy mode, on the host first, §14.8); when the
+branch moved in between, the merge is redone on the new tip, up to 8 times,
+as for land.
+
+Where git's merge (`ort`) does more than a path-by-path merge, the server
+refuses with a conflict instead of answering differently: renames git would
+carry across (a file renamed on one side and changed on the other, a rename
+onto a path the other side added, a directory renamed on one side while the
+other added files to it: kind `rename`), and criss-cross histories whose two
+merge bases do not merge cleanly, or which have more than two merge bases
+(kind `criss-cross`). Two merge bases that merge cleanly are merged first
+into a virtual base, as git does. Histories with no common commit are `400`.
+
+**Response**
+
+| Status | Body | Meaning |
+|---|---|---|
+| `200` | `{"result": "merged", "ref": "refs/heads/main", "old": "<oid>", "new": "<merge>", "fast_forward": false, "attempts": 1}` | Done. |
+| `200` | `{"result": "up_to_date", "ref": "refs/heads/main", "tip": "<oid>"}` | The branch already contains `commit`. Nothing changed. |
+| `409` | `{"result": "conflicts", "onto": "<tip>", "conflicts": [Conflict, ...]}` | Nothing changed. Each Conflict is as for land (§14.5); `changeset` is `commit`. |
+| `409` | `{"result": "rejected", "reason": "..."}` | The host, a protected ref or the policy hook refused. |
+| `409` | ErrorBody | The branch kept moving through all 8 attempts. |
+
+Conformance: for random histories (renames, directory moves, mode changes,
+file/directory swaps, criss-crosses), every clean merge has the tree of `git
+merge-tree --write-tree`, every merge git reports as conflicted is refused,
+and a merge commit has the id `git commit-tree` gives the same tree, parents
+and message.
 
 ## 15. Snapshots
 

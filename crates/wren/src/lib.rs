@@ -9,5 +9,5 @@ pub mod client;
 pub mod mcp;
 pub mod server;
 pub mod transport;
-#[cfg(all(feature = "vfs", target_os = "linux"))]
+#[cfg(all(feature = "vfs", any(target_os = "linux", target_os = "macos")))]
 pub mod vfs;

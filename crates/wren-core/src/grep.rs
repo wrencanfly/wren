@@ -61,6 +61,13 @@ impl Repo {
             files.push((base, root.oid));
         }
 
+        // Files that cannot match, by the content index, are not read.
+        if let Some(tris) = crate::search::required_trigrams(pattern, ignore_case) {
+            if std::env::var_os("WREN_NO_CONTENT_INDEX").is_none() {
+                self.prune_by_index(&mut files, &tris)?;
+            }
+        }
+
         let mut matches = Vec::new();
         let mut truncated = false;
         for chunk in files.chunks(CHUNK) {
@@ -87,7 +94,12 @@ impl Repo {
     }
 
     /// Depth-first in tree order, which is git's index (path) order.
-    fn collect_files(&self, tree: Oid, prefix: &str, out: &mut Vec<(String, Oid)>) -> Result<()> {
+    pub fn collect_files(
+        &self,
+        tree: Oid,
+        prefix: &str,
+        out: &mut Vec<(String, Oid)>,
+    ) -> Result<()> {
         for e in self.store.read_tree(&tree)? {
             let p = if prefix.is_empty() {
                 e.name_str().into_owned()

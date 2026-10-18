@@ -11,12 +11,13 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use wren_core::api::*;
+use wren_core::merge::Merged;
 use wren_core::write::Landed;
 use wren_core::{ObjectStore, Repo};
 
 use wren_vcs::client::{
     find_checkout_config, ChangesetRequest, Client, Content, Edit, FileChange, LandOnto,
-    LandRequest, Person, RevertRequest,
+    LandRequest, MergeRequest, Person, RevertRequest,
 };
 
 /// Wren: agent-scale source control on top of git.
@@ -130,6 +131,11 @@ enum Cmd {
         /// bursts of twice that. Beyond it: 429.
         #[arg(long, value_name = "N")]
         rate_limit: Option<f64>,
+        /// Seconds between updates of the content search index (the files
+        /// of each default branch; grep reads only files that can match).
+        /// 0 = no index.
+        #[arg(long, default_value_t = 10)]
+        content_index_every: u64,
     },
     /// Run a caching tier in front of a server or another cache.
     Cache {
@@ -244,8 +250,9 @@ enum Cmd {
         target: Target,
     },
     /// Mount a commit as a virtual checkout: everything visible at once,
-    /// fetched only when read; writes go to an overlay. Linux, built with
-    /// `--features vfs`, needs fuse3. Runs until unmounted (`wren umount`).
+    /// fetched only when read; writes go to an overlay. Built with
+    /// `--features vfs`: Linux (FUSE, needs fuse3) or macOS (a localhost NFS
+    /// server; nothing to install). Runs until unmounted (`wren umount`).
     Mount {
         mountpoint: PathBuf,
         #[arg(long, default_value = "HEAD")]
@@ -436,6 +443,27 @@ enum Cmd {
         /// Commits to land, oldest first; each must be the parent of the next.
         #[arg(required = true)]
         revs: Vec<String>,
+        #[command(flatten)]
+        write: WriteTarget,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Merge REV into a branch on the server (a merge commit, like `git
+    /// merge --no-ff`) and move the branch. Exits 1 on conflicts or if the
+    /// git host refuses.
+    Merge {
+        rev: String,
+        #[arg(long, value_name = "BRANCH")]
+        into: String,
+        /// Commit message. Default: "Merge commit '<id>' into <branch>".
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Just move the branch when REV already contains its tip.
+        #[arg(long)]
+        ff: bool,
+        /// "Name <email>". Default: WREN_AUTHOR, else git's user.name and user.email.
+        #[arg(long, env = "WREN_AUTHOR")]
+        author: Option<String>,
         #[command(flatten)]
         write: WriteTarget,
         #[command(flatten)]
@@ -719,6 +747,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             protect,
             policy_hook,
             export_every_ms,
+            content_index_every,
             acl,
             rate_limit,
         } => {
@@ -824,6 +853,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             server::spawn_pollers(state.clone(), (poll > 0).then(|| Duration::from_secs(poll)));
             server::spawn_snapshotters(state.clone());
             server::spawn_exporters(state.clone(), Duration::from_millis(export_every_ms));
+            if content_index_every > 0 {
+                server::spawn_indexers(state.clone(), Duration::from_secs(content_index_every));
+            }
             let listener = tokio::net::TcpListener::bind(listen).await?;
             tracing::info!(
                 "wren server listening on http://{listen} ({} repos)",
@@ -1038,7 +1070,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 );
             }
         }
-        #[cfg(all(feature = "vfs", target_os = "linux"))]
+        #[cfg(all(feature = "vfs", any(target_os = "linux", target_os = "macos")))]
         Cmd::Mount {
             mountpoint,
             rev,
@@ -1084,9 +1116,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 )
                 .await?;
             }
-            let fs = wren_vcs::vfs::WrenFs::new(
+            let view = wren_vcs::vfs::View::new(
                 c.clone(),
                 store,
+                commit,
                 info.tree,
                 wren_vcs::vfs::commit_time(info.committer.time),
                 overlay.clone(),
@@ -1099,27 +1132,55 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 mountpoint.display()
             );
             let mp = mountpoint.clone();
-            tokio::task::spawn_blocking(move || wren_vcs::vfs::run(fs, &mp)).await??;
+            #[cfg(target_os = "linux")]
+            let run = wren_vcs::vfs::fuse::run;
+            #[cfg(target_os = "macos")]
+            let run = wren_vcs::vfs::nfs::run;
+            tokio::task::spawn_blocking(move || run(view, &mp)).await??;
         }
-        #[cfg(not(all(feature = "vfs", target_os = "linux")))]
+        #[cfg(not(all(feature = "vfs", any(target_os = "linux", target_os = "macos"))))]
         Cmd::Mount { .. } => {
             anyhow::bail!(
-                "this wren was built without virtual checkouts (Linux, cargo build --features vfs)"
+                "this wren was built without virtual checkouts (Linux or macOS, cargo build --features vfs)"
             );
         }
         Cmd::Umount { mountpoint } => {
-            let st = std::process::Command::new("fusermount3")
-                .arg("-u")
-                .arg(&mountpoint)
-                .status()
-                .or_else(|_| {
-                    std::process::Command::new("umount")
+            #[cfg(target_os = "macos")]
+            {
+                // The NFS client can stay busy for a moment after the last
+                // process using the mount exits.
+                let mut ok = false;
+                for _ in 0..25 {
+                    let out = std::process::Command::new("/sbin/umount")
                         .arg(&mountpoint)
-                        .status()
-                })?;
-            anyhow::ensure!(st.success(), "could not unmount {}", mountpoint.display());
+                        .output()?;
+                    if out.status.success() {
+                        ok = true;
+                        break;
+                    }
+                    if !String::from_utf8_lossy(&out.stderr).contains("busy") {
+                        std::io::stderr().write_all(&out.stderr)?;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                anyhow::ensure!(ok, "could not unmount {}", mountpoint.display());
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let st = std::process::Command::new("fusermount3")
+                    .arg("-u")
+                    .arg(&mountpoint)
+                    .status()
+                    .or_else(|_| {
+                        std::process::Command::new("umount")
+                            .arg(&mountpoint)
+                            .status()
+                    })?;
+                anyhow::ensure!(st.success(), "could not unmount {}", mountpoint.display());
+            }
         }
-        #[cfg(all(feature = "vfs", target_os = "linux"))]
+        #[cfg(all(feature = "vfs", any(target_os = "linux", target_os = "macos")))]
         Cmd::FsmonitorHook {
             overlay,
             version,
@@ -1128,7 +1189,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let out = wren_vcs::vfs::fsmonitor_hook(&overlay, &version, &token)?;
             std::io::stdout().write_all(&out)?;
         }
-        #[cfg(not(all(feature = "vfs", target_os = "linux")))]
+        #[cfg(not(all(feature = "vfs", any(target_os = "linux", target_os = "macos"))))]
         Cmd::FsmonitorHook { .. } => anyhow::bail!("built without virtual checkouts"),
         Cmd::Find {
             query,
@@ -1513,6 +1574,65 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 return Ok(exit_code(matches!(l, Landed::Landed { .. })));
             }
             return Ok(exit_code(report_land(&l)));
+        }
+        Cmd::Merge {
+            rev,
+            into,
+            message,
+            ff,
+            author,
+            write,
+            target,
+        } => {
+            let author = cli_author(author)?;
+            let c = need_repo(&target).await?;
+            let w = writer(&c, &target, &write);
+            let m = w
+                .merge(&MergeRequest {
+                    commit: rev,
+                    into,
+                    author,
+                    committer: None,
+                    message,
+                    fast_forward: ff,
+                })
+                .await?;
+            let ok = matches!(m, Merged::Merged { .. } | Merged::UpToDate { .. });
+            if target.json {
+                print_json(&m)?;
+                return Ok(exit_code(ok));
+            }
+            match &m {
+                Merged::Merged {
+                    name,
+                    old,
+                    new,
+                    fast_forward,
+                    ..
+                } => {
+                    let how = if *fast_forward { " (fast-forward)" } else { "" };
+                    println!("merged {name} {old} -> {new}{how}");
+                }
+                Merged::UpToDate { name, tip } => println!("{name} at {tip} already contains it"),
+                Merged::Conflicts { onto, conflicts } => {
+                    eprintln!(
+                        "not merged: {} conflicting path(s) against {onto}:",
+                        conflicts.len()
+                    );
+                    for c in conflicts {
+                        let detail = c
+                            .detail
+                            .as_deref()
+                            .map(|d| format!(" ({d})"))
+                            .unwrap_or_default();
+                        eprintln!("  {:<14} {}{detail}", c.kind, c.path);
+                    }
+                }
+                Merged::Rejected { reason } => {
+                    eprintln!("not merged: the update was refused: {reason}")
+                }
+            }
+            return Ok(exit_code(ok));
         }
         Cmd::Revert {
             rev,

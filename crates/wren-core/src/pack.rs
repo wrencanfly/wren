@@ -940,6 +940,34 @@ impl Packs {
         }
     }
 
+    /// The object's size, without resolving a delta chain: a delta starts
+    /// with the size of what it makes.
+    pub fn size(&self, oid: &Oid) -> Result<Option<u64>> {
+        let Some((pack, offset)) = self.locate(oid)? else {
+            return Ok(None);
+        };
+        let (e, bytes) = pack.entry(offset)?;
+        if matches!(e.base, Base::None) {
+            return Ok(Some(e.size as u64));
+        }
+        let delta = pack.inflate(&e, &bytes)?;
+        let mut p = 0;
+        let mut varint = || -> Result<u64> {
+            let (mut v, mut shift) = (0u64, 0);
+            loop {
+                let c = *delta.get(p).context("truncated delta")?;
+                p += 1;
+                v |= ((c & 0x7f) as u64) << shift;
+                shift += 7;
+                if c & 0x80 == 0 {
+                    return Ok(v);
+                }
+            }
+        };
+        varint()?; // the base's size
+        Ok(Some(varint()?))
+    }
+
     /// The object, with its delta chain resolved.
     pub fn get(&self, oid: &Oid) -> Result<Option<(Kind, Vec<u8>)>> {
         let Some((pack, offset)) = self.locate(oid)? else {

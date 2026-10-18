@@ -254,6 +254,10 @@ impl Client {
         self.write("land", req).await
     }
 
+    pub async fn merge(&self, req: &MergeRequest) -> Result<wren_core::merge::Merged> {
+        self.write("merge", req).await
+    }
+
     pub async fn revert(&self, req: &RevertRequest) -> Result<RevertResponse> {
         self.write("revert", req).await
     }
@@ -557,6 +561,18 @@ pub struct LandRequest {
     pub onto: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committer: Option<Person>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct MergeRequest {
+    pub commit: String,
+    pub into: String,
+    pub author: Person,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer: Option<Person>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub fast_forward: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]

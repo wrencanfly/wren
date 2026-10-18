@@ -33,6 +33,8 @@ pub struct Repo {
     pub policy: std::sync::RwLock<crate::write::Policy>,
     /// Recent export lags in milliseconds (see `export`).
     pub(crate) export_lags: Mutex<std::collections::VecDeque<u64>>,
+    /// Which blobs the content index has (see `search`).
+    pub(crate) content: crate::search::ContentCache,
 }
 
 /// Exclusive use of the git mirror: within this process, and (on Postgres)
@@ -91,6 +93,7 @@ impl Repo {
             sync_lock: Mutex::new(()),
             policy: Default::default(),
             export_lags: Default::default(),
+            content: Default::default(),
         })
     }
 

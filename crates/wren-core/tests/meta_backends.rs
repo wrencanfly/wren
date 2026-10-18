@@ -138,6 +138,35 @@ fn exercise(db: &MetaDb) {
         2
     );
     assert_eq!(db.derived_keys_with_prefix("other", b"").unwrap().len(), 0);
+    // With values, in key order; deletes in a batch.
+    let rows = db.derived_with_prefix("k", b"\x01\xff").unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (b"\x01\xff".to_vec(), b"v".to_vec()),
+            (b"\x01\xff\x00".to_vec(), b"v".to_vec())
+        ]
+    );
+    db.write_batch(&[
+        WriteOp::DeleteDerived {
+            kind: "k",
+            key: b"\x01\xff",
+        },
+        WriteOp::Derived {
+            kind: "k",
+            key: b"\x01\xff",
+            value: b"merged",
+        },
+        WriteOp::DeleteDerived {
+            kind: "k",
+            key: b"\x01\xff\x00",
+        },
+    ])
+    .unwrap();
+    assert_eq!(
+        db.derived_with_prefix("k", b"\x01\xff").unwrap(),
+        vec![(b"\x01\xff".to_vec(), b"merged".to_vec())]
+    );
 
     // kv overwrites.
     db.set_kv("upstream", "a").unwrap();

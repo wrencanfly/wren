@@ -1,0 +1,20 @@
+[package]
+name = "wren-nfsserve"
+version = "0.11.0-wren.1"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "An NFSv3 server, vendored from nfsserve 0.11.0 for wren mount on macOS"
+repository = "https://github.com/wrencanfly/wren"
+
+[lib]
+name = "nfsserve"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1.9"
+byteorder = "1.4"
+filetime = "0.2"
+num-derive = "0.4"
+num-traits = "0.2"
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "sync", "fs", "rt", "macros"] }
+tracing = "0.1.31"

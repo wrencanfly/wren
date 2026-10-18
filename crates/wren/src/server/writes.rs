@@ -1,5 +1,6 @@
-//! The write API (`write.v1`): upload blobs, create changesets, land, move
-//! branches and revert, all on the server (see `wren_core::write`).
+//! The write API (`write.v1`): upload blobs, create changesets, land, merge,
+//! move branches and revert, all on the server (see `wren_core::write` and
+//! `wren_core::merge`).
 //!
 //! Writes need the write token. Every answer is `Cache-Control: no-store`.
 //! While a git host is the source of truth, ref moves go to the host first
@@ -17,6 +18,7 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use wren_core::merge::{MergeRequest, Merged};
 use wren_core::object::{Kind, MODE_BLOB, MODE_EXEC, MODE_GITLINK, MODE_SYMLINK};
 use wren_core::write::{signature, FileEdit, Landed, NewChangeset, RefUpdate};
 use wren_core::{bad_request, changes::FileVersion, Oid, Repo};
@@ -31,6 +33,7 @@ pub fn routes(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
         .route("/api/v1/repos/{repo}/blobs", post(blobs))
         .route("/api/v1/repos/{repo}/changesets", post(changesets))
         .route("/api/v1/repos/{repo}/land", post(land))
+        .route("/api/v1/repos/{repo}/merge", post(merge))
         .route("/api/v1/repos/{repo}/refs", post(update_ref))
         .route("/api/v1/repos/{repo}/revert", post(revert))
         .route(
@@ -221,6 +224,18 @@ struct LandReq {
 }
 
 #[derive(Deserialize)]
+struct MergeReq {
+    /// The revision to merge.
+    commit: String,
+    into: String,
+    author: Person,
+    committer: Option<Person>,
+    message: Option<String>,
+    #[serde(default)]
+    fast_forward: bool,
+}
+
+#[derive(Deserialize)]
 struct RefReq {
     name: String,
     expected: Option<String>,
@@ -254,16 +269,19 @@ fn land_status(l: &Landed) -> StatusCode {
 /// `land` gives up (a plain error) when the branch kept moving through all
 /// its attempts: that is contention, not a server fault.
 fn land_stack(r: &Repo, stack: &[Oid], onto: &str, committer: Option<&[u8]>) -> ApiResult<Landed> {
-    r.land(stack, onto, committer).map_err(|e| {
-        let typed = e
-            .chain()
-            .any(|c| c.is::<wren_core::NotFound>() || c.is::<wren_core::BadRequest>());
-        if !typed && format!("{e:#}").contains("kept moving") {
-            ApiError(StatusCode::CONFLICT, format!("{e:#}"))
-        } else {
-            e.into()
-        }
-    })
+    r.land(stack, onto, committer).map_err(contention)
+}
+
+/// Giving up because the branch kept moving is a conflict (`409`).
+fn contention(e: anyhow::Error) -> ApiError {
+    let typed = e
+        .chain()
+        .any(|c| c.is::<wren_core::NotFound>() || c.is::<wren_core::BadRequest>());
+    if !typed && format!("{e:#}").contains("kept moving") {
+        ApiError(StatusCode::CONFLICT, format!("{e:#}"))
+    } else {
+        e.into()
+    }
 }
 
 fn parse_oid(what: &str, s: &str) -> Result<Oid> {
@@ -420,6 +438,33 @@ async fn land(
         let committer = req.committer.as_ref().map(Person::signature).transpose()?;
         let landed = land_stack(&r, &stack, &req.onto, committer.as_deref())?;
         Ok((land_status(&landed), Json(landed)).into_response())
+    })
+    .await
+}
+
+async fn merge(
+    State(st): St,
+    Path(name): Path<String>,
+    Body(req): Body<MergeReq>,
+) -> ApiResult<Response> {
+    let r = repo(&st, &name)?;
+    blocking(move || {
+        let commit = st.resolve(&r, &req.commit)?;
+        let merged = r
+            .merge_into(&MergeRequest {
+                into: req.into.clone(),
+                commit,
+                author: req.author.signature()?,
+                committer: req.committer.as_ref().map(Person::signature).transpose()?,
+                message: req.message.map(String::into_bytes),
+                fast_forward: req.fast_forward,
+            })
+            .map_err(contention)?;
+        let status = match merged {
+            Merged::Merged { .. } | Merged::UpToDate { .. } => StatusCode::OK,
+            Merged::Conflicts { .. } | Merged::Rejected { .. } => StatusCode::CONFLICT,
+        };
+        Ok((status, Json(merged)).into_response())
     })
     .await
 }

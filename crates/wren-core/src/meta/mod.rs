@@ -82,6 +82,12 @@ pub enum WriteOp<'a> {
         key: &'a [u8],
         value: &'a [u8],
     },
+    /// Remove a derived row. Only for derived data that is not a pure
+    /// function of its key (the content index merges its posting rows).
+    DeleteDerived {
+        kind: &'a str,
+        key: &'a [u8],
+    },
 }
 
 /// A held exclusive lock (see [`MetaDb::lock`]); released on drop.
@@ -123,6 +129,7 @@ pub(crate) trait Backend: Send + Sync {
     fn cas_ref(&self, name: &str, expected: Option<Oid>, new: Option<(Oid, Oid)>) -> Result<bool>;
     fn get_derived(&self, kind: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn derived_keys_with_prefix(&self, kind: &str, prefix: &[u8]) -> Result<Vec<Vec<u8>>>;
+    fn derived_with_prefix(&self, kind: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     fn put_derived(&self, kind: &str, key: &[u8], value: &[u8]) -> Result<()>;
     fn write_batch(&self, ops: &[WriteOp]) -> Result<()>;
     fn get_kv(&self, key: &str) -> Result<Option<String>>;
@@ -219,6 +226,15 @@ impl MetaDb {
     /// not read).
     pub fn derived_keys_with_prefix(&self, kind: &str, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         self.backend.derived_keys_with_prefix(kind, prefix)
+    }
+    /// Every `kind` row whose key starts with `prefix`, with its value, in
+    /// key order.
+    pub fn derived_with_prefix(
+        &self,
+        kind: &str,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.backend.derived_with_prefix(kind, prefix)
     }
     /// Derived values are a pure function of immutable inputs, so concurrent
     /// writers always agree and the first write simply wins.

@@ -256,6 +256,29 @@ impl ObjectStore {
         }
     }
 
+    /// The object's size, reading only its header where it can.
+    pub fn size(&self, oid: &Oid) -> Result<Option<u64>> {
+        use std::io::Read as _;
+        match fs::File::open(self.path(oid)) {
+            Ok(f) => {
+                // "<kind> <size>\0": the first bytes inflated are enough.
+                let mut head = Vec::with_capacity(32);
+                flate2::read::ZlibDecoder::new(f)
+                    .take(32)
+                    .read_to_end(&mut head)?;
+                let end = head
+                    .iter()
+                    .position(|&b| b == 0)
+                    .context("bad loose object header")?;
+                let text = std::str::from_utf8(&head[..end])?;
+                let (_, size) = text.split_once(' ').context("bad loose object header")?;
+                Ok(Some(size.parse()?))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.packs.size(oid),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn get_kind(&self, oid: &Oid, want: Kind) -> Result<Vec<u8>> {
         let (kind, data) = self
             .get(oid)?

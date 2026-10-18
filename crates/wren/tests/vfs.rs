@@ -1,8 +1,8 @@
-//! `wren mount` (M7): a virtual checkout through FUSE. Linux only, with
-//! `--features vfs` and fuse3; skipped elsewhere unless WREN_REQUIRE_VFS is
-//! set.
+//! `wren mount` (M7): a virtual checkout, with `--features vfs`. Through
+//! FUSE on Linux (skipped without fuse3 unless WREN_REQUIRE_VFS is set) and
+//! a localhost NFS server on macOS.
 
-#![cfg(all(feature = "vfs", target_os = "linux"))]
+#![cfg(all(feature = "vfs", any(target_os = "linux", target_os = "macos")))]
 
 use std::net::TcpListener;
 use std::path::Path;
@@ -16,6 +16,25 @@ impl Drop for Proc {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// A `wren mount` process, unmounted when dropped (killing the server of
+/// an NFS mount would leave a dead mount behind).
+struct Mounted(Option<Child>, std::path::PathBuf);
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        if mounted(&self.1) {
+            let _ = Command::new(WREN).arg("umount").arg(&self.1).status();
+        }
+        if let Some(mut c) = self.0.take() {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while c.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 
@@ -62,6 +81,12 @@ fn wait_for(mut f: impl FnMut() -> bool, what: &str) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn fuse_available() -> bool {
+    true // the system's NFS client
+}
+
+#[cfg(target_os = "linux")]
 fn fuse_available() -> bool {
     let ok = Path::new("/dev/fuse").exists()
         && Command::new("fusermount3")
@@ -90,10 +115,9 @@ fn stored(store: &Path, oid: &str) -> bool {
 }
 
 fn mounted(mnt: &Path) -> bool {
-    std::fs::read_to_string("/proc/mounts")
-        .unwrap_or_default()
-        .lines()
-        .any(|l| l.split(' ').nth(1) == Some(mnt.to_str().unwrap()))
+    use std::os::unix::fs::MetadataExt;
+    let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
+    dev(mnt).is_some() && dev(mnt) != dev(mnt.parent().unwrap())
 }
 
 #[test]
@@ -113,6 +137,15 @@ fn virtual_checkout() {
     std::fs::write(up.join("src/old.rs"), "old\n").unwrap();
     std::fs::write(up.join("docs/guide.md"), "# guide\n").unwrap();
     std::fs::write(up.join("big/blob.bin"), vec![7u8; 300_000]).unwrap();
+    // More entries than one directory listing reply holds.
+    std::fs::create_dir_all(up.join("many")).unwrap();
+    for i in 0..600 {
+        std::fs::write(
+            up.join(format!("many/file-with-a-longish-name-{i:04}.txt")),
+            format!("{i}\n"),
+        )
+        .unwrap();
+    }
     std::os::unix::fs::symlink("src/lib.rs", up.join("link")).unwrap();
     git(&up, &["add", "-A"]);
     git(&up, &["commit", "-q", "-m", "one"]);
@@ -147,18 +180,21 @@ fn virtual_checkout() {
     let store = root.join("store");
     let overlay = root.join("overlay");
     let mount = |extra: &[&str]| {
-        Proc(
-            Command::new(WREN)
-                .arg("mount")
-                .arg(&mnt)
-                .args(["--store", store.to_str().unwrap()])
-                .args(["--overlay", overlay.to_str().unwrap()])
-                .args(extra)
-                .env("WREN_SERVER", &url)
-                .env("WREN_REPO", "demo")
-                .env("WREN_LOG", "warn")
-                .spawn()
-                .unwrap(),
+        Mounted(
+            Some(
+                Command::new(WREN)
+                    .arg("mount")
+                    .arg(&mnt)
+                    .args(["--store", store.to_str().unwrap()])
+                    .args(["--overlay", overlay.to_str().unwrap()])
+                    .args(extra)
+                    .env("WREN_SERVER", &url)
+                    .env("WREN_REPO", "demo")
+                    .env("WREN_LOG", "warn")
+                    .spawn()
+                    .unwrap(),
+            ),
+            mnt.clone(),
         )
     };
     let m = mount(&["--git"]);
@@ -171,8 +207,37 @@ fn virtual_checkout() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, [".git", "README", "big", "docs", "link", "src"]);
+    assert_eq!(
+        names,
+        [".git", "README", "big", "docs", "link", "many", "src"]
+    );
     assert!(!stored(&store, &big) && !stored(&store, &readme));
+    // A large directory lists completely, and stat'ing every file in it
+    // (as `ls -l` does) fetches no blob: sizes come from the server.
+    // (Paths, not DirEntry values, which keep the directory open.)
+    let many: Vec<_> = std::fs::read_dir(mnt.join("many"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(many.len(), 600);
+    let sizes: u64 = many.iter().map(|p| p.metadata().unwrap().len()).sum();
+    assert_eq!(
+        sizes,
+        (0..600)
+            .map(|i: u32| i.to_string().len() as u64 + 1)
+            .sum::<u64>()
+    );
+    let one = git(
+        &up,
+        &["rev-parse", "HEAD:many/file-with-a-longish-name-0007.txt"],
+    );
+    assert!(!stored(&store, one.trim()), "stat fetched a blob");
+    assert_eq!(
+        std::fs::metadata(mnt.join("big/blob.bin")).unwrap().len(),
+        300_000
+    );
+    assert!(!stored(&store, &big));
     // Reading fetches.
     assert_eq!(
         std::fs::read_to_string(mnt.join("README")).unwrap(),
@@ -238,7 +303,12 @@ fn virtual_checkout() {
     assert!(!stored(&store, &big));
 
     // The overlay outlives the mount.
-    Command::new(WREN).arg("umount").arg(&mnt).status().unwrap();
+    let out = Command::new(WREN).arg("umount").arg(&mnt).output().unwrap();
+    assert!(
+        out.status.success(),
+        "umount: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     wait_for(|| !mounted(&mnt), "unmount");
     drop(m);
     let _m = mount(&[]);

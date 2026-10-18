@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::changes::{self, Change, FileVersion, Status};
 use crate::git_source::{GitMirror, Push};
 use crate::meta::ChangesetRow;
-use crate::object::{Kind, RawCommit, MODE_BLOB, MODE_EXEC, MODE_GITLINK, MODE_SYMLINK};
+use crate::object::{Kind, RawCommit, TreeEntry, MODE_BLOB, MODE_EXEC, MODE_GITLINK, MODE_SYMLINK};
 use crate::oid::Oid;
 use crate::repo::Repo;
 use crate::{bad_request, BadRequest};
@@ -211,8 +211,17 @@ pub enum Landed {
     },
 }
 
+/// The result of merging one path (see `Repo::merge_path`).
+pub(crate) enum PathMerge {
+    /// The path becomes this (`None`: deleted).
+    Take(Option<FileVersion>),
+    /// The other side's version stays.
+    Keep,
+    Conflict(&'static str),
+}
+
 /// How many times `land` re-rebases after losing a race for the ref.
-const LAND_ATTEMPTS: u32 = 8;
+pub(crate) const LAND_ATTEMPTS: u32 = 8;
 
 fn is_regular(mode: u32) -> bool {
     mode & 0o170000 == 0o100000
@@ -246,9 +255,55 @@ impl Repo {
             }
         }
         let base = self.tree_of(&p1)?;
+        let (changes, tree) = self.apply_edits(base, &cs.edits)?;
+
+        let mut message = cs.message.clone();
+        if !message.ends_with(b"\n") {
+            message.push(b'\n');
+        }
+        let committer = cs.committer.clone().unwrap_or_else(|| cs.author.clone());
+        let raw = RawCommit {
+            tree,
+            parents: cs.parents.clone(),
+            author: cs.author.clone(),
+            committer: committer.clone(),
+            extra_headers: Vec::new(),
+            message: message.clone(),
+        }
+        .encode();
+        let commit_time = crate::object::Commit::parse(&raw)?.committer.time;
+        // The commit object is derived data, but stored: pushing to the git
+        // host and serving checkouts read it from the object store.
+        let oid = self.store.put(Kind::Commit, &raw)?;
+        // Every server must be able to read the new objects before the
+        // changeset is visible to any of them.
+        self.store.publish()?;
+        if self.meta.has_changeset(&oid)? {
+            return Ok(oid);
+        }
+        let row = ChangesetRow {
+            seq: 0,
+            oid,
+            parents: cs.parents.clone(),
+            author: cs.author.clone(),
+            committer: Some(committer),
+            extra_headers: Vec::new(),
+            message,
+            commit_time,
+            changes: changes::encode_changes(&changes),
+            tree_override: None,
+            raw_commit: None,
+        };
+        self.insert_changeset(&row, &changes, tree)?;
+        Ok(oid)
+    }
+
+    /// The changes `edits` make to tree `base`, and the resulting tree.
+    /// Edits that change nothing are dropped.
+    pub(crate) fn apply_edits(&self, base: Oid, edits: &[FileEdit]) -> Result<(Vec<Change>, Oid)> {
         let mut seen = std::collections::BTreeSet::new();
         let mut changes = Vec::new();
-        for e in &cs.edits {
+        for e in edits {
             check_path(&e.path)?;
             if !seen.insert(e.path.as_str()) {
                 return Err(bad_request(format!("{} is edited twice", e.path)));
@@ -312,46 +367,7 @@ impl Repo {
                  that stays a file); delete conflicting paths explicitly",
             ));
         }
-
-        let mut message = cs.message.clone();
-        if !message.ends_with(b"\n") {
-            message.push(b'\n');
-        }
-        let committer = cs.committer.clone().unwrap_or_else(|| cs.author.clone());
-        let raw = RawCommit {
-            tree,
-            parents: cs.parents.clone(),
-            author: cs.author.clone(),
-            committer: committer.clone(),
-            extra_headers: Vec::new(),
-            message: message.clone(),
-        }
-        .encode();
-        let commit_time = crate::object::Commit::parse(&raw)?.committer.time;
-        // The commit object is derived data, but stored: pushing to the git
-        // host and serving checkouts read it from the object store.
-        let oid = self.store.put(Kind::Commit, &raw)?;
-        // Every server must be able to read the new objects before the
-        // changeset is visible to any of them.
-        self.store.publish()?;
-        if self.meta.has_changeset(&oid)? {
-            return Ok(oid);
-        }
-        let row = ChangesetRow {
-            seq: 0,
-            oid,
-            parents: cs.parents.clone(),
-            author: cs.author.clone(),
-            committer: Some(committer),
-            extra_headers: Vec::new(),
-            message,
-            commit_time,
-            changes: changes::encode_changes(&changes),
-            tree_override: None,
-            raw_commit: None,
-        };
-        self.insert_changeset(&row, &changes, tree)?;
-        Ok(oid)
+        Ok((changes, tree))
     }
 
     /// Replay `stack` (a linear chain, oldest first, each the first-parent
@@ -395,74 +411,48 @@ impl Repo {
             let base_tree = self.tree_of(&base)?;
             let mut edits = Vec::new();
             let mut conflicts = Vec::new();
-            for c in changes::decode_changes(&row.changes)? {
+            let cs_changes = changes::decode_changes(&row.changes)?;
+            for (path, detail) in self.rebase_rename_conflicts(
+                self.tree_of(&row.parents[0])?,
+                base_tree,
+                &cs_changes,
+                self.tree_of(&row.oid)?,
+            )? {
+                conflicts.push(Conflict {
+                    changeset: row.oid,
+                    path,
+                    kind: "rename".into(),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    detail: Some(detail),
+                });
+            }
+            // Path by path would only add consequences of the renames.
+            if !conflicts.is_empty() {
+                return Ok(Rebased::Conflicts(conflicts));
+            }
+            let parent_tree = self.tree_of(&row.parents[0])?;
+            for c in cs_changes {
                 let cur = changes::entry_at(&self.store, base_tree, &c.path)?;
-                let conflict =
-                    |kind: &str, ours: Option<FileVersion>, detail: Option<String>| Conflict {
+                match self.merge_path(parent_tree, &c, cur.as_ref())? {
+                    PathMerge::Take(new) => edits.push(FileEdit {
+                        path: c.path.clone(),
+                        new,
+                    }),
+                    PathMerge::Keep => {}
+                    PathMerge::Conflict(kind) => conflicts.push(Conflict {
                         changeset: row.oid,
                         path: c.path.clone(),
                         kind: kind.to_string(),
                         base: c.old,
-                        ours,
+                        ours: cur.filter(|e| !e.is_tree()).map(|e| FileVersion {
+                            mode: e.mode,
+                            oid: e.oid,
+                        }),
                         theirs: c.new,
-                        detail,
-                    };
-                if cur.as_ref().is_some_and(|e| e.is_tree()) {
-                    conflicts.push(conflict("file/directory", None, None));
-                    continue;
-                }
-                let cur = cur.map(|e| FileVersion {
-                    mode: e.mode,
-                    oid: e.oid,
-                });
-                if cur == c.old {
-                    edits.push(FileEdit {
-                        path: c.path.clone(),
-                        new: c.new,
-                    });
-                    continue;
-                }
-                if cur == c.new {
-                    continue; // the base already has this version
-                }
-                match (c.old, cur, c.new) {
-                    (Some(o), Some(t), Some(n))
-                        if is_regular(o.mode) && is_regular(t.mode) && is_regular(n.mode) =>
-                    {
-                        let mode = if t.mode == o.mode {
-                            n.mode
-                        } else if n.mode == o.mode || n.mode == t.mode {
-                            t.mode
-                        } else {
-                            conflicts.push(conflict("mode", cur, None));
-                            continue;
-                        };
-                        let oid = if o.oid == t.oid {
-                            n.oid
-                        } else if o.oid == n.oid {
-                            t.oid
-                        } else {
-                            match self.merge_file(&o.oid, &t.oid, &n.oid)? {
-                                Some(merged) => self.store.put(Kind::Blob, &merged)?,
-                                None => {
-                                    conflicts.push(conflict("content", cur, None));
-                                    continue;
-                                }
-                            }
-                        };
-                        edits.push(FileEdit {
-                            path: c.path.clone(),
-                            new: Some(FileVersion { mode, oid }),
-                        });
-                    }
-                    (None, Some(_), Some(_)) => conflicts.push(conflict("add/add", cur, None)),
-                    (Some(_), Some(_), None) => {
-                        conflicts.push(conflict("modify/delete", cur, None))
-                    }
-                    (Some(_), None, Some(_)) => {
-                        conflicts.push(conflict("delete/modify", cur, None))
-                    }
-                    _ => conflicts.push(conflict("content", cur, None)),
+                        detail: None,
+                    }),
                 }
             }
             if !conflicts.is_empty() {
@@ -505,6 +495,72 @@ impl Repo {
         Ok(Rebased::Done {
             changesets: out,
             dropped,
+        })
+    }
+
+    /// Three-way merge of one path: one side changed it as `c` says (from
+    /// `c.old` to `c.new`, over tree `base`), and the other side has `cur`
+    /// there.
+    pub(crate) fn merge_path(
+        &self,
+        base: Oid,
+        c: &Change,
+        cur: Option<&TreeEntry>,
+    ) -> Result<PathMerge> {
+        if let Some(dir) = cur.filter(|e| e.is_tree()) {
+            if c.new.is_none() {
+                // Deleting a file the other side turned into a directory:
+                // it is gone there too.
+                return Ok(PathMerge::Keep);
+            }
+            // A directory the change replaced by a file (deleting what was
+            // in it, path by path) and the other side left alone: the
+            // file wins.
+            let untouched = changes::entry_at(&self.store, base, &c.path)?
+                .is_some_and(|b| b.is_tree() && b.oid == dir.oid);
+            return Ok(if untouched {
+                PathMerge::Take(c.new)
+            } else {
+                PathMerge::Conflict("file/directory")
+            });
+        }
+        let cur = cur.map(|e| FileVersion {
+            mode: e.mode,
+            oid: e.oid,
+        });
+        if cur == c.old {
+            return Ok(PathMerge::Take(c.new));
+        }
+        if cur == c.new {
+            return Ok(PathMerge::Keep); // the other side already has this version
+        }
+        Ok(match (c.old, cur, c.new) {
+            (Some(o), Some(t), Some(n))
+                if is_regular(o.mode) && is_regular(t.mode) && is_regular(n.mode) =>
+            {
+                let mode = if t.mode == o.mode {
+                    n.mode
+                } else if n.mode == o.mode || n.mode == t.mode {
+                    t.mode
+                } else {
+                    return Ok(PathMerge::Conflict("mode"));
+                };
+                let oid = if o.oid == t.oid {
+                    n.oid
+                } else if o.oid == n.oid {
+                    t.oid
+                } else {
+                    match self.merge_file(&o.oid, &t.oid, &n.oid)? {
+                        Some(merged) => self.store.put(Kind::Blob, &merged)?,
+                        None => return Ok(PathMerge::Conflict("content")),
+                    }
+                };
+                PathMerge::Take(Some(FileVersion { mode, oid }))
+            }
+            (None, Some(_), Some(_)) => PathMerge::Conflict("add/add"),
+            (Some(_), Some(_), None) => PathMerge::Conflict("modify/delete"),
+            (Some(_), None, Some(_)) => PathMerge::Conflict("delete/modify"),
+            _ => PathMerge::Conflict("content"),
         })
     }
 
@@ -562,7 +618,7 @@ impl Repo {
     /// in the mirror that a concurrent sync's absorb would delete, and
     /// holding the lock across push and CAS means Wren's ref has caught up
     /// before the next local writer reads it.
-    fn update_ref_locked(
+    pub(crate) fn update_ref_locked(
         &self,
         name: &str,
         expected: Option<Oid>,

@@ -1,6 +1,6 @@
 # 设计：Wren 向 Scion 架构迁移
 
-> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15，M3d ✅ 2026-10-15，M4 ✅ 2026-10-15，M5 ✅ 2026-10-15，M6 ✅ 2026-10-15，M7 ✅ 2026-10-15（Linux）**。
+> 状态：已确认（D1–D5 均按推荐）。**M1 ✅ 2026-10-13，M2 ✅ 2026-10-14，M3a ✅ 2026-10-14，M3b ✅ 2026-10-15，M3c ✅ 2026-10-15，M3d ✅ 2026-10-15，M4 ✅ 2026-10-15，M5 ✅ 2026-10-15，M6 ✅ 2026-10-15，M7 ✅ 2026-10-15（Linux），2026-10-18（macOS）；已知缺口补齐（§11）✅ 2026-10-18**。
 > 范围：用户选择"全面 Scion 化"，即下文 M1–M7 全部纳入路线图。
 > 这推翻了 v0.1 的定位（只读、git 主机是数据源、"不做服务端写入"），也推翻了
 > [reviews/04](reviews/04-positioning-vs-intent.md) 和 [reviews/08](reviews/08-synthesis.md)
@@ -229,7 +229,7 @@ commit 对象；它的哈希必须等于 `changesets.oid`。commit 对象不持�
 实现时的取舍：
 - 冲突文件的三方合并调用 `git merge-file`，与 git 的合并算法逐字节一致，代价是每个双方都改过的文件启动一次进程。
 - receive-pack 在 ref 事务里抢输时报 `incorrect old value provided`，与客户端 lease 失败一样按"ref 已移动"处理并重试。
-- land 只接受线性的 changeset 串；服务端还不创建 merge 提交。
+- land 只接受线性的 changeset 串。合并两个分支（生成 merge 提交）在 2026-10-17 补上，见 §11.2。
 
 ---
 
@@ -684,7 +684,7 @@ trigram 的路径集合求交、校验子串，再保留在该版本存在的路
 - 受限 token 只能用查询 API：别的仓库当作不存在；`file`、`blame`、`log` 必须给出
   授权目录内的路径（不能列整个历史）；`tree` 只列授权目录和通往它们的目录；`diff`、
   `commits/{rev}`、`log`、`grep`、`paths` 的结果按授权路径过滤，并标为 `no-store`。
-- 对象面（2026-10-17 补上）：对象按哈希寻址，单看哈希判断不了它属于哪个目录，一个
+- 对象面（2026-10-17 补上，§11.1）：对象按哈希寻址，单看哈希判断不了它属于哪个目录，一个
   提交的根树就能牵出全部对象。所以受限 token 的对象请求必须带**范围**（仓库 + 提交，
   批量请求里是 `scope` 字段，单个对象是 `?repo=&commit=`）。server 把"这个提交 +
   授权目录在这个提交下的所有树和 blob"算成一个集合（按仓库、提交、token 名缓存），
@@ -715,7 +715,7 @@ trigram 的路径集合求交、校验子串，再保留在该版本存在的路
 
 M1–M6 完成后按 D3 评估：值得做，因为它把"检出"的成本从"要用的目录"进一步降到
 "真正读到的文件"，而 git 兼容的难点可以用 git 自己的机制解决，不需要改 git。先做
-Linux（FUSE）；macOS 的 FSKit 需要一个签名的 app extension，没有做。
+Linux（FUSE）。macOS 在 2026-10-18 补上，没有用 FSKit（要签名的 app extension），而是走本机 NFS，见 §11.4。
 
 `wren mount <dir> [--rev R] [--git]`（`--features vfs`，需要 fuse3）：
 
@@ -821,3 +821,133 @@ M2 开始时一并修改：
 
 可以并行派三个 agent：第 2 步、第 3–4 步、第 6 步的测试工具。第 1 步和第 5 步
 由我来做，并把各部分合起来。
+
+---
+
+## 11. 补齐已知缺口（2026-10-17 起）
+
+M1–M7 完成后留下四个缺口：受限 token 不能用对象面、服务端不能合并两个分支、没有内容
+搜索索引、没有 macOS 的虚拟检出。本节记录补齐的做法。
+
+### 11.1 受限 token 的对象面 ✅
+
+见 §7.1"目录级 ACL"。要点：对象请求带范围（仓库 + 提交），server 只给这个提交和
+授权目录内的树和 blob，授权目录之上的树不给；集合外的 delta 基底丢掉；`whoami`
+告诉客户端从哪里开始遍历。能力标志 `scoped-objects.v1`，只有 server 声明。
+
+### 11.2 服务端合并 ✅
+
+`POST /api/v1/repos/{repo}/merge`（能力标志 `merge.v1`），CLI `wren merge REV --into
+BRANCH`，MCP 工具 `wren_merge`。实现在 `wren_core::merge`。
+
+- **树合并**：对合并基做三方合并，只看对方相对合并基改过的路径，每个路径的规则和
+  rebase 共用（`Repo::merge_path`，双方都改过的文件用 `git merge-file`）。
+- **criss-cross**：两个合并基时先把它们合并成虚拟基（和 git 的 `ort` 一样）；虚拟基
+  本身有冲突（git 会把冲突标记留在虚拟基里），或者合并基多于两个，就拒绝。
+- **重命名**：git 的合并默认做重命名检测，逐路径合并做不到的地方一律报 `rename`
+  冲突，不给出和 git 不同的结果：
+  - 一边改名、另一边改了（或删了）源文件：git 会把改动带到新名字上；
+  - 改名的目标路径另一边新增了：git 报 rename/add；
+  - 一边把整个目录移走、另一边往旧目录里加文件：git 的目录重命名检测。
+- **rebase 也补上了同样的检查**。写差分测试时发现 rebase 以前会悄悄给出和 git 不同
+  的结果：被 rebase 的提交改了名、目标分支删了源文件（git 报 rename/delete），以及
+  目录整体移走的两种情形。现在 rebase 总是对提交自身的改动做重命名检测（代价和改动
+  大小成正比）；只有"两边都删了同一路径"或"一边清空目录、另一边往里加文件"时才去算
+  目标分支一侧的 diff。另外修了两个过于保守的冲突：一边把目录换成文件、另一边没碰
+  这个目录；以及两边都把同一个文件换成目录。
+- **ref 移动**：和 land 一样在镜像锁里做，CAS 失败就在新 tip 上重新合并，最多 8 次；
+  写代理模式下先推主机。审计日志里 `via` 是 `merge`。默认总是生成合并提交（等同
+  `--no-ff`），`fast_forward: true` 时如果能快进就只移动分支。
+
+**差分测试**（`crates/wren-core/tests/merge.rs`）：两个长期分支，随机提交（改行、增删、
+目录内和跨目录改名、整个目录移走、改权限、文件和目录互换），中途用 git 互相合并
+（双方同时合并对方旧的 tip，造出 criss-cross）。每一轮对比：
+
+| 检查 | 结果（100 个种子） |
+|---|---|
+| 合并对 `git merge-tree --write-tree`（开重命名） | 待填 |
+| rebase（cherry-pick）对 `git merge-tree --merge-base` | 待填 |
+| `merge_into` 生成的提交 id 对 `git commit-tree` | 待填 |
+
+git 能干净合并、而我们报冲突的情况只允许是上面说的保守拒绝（`rename`、`criss-cross`，
+rebase 另有 git 顺着重命名带过去的 `delete/modify`），并且计数、设上限；git 报冲突
+的，我们必须也报冲突。
+
+### 11.3 内容搜索索引 ✅
+
+`wren_core::search`。对 blob 建 trigram 倒排索引，而不是对版本：blob 按内容寻址，一个
+blob 一旦建好索引，在每个包含它的版本上都成立；跟上默认分支就是给它新增的 blob 建索引
+（server 后台，`--content-index-every`，默认 10 秒）。
+
+- **存储**（都在元数据库，SQLite 和 Postgres 一样）：
+  - `c3.blob`：oid → 编号；`0` 表示超过 1 MiB 的文本（不建索引，grep 照常读），
+    `u32::MAX` 表示二进制（grep 本来就跳过）；
+  - `c3: <trigram><批次首编号>`：含这个 trigram 的 blob 编号，差分 varint 编码。每批
+    一行，每 32 批把行数多的 trigram 合并成一行（为此元数据接口加了按前缀读键值和批量
+    删除）。trigram 按 ASCII 小写计，不跨换行。
+- **查询**：解析正则（`regex-syntax`），取出任何匹配都必须包含的字面串：串接、分组、
+  至少一次的重复里的字面量和"大小写不同的同一个 ASCII 字节"的字符类；分支（`|`）和
+  其他字符类不贡献。`ignore_case` 时，大小写折叠会离开 ASCII 的字母（`k` 有开尔文
+  符号，`s` 有长 s）会打断字面串，所以剪枝始终是保守的。候选 = 含全部 trigram 的
+  blob；该版本里已建索引但不是候选的文件一定不匹配，不读；没建索引的照常读。**答案
+  和全量扫描逐字节相同**，只是更便宜。
+- **差分测试**（`tests/search.rs`）：随机文件（大小写混合、非 ASCII、开尔文符号和长 s、
+  二进制、超大文件）× 25 种模式（字面量、串接、字符类、重复、分支、`ignore_case`），
+  在索引的 tip 和更早的版本上、经过增量索引和合并之后，有索引和无索引的结果完全一致。
+
+git/git 上（4,720 个 blob 建索引，20 个二进制或超大跳过；从零建索引约 0.5 s；索引约
+7 MB，元数据库共 180 MB）：
+
+| grep（HEAD，limit 10000） | 匹配行 | 全量扫描 | 有索引 |
+|---|---:|---:|---:|
+| `first_parent` | 86 | 27.5 ms | 7.6 ms |
+| `xyzzy_nonexistent` | 0 | 26.5 ms | 3.6 ms |
+| `TODO` | 466 | 28.6 ms | 9.5 ms |
+| `static int` | 4,429 | 26.4 ms | 13.2 ms |
+| `strbuf_addf.*%s` | 822 | 25.3 ms | 6.0 ms |
+| `first_parent`，`ignore_case` | 94 | 29.4 ms | 9.1 ms |
+| `first_parent`，v2.30.0 | 90 | 21.5 ms | 16.9 ms |
+
+git/git 很小，热缓存下全量扫描本来就只要 26 ms，所以收益是 2–7 倍；仓库越大、
+对象越冷，差距越大。旧版本上只有和默认分支共享的 blob 能剪枝。
+
+### 11.4 macOS 的虚拟检出 ✅
+
+`wren mount` 在 macOS 上起一个本机 NFSv3 server，由系统自带的 NFS 客户端挂载
+（`mount_nfs`，挂载点属于当前用户时不需要 root）。不需要内核扩展（macFUSE），也不需要
+FSKit 的签名 app extension 和用户在系统设置里手动启用。EdenFS 在 macOS 上走的也是这条路。
+
+- **结构**：`vfs/mod.rs` 是和协议无关的联合视图（提交的树 + 覆盖层 + whiteout +
+  journal），`vfs/fuse.rs`（Linux）和 `vfs/nfs.rs`（macOS）只做协议转换。
+- **NFS server**：从 nfsserve 0.11.0（BSD-3）vendor 成 `crates/nfsserve`
+  （`wren-nfsserve`），改了四处，源码里都标了 `Wren:`：
+  - READDIR 不带 cookie 的 bug（大目录会从头重复列）；
+  - READDIRPLUS 的条目属性改成可选；
+  - LINK 回 `NOTSUPP`；
+  - COMMIT 回成功（写都是 FILE_SYNC）。
+- **NFS 是无状态的**：没有打开的文件句柄，每次 WRITE 先 copy-up 再按偏移写覆盖层文件。
+  git 用 `0444` 创建临时对象文件、随后再写，所以写不进时临时加上属主写权限；SETATTR
+  里"模式 0444 + 时间"同时到达，于是改成先改大小和时间、最后改模式。
+- **文件大小不再需要 blob**：macOS 的 NFS 客户端列目录时会对每个条目取属性，而文件
+  大小在 blob 里，所以只要 `ls` 一下就会把整个目录的 blob 拉下来。现在 `tree` 查询加了
+  `sizes=true`：server 读对象头拿到大小（delta 只解压开头几个字节），挂载每个目录问一次。
+  Linux 的 FUSE 也受益：stat 不再取 blob。
+- **AppleDouble**：没有扩展属性的文件系统上，macOS 会为每个文件写一个 `._name`。这些
+  文件存在覆盖层的另一个目录里，不出现在列表和 journal 里：系统按名字找得到，git 和
+  其他工具看不到（提交里本来就有的 `._` 文件照常处理）。
+- **挂载出来的 `.git`** 关掉自动 gc 和 maintenance：新版 git 会在提交后把 maintenance
+  放到后台去跑，它会读遍所有文件，而且它的工作目录在挂载点里，导致卸载时一直 busy。
+- 卸载：`wren umount`（busy 时重试几秒）、`umount`、Ctrl-C（会自己卸载再退出）。
+
+git/git 上（`--git`）：
+
+| 操作 | macOS（NFS） |
+|---|---:|
+| 挂载就绪 | 125 ms |
+| `git status`，第一次 / 之后 | 230 ms / 20 ms |
+| `ls -l t/`（1,200 个文件） | 10 ms，不取 blob |
+| 改一个文件后 `git commit` | 1.27 s（git 为重建 `builtin/` 的 tree 懒取该目录的 blob） |
+| 之后的 `git status` | 30 ms |
+
+同一个端到端测试（`tests/vfs.rs`）在两个平台上跑，并新增两项检查：600 个文件的目录
+能完整列出，对每个文件 stat 都不会取 blob。

@@ -430,13 +430,20 @@ pub const FEATURES: &[&str] = &[
     "snapshots.v1",
 ];
 
+/// Advertised by servers only: caches do not know restricted tokens.
+pub const SERVER_FEATURES: &[&str] = &["scoped-objects.v1"];
+
 /// Advertised only by a server started with a write token.
-pub const WRITE_FEATURE: &str = "write.v1";
+pub const WRITE_FEATURES: &[&str] = &["write.v1", "merge.v1"];
 
 async fn capabilities(State(st): St) -> Json<Capabilities> {
-    let mut features: Vec<String> = FEATURES.iter().map(|f| f.to_string()).collect();
+    let mut features: Vec<String> = FEATURES
+        .iter()
+        .chain(SERVER_FEATURES)
+        .map(|f| f.to_string())
+        .collect();
     if st.write_token.is_some() {
-        features.push(WRITE_FEATURE.into());
+        features.extend(WRITE_FEATURES.iter().map(|f| f.to_string()));
     }
     Json(Capabilities {
         protocol: PROTOCOL_VERSION,
@@ -849,16 +856,24 @@ async fn blame(
     .await
 }
 
+#[derive(Deserialize)]
+struct TreeQ {
+    rev: Option<String>,
+    path: Option<String>,
+    #[serde(default)]
+    sizes: bool,
+}
+
 async fn tree(
     State(st): St,
     Path(name): Path<String>,
-    Query(q): Query<PathQ>,
+    Query(q): Query<TreeQ>,
 ) -> ApiResult<Json<TreeResponse>> {
     let r = repo(&st, &name)?;
     blocking(move || {
         let rev = st.resolve(&r, q.rev.as_deref().unwrap_or("HEAD"))?;
         let path = q.path.unwrap_or_default();
-        r.tree_listing(&rev, &path)?
+        r.tree_listing(&rev, &path, q.sizes)?
             .map(Json)
             .ok_or_else(|| not_found(format!("no directory {path:?} at {rev}")))
     })
@@ -1115,6 +1130,27 @@ pub async fn serve_file(
 }
 
 /// Rebuild each repository's snapshot now and then every `every`.
+/// Keep each repository's content index (`wren_core::search`) up to date
+/// with its default branch.
+pub fn spawn_indexers(state: Arc<ServerState>, every: Duration) {
+    for repo in state.repos.values().cloned() {
+        tokio::spawn(async move {
+            loop {
+                let r = repo.clone();
+                match tokio::task::spawn_blocking(move || r.index_content()).await {
+                    Ok(Ok(rep)) if rep.indexed + rep.skipped > 0 => {
+                        tracing::info!(repo = %repo.name, ?rep, "content index updated")
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!(repo = %repo.name, "content index: {e:#}"),
+                    Err(e) => tracing::warn!(repo = %repo.name, "content index panicked: {e}"),
+                }
+                tokio::time::sleep(every).await;
+            }
+        });
+    }
+}
+
 pub fn spawn_snapshotters(state: Arc<ServerState>) {
     let (Some(dir), Some(every)) = (state.snapshots.dir.clone(), state.snapshots.every) else {
         return;

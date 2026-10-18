@@ -7,11 +7,12 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use wren_core::api::*;
+use wren_core::merge::Merged;
 use wren_core::write::{Conflict, Landed};
 
 use crate::client::{
-    ChangesetRequest, Client, Content, Edit, FileChange, LandOnto, LandRequest, Person,
-    RevertRequest,
+    ChangesetRequest, Client, Content, Edit, FileChange, LandOnto, LandRequest, MergeRequest,
+    Person, RevertRequest,
 };
 
 /// Author of commits made through MCP when `WREN_AUTHOR` is not set.
@@ -73,6 +74,12 @@ fn tools() -> Value {
             "changesets": {"type": "array", "items": {"type": "string"}, "description": "Commits to land, oldest first; each must be the parent of the next."},
             "onto": {"type": "string", "description": "Branch, e.g. main."},
             "max_chars": max_chars}, "required": ["changesets", "onto"]}},
+        {"name": "wren_merge", "description": "Merge a commit (e.g. a feature branch) into a branch on the server with a merge commit, like git merge --no-ff, and move the branch. On conflicts nothing changes: the paths that conflict are listed; resolve by committing to one side with wren_commit and merging again.",
+         "inputSchema": {"type": "object", "properties": {
+            "commit": rev,
+            "into": {"type": "string", "description": "Branch to merge into, e.g. main."},
+            "message": {"type": "string", "description": "Merge commit message. Default: \"Merge commit '<id>' into <branch>\"."},
+            "max_chars": max_chars}, "required": ["commit", "into"]}},
         {"name": "wren_revert", "description": "Create a commit that undoes a (non-merge) commit, and land it on onto if given. On conflicts nothing lands: the reverted lines changed since, so read the files at the reported branch tip with wren_read_file and undo the change by hand with wren_commit.",
          "inputSchema": {"type": "object", "properties": {
             "commit": rev,
@@ -279,6 +286,57 @@ async fn write_tool(w: &Client, name: &str, args: &Value) -> Result<(String, boo
                 format!("recreate the change on top of it with wren_commit (onto \"{onto}\").");
             Ok(describe_land(&l, &what, onto, &redo))
         }
+        "wren_merge" => {
+            let commit = s(args, "commit", "");
+            let into = s(args, "into", "");
+            if commit.is_empty() || into.is_empty() {
+                bail!("commit and into (a branch) are required");
+            }
+            let m = w
+                .merge(&MergeRequest {
+                    commit: commit.to_string(),
+                    into: into.to_string(),
+                    author: author()?,
+                    committer: None,
+                    message: args
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    fast_forward: false,
+                })
+                .await?;
+            Ok(match m {
+                Merged::Merged { name, old, new, .. } => (
+                    format!("Merged {commit} into {name}: {old} -> {new}."),
+                    false,
+                ),
+                Merged::UpToDate { name, tip } => (
+                    format!("{name} (at {tip}) already contains {commit}; nothing to do."),
+                    false,
+                ),
+                Merged::Conflicts { onto, conflicts } => {
+                    let list: Vec<String> = conflicts
+                        .iter()
+                        .map(|c| match &c.detail {
+                            Some(d) => format!("- {} ({}: {d})", c.path, c.kind),
+                            None => format!("- {} ({})", c.path, c.kind),
+                        })
+                        .collect();
+                    (
+                        format!(
+                            "Not merged: {} conflict(s) against {into} at {onto}:\n{}\nNothing changed. Read both versions with wren_read_file, commit a resolution to one side with wren_commit, and merge again.",
+                            conflicts.len(),
+                            list.join("\n")
+                        ),
+                        true,
+                    )
+                }
+                Merged::Rejected { reason } => (
+                    format!("Not merged: the update was refused: {reason}"),
+                    true,
+                ),
+            })
+        }
         "wren_revert" => {
             let commit = s(args, "commit", "");
             if commit.is_empty() {
@@ -366,7 +424,9 @@ fn cap(text: String, args: &Value) -> String {
 /// failed in a way the agent must act on (conflicts, a rejected land).
 async fn call(c: &Client, w: &Client, name: &str, args: &Value) -> Result<(String, bool)> {
     let (text, failed) = match name {
-        "wren_commit" | "wren_land" | "wren_revert" => write_tool(w, name, args).await?,
+        "wren_commit" | "wren_land" | "wren_merge" | "wren_revert" => {
+            write_tool(w, name, args).await?
+        }
         _ => (read_tool(c, name, args).await?, false),
     };
     Ok((cap(text, args), failed))
@@ -634,7 +694,7 @@ pub async fn serve(c: Client, w: Client) -> Result<()> {
                 "protocolVersion": params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or(PROTOCOL_VERSION),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "wren", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": format!("Source control for repository '{}' served by Wren at {}: queries, and commits made on the server (wren_commit, wren_land, wren_revert). No checkout needed.", c.repo, c.server),
+                "instructions": format!("Source control for repository '{}' served by Wren at {}: queries, and commits made on the server (wren_commit, wren_land, wren_merge, wren_revert). No checkout needed.", c.repo, c.server),
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tools()})),
@@ -686,7 +746,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for n in ["wren_commit", "wren_land", "wren_revert"] {
+        for n in ["wren_commit", "wren_land", "wren_merge", "wren_revert"] {
             assert!(names.contains(&n), "{names:?}");
         }
         let commit = tools

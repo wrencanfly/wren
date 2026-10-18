@@ -171,6 +171,9 @@ pub struct TreeEntryInfo {
     pub mode: String,
     pub kind: Kind,
     pub oid: Oid,
+    /// The blob's size, when asked for (`sizes=true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,7 +216,8 @@ impl Repo {
         })
     }
 
-    pub fn tree_listing(&self, rev: &Oid, path: &str) -> Result<Option<TreeResponse>> {
+    /// Directory `path` at `rev`; with `sizes`, every blob's size too.
+    pub fn tree_listing(&self, rev: &Oid, path: &str, sizes: bool) -> Result<Option<TreeResponse>> {
         let Some(e) = self.entry(rev, path)? else {
             return Ok(None);
         };
@@ -224,19 +228,27 @@ impl Repo {
             .store
             .read_tree(&e.oid)?
             .into_iter()
-            .map(|t| TreeEntryInfo {
-                name: t.name_str().into_owned(),
-                mode: format!("{:06o}", t.mode),
-                kind: if t.is_tree() {
+            .map(|t| {
+                let kind = if t.is_tree() {
                     Kind::Tree
                 } else if t.mode == MODE_GITLINK {
                     Kind::Commit
                 } else {
                     Kind::Blob
-                },
-                oid: t.oid,
+                };
+                let size = match kind {
+                    Kind::Blob if sizes => self.store.size(&t.oid)?,
+                    _ => None,
+                };
+                Ok(TreeEntryInfo {
+                    name: t.name_str().into_owned(),
+                    mode: format!("{:06o}", t.mode),
+                    kind,
+                    oid: t.oid,
+                    size,
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         Ok(Some(TreeResponse {
             oid: e.oid,
             entries,

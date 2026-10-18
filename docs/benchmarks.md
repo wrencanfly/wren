@@ -161,6 +161,43 @@ commit each line is attributed to, and its line number there):
   as git, across both renames, in 13 ms (git's `log --follow`, which walks
   every parent: 524 ms).
 
+## Indexed grep
+
+The content index (`--content-index-every`, a trigram index over the blobs
+of the default branch) on git/git: 4,720 blobs indexed (20 binary or over
+1 MiB), built from scratch in about 0.5 s, about 7 MB of the 180 MB
+metadata database. Server-side `grep` at HEAD, `limit=10000`, median of 5
+warm runs, with the index and with `WREN_NO_CONTENT_INDEX=1` (every file
+read); the matches are identical:
+
+| Pattern | Matching lines | Scan every file | With the index |
+|---|---:|---:|---:|
+| `first_parent` | 86 | 27.5 ms | 7.6 ms |
+| `xyzzy_nonexistent` | 0 | 26.5 ms | 3.6 ms |
+| `TODO` | 466 | 28.6 ms | 9.5 ms |
+| `static int` | 4,429 | 26.4 ms | 13.2 ms |
+| `strbuf_addf.*%s` | 822 | 25.3 ms | 6.0 ms |
+| `first_parent`, ignore case | 94 | 29.4 ms | 9.1 ms |
+| `first_parent` at `v2.30.0` | 90 | 21.5 ms | 16.9 ms |
+
+git/git's files fit in memory and are searched in parallel, so even a full
+scan takes under 30 ms; the index reads only candidate files and gains 2–7×
+here. At an older revision only the blobs it shares with the indexed branch
+are pruned.
+
+## Virtual checkouts on macOS
+
+`wren mount --git` on macOS (a localhost NFS server mounted by the system's
+NFS client), git/git at HEAD, Apple git 2.54:
+
+| | |
+|---|---:|
+| Mount ready (all trees fetched for the index, no blobs) | 125 ms |
+| `git status`, first / later | 230 ms / 20 ms |
+| `ls -l t/` (1,200 files; sizes come from the server, no blob is fetched) | 10 ms |
+| `git commit` after editing `builtin/blame.c` | 1.27 s (git lazily fetches the blobs of `builtin/` to rebuild its tree) |
+| `git status` after that | 30 ms |
+
 ## Corrections
 
 Internal AI-assisted reviews ([reviews/03](reviews/03-strategy-and-claims.md)) found

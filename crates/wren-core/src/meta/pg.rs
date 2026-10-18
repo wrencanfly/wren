@@ -433,6 +433,40 @@ impl Backend for PgMeta {
         })
     }
 
+    fn derived_with_prefix(&self, kind: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut hi = prefix.to_vec();
+        while hi.last() == Some(&0xff) {
+            hi.pop();
+        }
+        let bounded = if let Some(last) = hi.last_mut() {
+            *last += 1;
+            true
+        } else {
+            false
+        };
+        let q = if bounded {
+            self.sql("SELECT key, value FROM {s}.derived WHERE kind = $1 AND key >= $2 AND key < $3 ORDER BY key")
+        } else {
+            self.sql(
+                "SELECT key, value FROM {s}.derived WHERE kind = $1 AND key >= $2 ORDER BY key",
+            )
+        };
+        let (kind, lo) = (kind.to_string(), prefix.to_vec());
+        let prefix = prefix.to_vec();
+        self.run(move |c| {
+            let rows = if bounded {
+                c.query(&q, &[&kind, &lo, &hi])?
+            } else {
+                c.query(&q, &[&kind, &lo])?
+            };
+            Ok(rows
+                .into_iter()
+                .map(|r| (r.get::<_, Vec<u8>>(0), r.get::<_, Vec<u8>>(1)))
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .collect())
+        })
+    }
+
     fn put_derived(&self, kind: &str, key: &[u8], value: &[u8]) -> Result<()> {
         let q = self.sql(
             "INSERT INTO {s}.derived(kind, key, value) VALUES ($1, $2, $3)
@@ -450,6 +484,7 @@ impl Backend for PgMeta {
             Changeset(Box<ChangesetRow>),
             PathIndex(String, i64, Vec<u8>),
             Derived(String, Vec<u8>, Vec<u8>),
+            Delete(String, Vec<u8>),
         }
         let ops: Vec<Op> = ops
             .iter()
@@ -467,6 +502,7 @@ impl Backend for PgMeta {
                 WriteOp::Derived { kind, key, value } => {
                     Op::Derived(kind.to_string(), key.to_vec(), value.to_vec())
                 }
+                WriteOp::DeleteDerived { kind, key } => Op::Delete(kind.to_string(), key.to_vec()),
             })
             .collect();
         let ins_cs = insert_changeset_sql(self);
@@ -477,9 +513,14 @@ impl Backend for PgMeta {
             "INSERT INTO {s}.derived(kind, key, value) VALUES ($1, $2, $3)
              ON CONFLICT (kind, key) DO NOTHING",
         );
+        let del_derived = self.sql("DELETE FROM {s}.derived WHERE kind = $1 AND key = $2");
         self.run(move |c| {
-            let (s_cs, s_path, s_der) =
-                (c.stmt(&ins_cs)?, c.stmt(&ins_path)?, c.stmt(&ins_derived)?);
+            let (s_cs, s_path, s_der, s_del) = (
+                c.stmt(&ins_cs)?,
+                c.stmt(&ins_path)?,
+                c.stmt(&ins_derived)?,
+                c.stmt(&del_derived)?,
+            );
             let mut tx = c.client.transaction()?;
             for op in &ops {
                 match op {
@@ -506,6 +547,9 @@ impl Backend for PgMeta {
                     }
                     Op::Derived(k, key, v) => {
                         tx.execute(&s_der, &[k, key, v])?;
+                    }
+                    Op::Delete(k, key) => {
+                        tx.execute(&s_del, &[k, key])?;
                     }
                 }
             }

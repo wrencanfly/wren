@@ -231,7 +231,7 @@ fn writes_are_disabled_without_a_write_token() {
         "{caps:?}"
     );
 
-    for endpoint in ["blobs", "changesets", "land", "refs", "revert"] {
+    for endpoint in ["blobs", "changesets", "land", "merge", "refs", "revert"] {
         let r = http(
             "POST",
             &format!("{}/api/v1/repos/demo/{endpoint}", srv.url),
@@ -759,4 +759,118 @@ fn caches_refuse_writes() {
         "{r:?}"
     );
     assert_eq!(git(&host, &["rev-parse", "main"]), s(&r.body["oid"]));
+}
+
+#[test]
+fn merges_over_http_and_the_cli() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let host = make_host(&root);
+    let srv = start_server(&root, &host, Some(WRITE));
+    let api = |p: &str| format!("{}/api/v1/repos/demo/{p}", srv.url);
+    let post = |p: &str, body: Value| http("POST", &api(p), Some(WRITE), Some(&body));
+    let commit = |parent: &str, path: &str, content: &str| -> String {
+        let r = post(
+            "changesets",
+            json!({"parents": [parent], "author": author(), "message": format!("edit {path}"),
+                   "changes": [{"path": path, "content": content}]}),
+        );
+        assert_eq!(r.status, 201, "{r:?}");
+        s(&r.body["oid"]).to_string()
+    };
+    let base = git(&host, &["rev-parse", "main"]);
+    // A topic branch and main both move, touching different lines.
+    let t1 = commit(
+        &base,
+        "README.md",
+        "# demo\n\nline one\nline two\nline three, topic\n",
+    );
+    let r = post(
+        "refs",
+        json!({"name": "refs/heads/topic", "expected": null, "new": t1}),
+    );
+    assert_eq!(r.status, 200, "{r:?}");
+    let m1 = commit(
+        &base,
+        "README.md",
+        "# demo, main\n\nline one\nline two\nline three\n",
+    );
+    let r = post("land", json!({"changesets": [m1], "onto": "main"}));
+    assert_eq!(r.status, 200, "{r:?}");
+
+    let r = post(
+        "merge",
+        json!({"commit": "topic", "into": "main", "author": author()}),
+    );
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.body["result"], "merged", "{r:?}");
+    assert_eq!(r.body["fast_forward"], false, "{r:?}");
+    let merged = s(&r.body["new"]).to_string();
+    // The host has it: two parents, both edits, git's merge.
+    assert_eq!(git(&host, &["rev-parse", "main"]), merged);
+    assert_eq!(
+        git(&host, &["log", "-1", "--format=%P", "main"]),
+        format!("{m1} {t1}")
+    );
+    assert_eq!(
+        git(&host, &["show", "main:README.md"]),
+        "# demo, main\n\nline one\nline two\nline three, topic"
+    );
+    let (ok, expect) = git_out(&host, &["merge-tree", "--write-tree", &m1, &t1]);
+    assert!(ok);
+    assert_eq!(git(&host, &["rev-parse", "main^{tree}"]), expect.trim());
+    // Merging it again changes nothing.
+    let r = post(
+        "merge",
+        json!({"commit": t1, "into": "main", "author": author()}),
+    );
+    assert_eq!(
+        (r.status, &r.body["result"]),
+        (200, &json!("up_to_date")),
+        "{r:?}"
+    );
+
+    // Conflicts: nothing moves, the path is named.
+    let t2 = commit(&merged, "src/lib.rs", "pub fn a() { 1 }\n\npub fn b() {}\n");
+    let m2 = commit(&merged, "src/lib.rs", "pub fn a() { 2 }\n\npub fn b() {}\n");
+    let r = post("land", json!({"changesets": [m2], "onto": "main"}));
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = post(
+        "merge",
+        json!({"commit": t2, "into": "main", "author": author()}),
+    );
+    assert_eq!(r.status, 409, "{r:?}");
+    assert_eq!(r.body["result"], "conflicts", "{r:?}");
+    assert_eq!(r.body["conflicts"][0]["path"], "src/lib.rs", "{r:?}");
+    assert_eq!(git(&host, &["rev-parse", "main"]), m2);
+
+    // The CLI, fast-forwarding when allowed.
+    let ahead = commit(&m2, "notes.txt", "later\n");
+    let env = [
+        ("WREN_SERVER", srv.url.as_str()),
+        ("WREN_REPO", "demo"),
+        ("WREN_TOKEN", READ),
+        ("WREN_WRITE_TOKEN", WRITE),
+        ("WREN_AUTHOR", "Agent <agent@wren.dev>"),
+        ("WREN_LOG", "warn"),
+    ];
+    let out = Command::new(WREN)
+        .args(["merge", &ahead, "--into", "main", "--ff"])
+        .envs(env)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("(fast-forward)"));
+    assert_eq!(git(&host, &["rev-parse", "main"]), ahead);
+    let out = Command::new(WREN)
+        .args(["merge", &t2, "--into", "main", "-m", "try again"])
+        .envs(env)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("src/lib.rs"));
 }

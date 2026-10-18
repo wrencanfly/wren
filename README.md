@@ -77,19 +77,19 @@ principle and says where it still differs.
 |---|---|---|
 | Metadata queries answered by the server (history, blame, ancestry) | Log, blame, diff, merge-base, `landed`, bisect, grep | ✅ |
 | Changesets relative to the first parent; trees are derived data | Changesets keep no tree; trees and commits are derived and checked against git's ids | ✅ M1 |
-| Every commit, rebase and revert happens on the server; refs move by compare-and-swap | Server-side commit, rebase, land and revert; the git host is updated first (write proxy) | ✅ M2 |
+| Every commit, rebase, merge and revert happens on the server; refs move by compare-and-swap | Server-side commit, rebase, land, merge and revert; the git host is updated first (write proxy) | ✅ M2 |
 | Want-only object protocol; identical RPCs at every cache tier | `wren cache` tiers, per-object verification, resumable | ✅ |
 | No packfiles and no maintenance; contents in object storage; distributed metadata | Immutable segments (git's pack format, never repacked): git/git in 331 MiB. Delta frames on the wire. Segments in S3, GCS or Azure, read by range; Postgres metadata shared by stateless servers | ✅ M3 |
 | A daemon per node with a bounded cache, seeded from snapshots; strict tiering | `wren daemon`: generational eviction under a byte budget, leases for git checkouts, snapshot seeding; node → region → server enforced at startup; turmoil simulation of the tiers with fault injection | ✅ M4 |
 | The server is the source of truth; older git clients still work | Stock git clones, fetches (partial clones too) and pushes through Wren's git protocol front end; with `--source-of-truth wren` the git host becomes a downstream mirror. Protected refs, a policy hook and an audit log replace the host's protections | ✅ M5 |
-| Path history, copy detection and search indexes; directory permissions | The path index is a derived type; renames and copies are detected as git does (`log --follow`, blame across renames, `diff -M`); path search by trigrams; read tokens restricted to directories; per-client rate limits | ✅ M6 |
-| Virtualized checkouts | `wren mount` (Linux, FUSE): the whole tree visible at once, fetched when read, writes in an overlay; with `--git`, fsmonitor and cache-tree keep `git status` and `git commit` from reading untouched files | ✅ M7 |
+| Path history, copy detection and search indexes; directory permissions | The path index is a derived type; renames and copies are detected as git does (`log --follow`, blame across renames, `diff -M`); path search by trigrams; an indexed content search (trigrams over blobs) behind grep; read tokens restricted to directories, on the query API and the object plane; per-client rate limits | ✅ M6 |
+| Virtualized checkouts | `wren mount` (Linux through FUSE; macOS through a localhost NFS server, nothing to install): the whole tree visible at once, fetched when read, writes in an overlay; with `--git`, fsmonitor and cache-tree keep `git status` and `git commit` from reading untouched files | ✅ M7 |
 
 |  |  |
 |---|---|
 | **Commit without a checkout** | Send "parent + changed files"; Wren derives the tree, rebases onto the branch tip with git's own three-way merge, and lands with a compare-and-swap. No merge queue: a lost race costs one more rebase. |
 | **Ask history without a clone** | Log by path, blame, diff, merge-base, ancestry, `landed` and bisect are answered from server-side indexes: changesets, a commit graph with skip lists, a path index, and persisted blame. |
-| **Search and read at any revision** | `grep`, `cat` and `ls` at any commit, with no checkout. |
+| **Search and read at any revision** | `grep`, `cat` and `ls` at any commit, with no checkout. A trigram index over blobs means grep reads only the files that can match. |
 | **Bounded, cacheable answers for agents** | MCP tools pin revisions to full commit ids, so answers are immutable and served by caches. Line ranges and output caps keep token use predictable. |
 | **Check out only what you read** | A want-only object protocol through same-RPC cache tiers. `--git` checkouts are stock git working trees with a sparse index, so `git status`, `commit` and `push` work. |
 | **Verified against git** | A seeded differential fuzz suite checks every answer against git itself. Server-made commits have the ids `git commit` would give them, rebases agree with `git merge-tree`, and all 85,545 commits of git/git round-trip through changesets. |
@@ -166,6 +166,7 @@ wren commit -m "Fix typo" --land master --set README.md=./README.md
 wren commit -m "Drop script" --parent master --delete ci/old.sh   # prints the commit id
 wren land --onto master <commit>...       # oldest first; exits 1 on conflicts
 wren revert <commit> --onto master
+wren merge topic --into master            # a merge commit made on the server
 ```
 
 **Check out only what you need, as a real git repo**
@@ -175,8 +176,9 @@ wren checkout ws --sparse t/helper --git
 cd ws && git status && git log -1     # stock git works
 ```
 
-**Mount instead of checking out** (Linux, `cargo build --release --features
-vfs`, fuse3): every file is visible at once and fetched when read.
+**Mount instead of checking out** (`cargo build --release --features vfs`;
+Linux needs fuse3, macOS nothing): every file is visible at once and fetched
+when read.
 
 ```sh
 wren mount ws --git          # ready in ~50 ms for git/git; Ctrl-C or `wren umount ws`
@@ -223,7 +225,7 @@ before Wren answers. You can also point your host's push webhook at
 | `wren_bisect_step` | The next commit to test, or the first bad one |
 | `wren_refs` | Branches and tags, filtered by prefix |
 | `wren_commit` | Commit whole-file contents on the server, and optionally land the commit on a branch |
-| `wren_land`, `wren_revert` | Land commits on a branch; revert a commit |
+| `wren_land`, `wren_merge`, `wren_revert` | Land commits on a branch; merge a branch into another; revert a commit |
 
 Every query tool resolves its revisions to full commit ids first, and every
 answer names the commit it describes. Outputs are capped (about 10k tokens by
@@ -323,13 +325,17 @@ gates for each milestone.
 - **M5, source of truth.** Done: a git protocol front end so stock git can clone,
   fetch and push through Wren, with the git host as a downstream mirror.
 - **M6, indexes and permissions.** Done: path history through the
-  derived-data mechanism, rename and copy detection, path search, directory
-  ACLs for queries, per-client rate limits. Content search indexes remain.
+  derived-data mechanism, rename and copy detection, path search, an indexed
+  content search, directory ACLs (queries and the object plane), per-client
+  rate limits.
 - **Upstream.** Send the [sparse/promisor report](docs/upstream/git-sparse-promisor.md)
   to the git list, and refine the [draft git protocol v2 extensions](docs/upstream/git-protocol-v2-query.md).
 
-- **M7, virtual checkouts.** Done on Linux: `wren mount`. macOS (FSKit)
-  remains.
+- **M7, virtual checkouts.** Done: `wren mount` on Linux (FUSE) and macOS
+  (a localhost NFS server, as EdenFS does there; FSKit would need a signed
+  app extension).
+- **Merges on the server.** Done: `wren merge`, checked against `git
+  merge-tree`.
 
 Not planned: merge queues and code review.
 

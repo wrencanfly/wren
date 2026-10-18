@@ -389,6 +389,35 @@ impl SqliteMeta {
         })
     }
 
+    pub fn derived_with_prefix(
+        &self,
+        kind: &str,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut hi = prefix.to_vec();
+        while hi.last() == Some(&0xff) {
+            hi.pop();
+        }
+        self.with(|c| {
+            let map = |r: &rusqlite::Row| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?));
+            let rows = if let Some(last) = hi.last_mut() {
+                *last += 1;
+                let mut st = c.prepare_cached(
+                    "SELECT key, value FROM derived WHERE kind = ?1 AND key >= ?2 AND key < ?3 ORDER BY key",
+                )?;
+                let rows = st.query_map(params![kind, prefix, hi], map)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let mut st = c.prepare_cached(
+                    "SELECT key, value FROM derived WHERE kind = ?1 AND key >= ?2 ORDER BY key",
+                )?;
+                let rows = st.query_map(params![kind, prefix], map)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            Ok(rows.into_iter().filter(|(k, _)| k.starts_with(prefix)).collect())
+        })
+    }
+
     /// Derived values are a pure function of immutable inputs, so concurrent
     /// writers always agree and the first write simply wins.
     pub fn put_derived(&self, kind: &str, key: &[u8], value: &[u8]) -> Result<()> {
@@ -487,6 +516,9 @@ impl Backend for SqliteMeta {
     fn derived_keys_with_prefix(&self, kind: &str, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         SqliteMeta::derived_keys_with_prefix(self, kind, prefix)
     }
+    fn derived_with_prefix(&self, kind: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        SqliteMeta::derived_with_prefix(self, kind, prefix)
+    }
     fn put_derived(&self, kind: &str, key: &[u8], value: &[u8]) -> Result<()> {
         SqliteMeta::put_derived(self, kind, key, value)
     }
@@ -502,6 +534,10 @@ impl Backend for SqliteMeta {
                     } => SqliteMeta::insert_path_index(tx, path, *generation, oid)?,
                     WriteOp::Derived { kind, key, value } => {
                         SqliteMeta::put_derived_tx(tx, kind, key, value)?
+                    }
+                    WriteOp::DeleteDerived { kind, key } => {
+                        tx.prepare_cached("DELETE FROM derived WHERE kind = ?1 AND key = ?2")?
+                            .execute(params![kind, key])?;
                     }
                 }
             }
