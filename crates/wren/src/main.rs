@@ -22,7 +22,7 @@ use wren_vcs::client::{
 
 /// Wren: agent-scale source control on top of git.
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(name = "wren", version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

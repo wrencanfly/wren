@@ -121,6 +121,10 @@ principle and says where it still differs.
 
 ## Quick start
 
+Prebuilt binaries for Linux (x86_64, aarch64) and macOS (Apple silicon) are
+on the [releases page](https://github.com/wrencanfly/wren/releases), with
+`wren mount` included. Or build from source:
+
 ```sh
 cargo build --release
 export PATH=$PWD/target/release:$PATH
