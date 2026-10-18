@@ -27,6 +27,33 @@ pub struct Client {
     /// The object plane's own store, if it said (a node daemon does).
     objects_store: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
     pub stats: Arc<FetchStats>,
+    /// The commit object requests come from (see `wire::Scope`); sent with
+    /// every request once set. Tokens restricted to directories need it.
+    scope: Arc<std::sync::Mutex<Option<Oid>>>,
+}
+
+/// `GET /api/v1/whoami`.
+#[derive(Deserialize, Debug)]
+pub struct Access {
+    /// `read`, `write` or `restricted`.
+    pub access: String,
+    /// For a restricted token: repository (or `*`) -> granted directories.
+    #[serde(default)]
+    pub repos: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl Access {
+    /// The directories a restricted token may read in `repo` (`None`: not
+    /// restricted).
+    pub fn dirs(&self, repo: &str) -> Option<Vec<String>> {
+        (self.access == "restricted").then(|| {
+            self.repos
+                .get(repo)
+                .or_else(|| self.repos.get("*"))
+                .cloned()
+                .unwrap_or_default()
+        })
+    }
 }
 
 #[derive(Default)]
@@ -101,6 +128,7 @@ impl Client {
             objects,
             objects_store: Arc::default(),
             stats: Arc::default(),
+            scope: Arc::default(),
         }
     }
 
@@ -230,6 +258,21 @@ impl Client {
         self.write("revert", req).await
     }
 
+    /// Name the commit that the objects asked for from now on come from.
+    pub fn scope_to(&self, commit: Oid) {
+        *self.scope.lock().unwrap() = Some(commit);
+    }
+
+    pub async fn whoami(&self) -> Result<Access> {
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/whoami", self.server))
+            .send()
+            .await
+            .with_context(|| format!("connecting to {}", self.server))?;
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
     pub async fn repos(&self) -> Result<Vec<RepoInfo>> {
         let resp = self
             .http
@@ -345,9 +388,13 @@ impl Client {
             Some((c, b)) => (c, b.as_str()),
             None => (&self.http, self.server.as_str()),
         };
+        let scope = self.scope.lock().unwrap().map(|commit| wire::Scope {
+            repo: self.repo.clone(),
+            commit,
+        });
         let resp = http
             .post(format!("{base}/v1/objects"))
-            .json(&ObjectsRequest { oids, bases })
+            .json(&ObjectsRequest { oids, bases, scope })
             .send()
             .await
             .with_context(|| format!("connecting to {base}"))?;

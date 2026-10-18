@@ -365,6 +365,9 @@ Content-Type: application/json
  "bases": ["9fceb02d0ae598e95dc970b74767f19372d61af8", null, "..."]}
 ```
 
+* `scope` is OPTIONAL, `{"repo": "<name>", "commit": "<oid>"}`: where the
+  objects come from. Tokens restricted to some directories MUST send it
+  (§17); for other tokens servers ignore it, and caches drop it.
 * `Content-Type: application/json` is REQUIRED. Without it, the reference
   implementation answers `415`.
 * `oids` is an array of oids, each a 40-character hex string. Clients SHOULD send
@@ -454,7 +457,8 @@ it belongs to (see [Open issues](#13-open-issues), item 10).
 
 ### 3.3 Single fetch: `GET /v1/objects/{oid}`
 
-`{oid}` is a 40-character hex oid.
+`{oid}` is a 40-character hex oid. A restricted token (§17) adds the scope
+as `?repo=<name>&commit=<oid>`; its answers are `private`.
 
 | Status | Body | Headers |
 |---|---|---|
@@ -1781,8 +1785,6 @@ object authorization, which v1 does not provide (§13, item 10).
   explicit (§4.14). Checkouts created with `--git` are configured for this.
   Tags cannot be written, and there is no server-side merge of two branches
   (only rebase).
-* **No rename or copy following.** Rename and copy detection is absent from
-  `log?path=`, `blame`, `diff`, and changesets. A rename is a delete plus an add.
 * **First-parent history only** for `log`, `blame`, changesets, `landed`, and
   `bisect`. There is no full-graph log.
 * **Only `refs/heads/*` and `refs/tags/*`.**
@@ -2483,12 +2485,29 @@ FILE`). Such a token can use only the query API, and:
   other directories answer `404`;
 * `diff`, `commits/{rev}`, `log` (with changes), `grep` and `paths` answers
   are filtered to granted paths and carry `Cache-Control: no-store`;
-* the object plane (§3), snapshots (§15), the git front end (§16), writes
-  (§14) and the audit log refuse the token: an object's hash does not say
-  which directory it belongs to, so the object plane cannot be filtered.
+* object requests (§3.2, §3.3) MUST name a **scope**, a repository and a
+  commit in it: `"scope": {"repo": "<name>", "commit": "<oid>"}` in a batch,
+  `?repo=<name>&commit=<oid>` on a single fetch. An object's hash does not
+  say which directory it belongs to, so the server serves only the scope's
+  commit object and the trees and blobs inside the token's directories at
+  that commit. The trees above them (including the root tree) are refused,
+  since their entries name everything else. Any other oid answers `403`
+  (`forbidden`), and delta bases outside the set are ignored (a delta would
+  reveal how a hidden object differs from a visible one). A client finds
+  the tree ids of its directories with `tree` (§4.12, `oid`). Without a
+  scope, every object request answers `403`;
+* snapshots (§15), the git front end (§16), writes (§14) and the audit log
+  refuse the token.
+
+`GET /api/v1/whoami` answers `{"access": "read" | "write"}` for other
+tokens, and for a restricted one `{"access": "restricted", "name": …,
+"repos": {"<repo or *>": ["<dir>", …]}}`, so that a client knows to start
+at its directories (the reference `wren checkout` does, and refuses
+`--git`, which needs every tree).
 
 Caches do not know about restricted tokens; such tokens talk to the server.
-Commit metadata of commits that touched granted paths stays visible.
+Commit metadata of any commit stays visible through `commits/{rev}` and
+scoped commit objects; `log` lists only commits that touched granted paths.
 
 **Rate limits.** A server MAY limit each client (reference: per credential,
 or per address without one; `--rate-limit N` per second with a burst of

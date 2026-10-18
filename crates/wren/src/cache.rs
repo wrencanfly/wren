@@ -421,6 +421,7 @@ impl CacheState {
             } else {
                 Vec::new()
             },
+            scope: None,
         })?;
         let resp = self
             .upstream_call(

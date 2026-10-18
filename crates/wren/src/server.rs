@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -38,6 +38,8 @@ pub struct ServerState {
     /// Read tokens restricted to some directories (see `access`).
     pub acl: Vec<access::AclEntry>,
     pub rate_limit: Option<access::RateLimit>,
+    /// What restricted tokens may fetch, per (repo, commit, token name).
+    pub scoped: access::ScopeCache,
 }
 
 /// Where snapshots (see `wren_core::snapshot`) are kept, and what they hold.
@@ -75,6 +77,7 @@ impl ServerState {
             snapshots: SnapshotConfig::default(),
             acl: Vec::new(),
             rate_limit: None,
+            scoped: Default::default(),
         }
     }
 
@@ -183,6 +186,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/objects", post(objects_batch))
         .route("/v1/objects/{oid}", get(object_one))
         .route("/api/v1/repos", get(list_repos))
+        .route("/api/v1/whoami", get(access::whoami))
         .route("/api/v1/repos/{repo}/refs", get(refs))
         .route("/api/v1/repos/{repo}/resolve", get(resolve))
         .route("/api/v1/repos/{repo}/commits/{rev}", get(commit))
@@ -478,7 +482,11 @@ pub fn objects_response(body: Vec<u8>) -> Response {
     ([(header::CONTENT_TYPE, wire::CONTENT_TYPE)], body).into_response()
 }
 
-async fn objects_batch(State(st): St, Json(req): Json<ObjectsRequest>) -> ApiResult<Response> {
+async fn objects_batch(
+    State(st): St,
+    grant: Option<Extension<access::Grant>>,
+    Json(req): Json<ObjectsRequest>,
+) -> ApiResult<Response> {
     if req.oids.len() > wire::MAX_BATCH {
         return Err(ApiError(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -487,6 +495,10 @@ async fn objects_batch(State(st): St, Json(req): Json<ObjectsRequest>) -> ApiRes
     }
     let store = st.store.clone();
     let body = blocking(move || {
+        let req = match grant {
+            Some(Extension(g)) => st.scope_request(&g, req)?,
+            None => req,
+        };
         let mut out = Vec::new();
         for (i, oid) in req.oids.iter().enumerate() {
             wire::encode_from_store(&mut out, &store, oid, req.base(i))?;
@@ -497,13 +509,39 @@ async fn objects_batch(State(st): St, Json(req): Json<ObjectsRequest>) -> ApiRes
     Ok(objects_response(body))
 }
 
-async fn object_one(State(st): St, Path(oid): Path<String>) -> ApiResult<Response> {
+#[derive(Deserialize)]
+struct ScopeQ {
+    repo: Option<String>,
+    commit: Option<Oid>,
+}
+
+async fn object_one(
+    State(st): St,
+    grant: Option<Extension<access::Grant>>,
+    Path(oid): Path<String>,
+    Query(q): Query<ScopeQ>,
+) -> ApiResult<Response> {
     let oid: Oid = oid
         .parse()
         .map_err(|e| wren_core::bad_request(format!("{e}")))?;
-    let private = st.private();
+    let private = st.private() || grant.is_some();
     let store = st.store.clone();
-    let raw = blocking(move || Ok(store.get_raw(&oid)?)).await?;
+    let raw = blocking(move || {
+        if let Some(Extension(g)) = grant {
+            // As for a batch: `?repo=…&commit=…` is the scope.
+            let req = ObjectsRequest {
+                oids: vec![oid],
+                bases: Vec::new(),
+                scope: q
+                    .repo
+                    .zip(q.commit)
+                    .map(|(repo, commit)| wire::Scope { repo, commit }),
+            };
+            st.scope_request(&g, req)?;
+        }
+        Ok(store.get_raw(&oid)?)
+    })
+    .await?;
     match raw {
         // Content-addressed: the response for a given URL can never change.
         Some(raw) => Ok((

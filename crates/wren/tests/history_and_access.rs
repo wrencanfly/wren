@@ -265,20 +265,111 @@ fn follow_renames_search_and_acls() {
         .map(|p| p["path"].as_str().unwrap())
         .collect();
     assert_eq!(found, ["src/public/api.rs"]);
-    // Not the object plane, nor git.
-    let out = Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}"])
-        .args([
-            "-H",
-            "Authorization: Bearer c",
-            "-H",
-            "Content-Type: application/json",
-        ])
-        .args(["-d", "{\"oids\":[]}"])
-        .arg(format!("{url}/v1/objects"))
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "403");
+    // Objects only with a scope, and only inside the directories at it.
+    let objects = |body: serde_json::Value| -> String {
+        let out = Command::new("curl")
+            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}"])
+            .args([
+                "-H",
+                "Authorization: Bearer c",
+                "-H",
+                "Content-Type: application/json",
+            ])
+            .args(["-d", &body.to_string()])
+            .arg(format!("{url}/v1/objects"))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let head = git(&up, &["rev-parse", "main"]).trim().to_string();
+    let oid = |spec: &str| {
+        git(&up, &["rev-parse", &format!("main:{spec}")])
+            .trim()
+            .to_string()
+    };
+    let scope = serde_json::json!({"repo": "demo", "commit": head});
+    assert_eq!(objects(serde_json::json!({"oids": []})), "403");
+    for (spec, code) in [
+        ("docs/manual.md", "200"),
+        ("docs", "200"),
+        ("src/public/api.rs", "200"),
+        ("src/secret/keys.rs", "403"),
+        ("src", "403"),
+        ("", "403"),
+    ] {
+        assert_eq!(
+            objects(serde_json::json!({"oids": [oid(spec)], "scope": scope})),
+            code,
+            "{spec:?}"
+        );
+    }
+    assert_eq!(
+        objects(serde_json::json!({"oids": [head], "scope": scope})),
+        "200"
+    );
+    // A base outside the directories is ignored, not used for a delta.
+    assert_eq!(
+        objects(serde_json::json!({
+            "oids": [oid("docs/manual.md")],
+            "bases": [oid("src/secret/keys.rs")],
+            "scope": scope,
+        })),
+        "200"
+    );
+    let one = |o: &str, q: &str| {
+        let out = Command::new("curl")
+            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}"])
+            .args(["-H", "Authorization: Bearer c"])
+            .arg(format!("{url}/v1/objects/{o}{q}"))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let q = format!("?repo=demo&commit={head}");
+    assert_eq!(one(&oid("docs/manual.md"), ""), "403");
+    assert_eq!(one(&oid("docs/manual.md"), &q), "200");
+    assert_eq!(one(&oid("src/secret/keys.rs"), &q), "403");
+    // So a restricted token can check out its directories.
+    let renv = [
+        ("WREN_SERVER", url.as_str()),
+        ("WREN_REPO", "demo"),
+        ("WREN_TOKEN", "c"),
+    ];
+    let co = root.join("co");
+    let store = root.join("store");
+    let (ok, _, err) = wren(
+        &[
+            "checkout",
+            co.to_str().unwrap(),
+            "--rev",
+            "main",
+            "--store",
+            store.to_str().unwrap(),
+        ],
+        &renv,
+    );
+    assert!(ok, "{err}");
+    assert_eq!(
+        std::fs::read_to_string(co.join("docs/manual.md")).unwrap(),
+        git(&up, &["show", "main:docs/manual.md"])
+    );
+    assert!(co.join("src/public/api.rs").exists());
+    assert!(!co.join("src/secret").exists());
+    let (ok, _, err) = wren(
+        &[
+            "checkout",
+            root.join("co2").to_str().unwrap(),
+            "--rev",
+            "main",
+            "--sparse",
+            "src/secret",
+            "--store",
+            store.to_str().unwrap(),
+        ],
+        &renv,
+    );
+    assert!(!ok && err.contains("may not read"), "{err}");
+    // Not git.
     let clone = Command::new("git")
         .args(["-c", "protocol.version=2", "clone", "-q"])
         .arg(format!("http://x:c@127.0.0.1:{port}/git/demo"))

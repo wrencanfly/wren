@@ -13,6 +13,11 @@
 //! in a tree it checked out before). It is a hint, not negotiation: the
 //! answer for an oid is still that object, whatever the base.
 //!
+//! `scope` (optional, `{"repo": "<name>", "commit": "<hex>"}`) names where
+//! the objects come from. Tokens restricted to some directories must send
+//! it: the server then serves only that commit and the trees and blobs
+//! inside the token's directories at it. Everyone else may omit it.
+//!
 //! Response: a stream of frames, one per requested oid, in request order:
 //!
 //! ```text
@@ -45,6 +50,15 @@ pub struct ObjectsRequest {
     pub oids: Vec<Oid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bases: Vec<Option<Oid>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Scope>,
+}
+
+/// Where requested objects come from (see the module docs).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Scope {
+    pub repo: String,
+    pub commit: Oid,
 }
 
 impl ObjectsRequest {

@@ -18,11 +18,16 @@
 //! * `diff`, `commits/{rev}`, `log` (with changes), `grep` and `paths`
 //!   answers are filtered to granted paths, and marked `no-store`.
 //!
-//! The object plane (`/v1/objects`, snapshots), the git front end, writes
-//! and the audit log refuse restricted tokens: objects are addressed by
-//! hash, and a tier cannot tell which directory an object belongs to (a
-//! commit's root tree names every object). Caches are one trust domain:
-//! restricted tokens talk to the server.
+//! **Objects.** An object's hash does not say which directory it belongs
+//! to, so a restricted token's object requests (`/v1/objects`) must name a
+//! scope, a repository and a commit in it (see `wren_core::wire`). The
+//! server then serves only that commit and the trees and blobs inside the
+//! token's directories at it (never the trees above them, whose entries
+//! name everything else), and drops delta bases outside that set. `wren
+//! checkout --sparse` with a restricted token starts its walk at the granted
+//! directories, whose tree ids it gets from the query API. Snapshots, the
+//! git front end, writes and the audit log refuse restricted tokens, and
+//! caches are one trust domain: restricted tokens talk to the server.
 //!
 //! Commit metadata (messages, authors) of commits that touched granted
 //! paths stays visible.
@@ -31,19 +36,21 @@
 //! IP address without one) a token bucket of N requests per second with a
 //! burst of 2N; beyond it requests get `429` with `Retry-After`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Extension, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wren_core::changes::normalize_path;
+use wren_core::wire::{ObjectsRequest, Scope};
+use wren_core::Oid;
 
 use super::{constant_time_eq, ApiError, ServerState};
 
@@ -61,7 +68,7 @@ pub struct AclFile {
 }
 
 /// What a restricted token may see (in request extensions).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Grant {
     pub name: String,
     repos: HashMap<String, Vec<String>>,
@@ -111,6 +118,121 @@ impl ServerState {
     }
 }
 
+/// Objects restricted tokens may fetch, per (repo, commit, token name).
+pub type ScopeCache = Mutex<HashMap<(String, Oid, String), Arc<HashSet<Oid>>>>;
+
+impl ServerState {
+    /// What `grant` may fetch from `scope`: the commit, and every tree and
+    /// blob inside the grant's directories at it. Computed by walking those
+    /// directories once, then kept for a while.
+    pub fn scoped_objects(
+        &self,
+        grant: &Grant,
+        scope: &Scope,
+    ) -> Result<Arc<HashSet<Oid>>, ApiError> {
+        let key = (scope.repo.clone(), scope.commit, grant.name.clone());
+        if let Some(s) = self.scoped.lock().unwrap().get(&key) {
+            return Ok(s.clone());
+        }
+        let unknown = || {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("unknown repo {}", scope.repo),
+            )
+        };
+        let (Some(dirs), Some(repo)) = (grant.dirs(&scope.repo), self.repos.get(&scope.repo))
+        else {
+            return Err(unknown());
+        };
+        if !repo.meta.has_changeset(&scope.commit)? {
+            return Err(ApiError(
+                StatusCode::NOT_FOUND,
+                format!("no commit {} in {}", scope.commit, scope.repo),
+            ));
+        }
+        let mut set = HashSet::from([scope.commit]);
+        let mut trees = Vec::new();
+        for d in dirs {
+            match repo.entry(&scope.commit, &normalize_path(d))? {
+                Some(e) if e.is_tree() => trees.push(e.oid),
+                Some(e) if !e.is_gitlink() => {
+                    set.insert(e.oid);
+                }
+                _ => {}
+            }
+        }
+        while let Some(t) = trees.pop() {
+            if !set.insert(t) {
+                continue;
+            }
+            for e in repo.store.read_tree(&t)? {
+                if e.is_tree() {
+                    trees.push(e.oid);
+                } else if !e.is_gitlink() {
+                    set.insert(e.oid);
+                }
+            }
+        }
+        let set = Arc::new(set);
+        let mut cache = self.scoped.lock().unwrap();
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, set.clone());
+        Ok(set)
+    }
+
+    /// Check a restricted token's object request against its scope, and
+    /// drop delta bases outside it (a delta would tell how a hidden object
+    /// differs from a visible one).
+    pub fn scope_request(
+        &self,
+        grant: &Grant,
+        mut req: ObjectsRequest,
+    ) -> Result<ObjectsRequest, ApiError> {
+        let Some(scope) = req.scope.clone() else {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "a token restricted to some directories must name a scope (repo and commit) for objects".into(),
+            ));
+        };
+        let allowed = self.scoped_objects(grant, &scope)?;
+        if let Some(o) = req.oids.iter().find(|o| !allowed.contains(o)) {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "object {o} is not inside this token's directories at {}",
+                    scope.commit
+                ),
+            ));
+        }
+        for b in req.bases.iter_mut() {
+            *b = b.filter(|b| allowed.contains(b));
+        }
+        Ok(req)
+    }
+}
+
+/// `GET /api/v1/whoami`: what the presented token may do.
+pub async fn whoami(
+    State(st): State<Arc<ServerState>>,
+    grant: Option<Extension<Grant>>,
+    req: Request,
+) -> axum::Json<Value> {
+    let writes = st.write_token.as_deref().is_some_and(|w| {
+        super::writes::bearer(&req)
+            .is_some_and(|got| constant_time_eq(got.as_bytes(), w.as_bytes()))
+    });
+    axum::Json(match grant {
+        Some(Extension(g)) => serde_json::json!({
+            "access": "restricted",
+            "name": g.name,
+            "repos": g.repos,
+        }),
+        None => serde_json::json!({"access": if writes { "write" } else { "read" }}),
+    })
+}
+
 fn deny(code: StatusCode, msg: &str) -> Response {
     ApiError(code, msg.to_string()).into_response()
 }
@@ -136,7 +258,11 @@ pub async fn enforce(req: Request, next: Next) -> Response {
         return next.run(req).await;
     };
     let path = req.uri().path().to_string();
-    let refuse = "this token is restricted to some directories and may only use the query API";
+    let refuse = "this token is restricted to some directories and may only use the query API and scoped object requests";
+    // The object plane checks scopes itself (`scope_request`).
+    if path == "/api/v1/whoami" || path == "/v1/capabilities" || path.starts_with("/v1/objects") {
+        return next.run(req).await;
+    }
     if path == "/api/v1/repos" {
         let resp = next.run(req).await;
         return filter_json(resp, |v| {

@@ -16,9 +16,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
-use wren_core::changes::join;
+use wren_core::changes::{join, normalize_path};
 use wren_core::index::{write_index, IndexEntry, Stat};
 use wren_core::object::{MODE_EXEC, MODE_GITLINK, MODE_SYMLINK};
 use wren_core::sparse::Sparse;
@@ -109,8 +109,23 @@ pub async fn checkout(client: &Client, opts: Options) -> Result<Report> {
     wren_core::bounded::lease(&opts.store_dir, &lease_name, &[commit_oid])?;
     let _release = (!opts.git).then(|| Release(opts.store_dir.clone(), lease_name.clone()));
     let store = Arc::new(ObjectStore::open(&opts.store_dir)?);
+    client.scope_to(commit_oid);
+    // A token restricted to some directories gets only the objects inside
+    // them, not the trees above (see `server::access`): the walk starts at
+    // each cone directory, found through the query API.
+    let restricted = match client.whoami().await {
+        Ok(a) => a.dirs(&client.repo),
+        Err(_) => None, // a server that predates whoami: not restricted
+    };
     client.ensure(&store, &[commit_oid]).await?;
     let commit = store.read_commit(&commit_oid)?;
+    let roots = match &restricted {
+        None => vec![(String::new(), commit.tree, last_root(&store))],
+        Some(granted) => restricted_roots(client, commit_oid, &sparse, granted).await?,
+    };
+    if restricted.is_some() && opts.git {
+        bail!("a token restricted to some directories cannot make a --git checkout (git needs every tree above them)");
+    }
 
     // Breadth-first, want-only tree walk. `inside` marks directories that are
     // part of the checkout. Directories outside the cone are never fetched:
@@ -119,14 +134,21 @@ pub async fn checkout(client: &Client, opts: Options) -> Result<Report> {
     // walked (trees only, never blobs) to list every file in the index.
     // (git does read each sparse directory's own tree object; see below.)
     // (path, tree, inside the cone, the same path in the reference tree)
-    let mut level: Vec<(String, Oid, bool, Option<Oid>)> =
-        vec![(String::new(), commit.tree, true, last_root(&store))];
+    let mut dirs: Vec<String> = Vec::new();
+    for (path, _, _) in &roots {
+        if !path.is_empty() {
+            dirs.push(path.clone());
+        }
+    }
+    let mut level: Vec<(String, Oid, bool, Option<Oid>)> = roots
+        .into_iter()
+        .map(|(path, tree, base)| (path, tree, true, base))
+        .collect();
     let mut files: Vec<FileOut> = Vec::new();
     let mut outside: Vec<FileOut> = Vec::new();
     let mut sparse_dirs: Vec<(String, Oid)> = Vec::new();
     let mut boundary_bases: Vec<Option<Oid>> = Vec::new();
     let walk_outside = opts.git && opts.full_index;
-    let mut dirs: Vec<String> = Vec::new();
     let mut trees_walked = 0;
     while !level.is_empty() {
         let wants: Vec<(Oid, Option<Oid>)> = level.iter().map(|l| (l.1, l.3)).collect();
@@ -263,7 +285,9 @@ pub async fn checkout(client: &Client, opts: Options) -> Result<Report> {
         serde_json::to_vec_pretty(&cfg)?,
     )?;
 
-    set_last_root(&store, &commit.tree)?;
+    if restricted.is_none() {
+        set_last_root(&store, &commit.tree)?;
+    }
 
     Ok(Report {
         commit: commit_oid,
@@ -275,6 +299,51 @@ pub async fn checkout(client: &Client, opts: Options) -> Result<Report> {
         requests: client.stats.requests.load(Ordering::Relaxed),
         millis: start.elapsed().as_millis(),
     })
+}
+
+/// Where a restricted token's walk starts: each cone directory (outermost
+/// only) that its grant covers, with its tree id from the query API.
+async fn restricted_roots(
+    client: &Client,
+    commit: Oid,
+    sparse: &Sparse,
+    granted: &[String],
+) -> Result<Vec<(String, Oid, Option<Oid>)>> {
+    let granted: Vec<String> = granted.iter().map(|d| normalize_path(d)).collect();
+    let covered = |d: &str| {
+        granted
+            .iter()
+            .any(|g| g.is_empty() || d == g || d.starts_with(&format!("{g}/")))
+    };
+    let mut cone: Vec<String> = if sparse.dirs().is_empty() {
+        granted.clone()
+    } else {
+        sparse.dirs().iter().map(|d| normalize_path(d)).collect()
+    };
+    cone.sort();
+    cone.dedup();
+    if let Some(d) = cone.iter().find(|d| !covered(d)) {
+        bail!("this token may not read {d:?}; it is restricted to {granted:?} (check out those with --sparse)");
+    }
+    let outermost: Vec<String> = cone
+        .iter()
+        .filter(|d| {
+            !cone
+                .iter()
+                .any(|o| o != *d && (o.is_empty() || d.starts_with(&format!("{o}/"))))
+        })
+        .cloned()
+        .collect();
+    let rev = commit.to_hex();
+    let mut roots = Vec::new();
+    for d in outermost {
+        let t: wren_core::api::TreeResponse = client
+            .get("tree", &[("rev", &rev), ("path", &d)])
+            .await
+            .with_context(|| format!("looking up {d:?}"))?;
+        roots.push((d, t.oid, None));
+    }
+    Ok(roots)
 }
 
 fn write_file(store: &ObjectStore, dest: &Path, f: &FileOut) -> Result<Option<Stat>> {

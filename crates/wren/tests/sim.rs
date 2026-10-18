@@ -580,6 +580,7 @@ async fn fetch(shared: &Shared, base: &str, oids: &[Oid]) -> anyhow::Result<Vec<
     let body = serde_json::to_vec(&ObjectsRequest {
         oids: oids.to_vec(),
         bases: Vec::new(),
+        scope: None,
     })?;
     let r = call(
         Method::POST,
