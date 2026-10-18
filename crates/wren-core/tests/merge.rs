@@ -384,6 +384,20 @@ fn run(seed: u64, t: &mut Tally) {
             }
             TreeMerge::Conflicts(c) => {
                 let kinds: BTreeSet<&str> = c.iter().map(|c| c.kind.as_str()).collect();
+                if git_clean && !kinds.iter().all(|k| ["rename", "criss-cross"].contains(k)) {
+                    let mb = git(work, &["merge-base", "a", "b"]);
+                    eprintln!(
+                        "ours since the base:\n{}\ntheirs since the base:\n{}",
+                        git(
+                            work,
+                            &["diff", "--no-renames", "--name-status", mb.trim(), "a"]
+                        ),
+                        git(
+                            work,
+                            &["diff", "--no-renames", "--name-status", mb.trim(), "b"]
+                        ),
+                    );
+                }
                 if git_clean {
                     assert!(
                         kinds.iter().all(|k| ["rename", "criss-cross"].contains(k)),

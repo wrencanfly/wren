@@ -514,10 +514,12 @@ impl Repo {
                 return Ok(PathMerge::Keep);
             }
             // A directory the change replaced by a file (deleting what was
-            // in it, path by path) and the other side left alone: the
-            // file wins.
-            let untouched = changes::entry_at(&self.store, base, &c.path)?
-                .is_some_and(|b| b.is_tree() && b.oid == dir.oid);
+            // in it, path by path), where the other side only deleted
+            // files, if anything: the deletions empty it and the file wins.
+            let untouched = match changes::entry_at(&self.store, base, &c.path)? {
+                Some(b) if b.is_tree() => self.tree_within(dir.oid, b.oid)?,
+                _ => false,
+            };
             return Ok(if untouched {
                 PathMerge::Take(c.new)
             } else {
@@ -562,6 +564,29 @@ impl Repo {
             (Some(_), None, Some(_)) => PathMerge::Conflict("delete/modify"),
             _ => PathMerge::Conflict("content"),
         })
+    }
+
+    /// Every file of tree `t` is in tree `base`, unchanged (`t` is `base`
+    /// with some files deleted, or `base` itself).
+    fn tree_within(&self, t: Oid, base: Oid) -> Result<bool> {
+        if t == base {
+            return Ok(true);
+        }
+        let theirs = self.store.read_tree(&base)?;
+        for e in self.store.read_tree(&t)? {
+            let Some(b) = theirs.iter().find(|b| b.name == e.name) else {
+                return Ok(false);
+            };
+            let same = match (e.is_tree(), b.is_tree()) {
+                (true, true) => self.tree_within(e.oid, b.oid)?,
+                (false, false) => e.mode == b.mode && e.oid == b.oid,
+                _ => false,
+            };
+            if !same {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Three-way merge of blob contents with git's own algorithm. `None`
