@@ -320,24 +320,26 @@ fn rate_limits_per_client() {
     std::thread::sleep(Duration::from_millis(500));
     // A burst of 30 from one client: about 10 pass (the burst), the rest
     // are told when to come back.
-    let codes: Vec<String> = (0..30)
+    // (Retry-After is checked on the refusals themselves: a separate request
+    // afterwards may find the bucket refilled on a slow machine.)
+    let replies: Vec<String> = (0..30)
         .map(|_| {
             let out = Command::new("curl")
-                .args(["-s", "-o", "/dev/null", "-w", "%{http_code}"])
-                .arg(format!("{url}/api/v1/repos"))
+                .args(["-s", "-i", &format!("{url}/api/v1/repos")])
                 .output()
                 .unwrap();
-            String::from_utf8_lossy(&out.stdout).into_owned()
+            String::from_utf8_lossy(&out.stdout).to_lowercase()
         })
         .collect();
-    let limited = codes.iter().filter(|c| *c == "429").count();
-    assert!((10..30).contains(&limited), "{codes:?}");
-    let out = Command::new("curl")
-        .args(["-s", "-i", &format!("{url}/api/v1/repos")])
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
-    assert!(text.contains("retry-after"), "{text}");
+    let limited: Vec<&String> = replies
+        .iter()
+        .filter(|r| r.starts_with("http/1.1 429"))
+        .collect();
+    assert!((10..30).contains(&limited.len()), "{replies:?}");
+    assert!(
+        limited.iter().all(|r| r.contains("retry-after")),
+        "{limited:?}"
+    );
     // Another client (a token) has its own bucket.
     let out = Command::new("curl")
         .args(["-s", "-o", "/dev/null", "-w", "%{http_code}"])
