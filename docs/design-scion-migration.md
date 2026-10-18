@@ -677,7 +677,7 @@ write-proxy 模式下 push 同步先到主机。
 **路径搜索**：所有曾经新增过的路径（小写）的 trigram，作为派生行 `path3:<三字节><路径>`
 在摄入时写入；旧数据库第一次查询时从路径索引回填一次。查询 ≥ 3 个字符时取各
 trigram 的路径集合求交、校验子串，再保留在该版本存在的路径；更短的查询遍历树。
-`GET /api/v1/repos/{repo}/paths?q=…&rev=…`，CLI `wren find`。内容的 trigram 索引仍未做。
+`GET /api/v1/repos/{repo}/paths?q=…&rev=…`，CLI `wren find`。内容的 trigram 索引见 §11.3。
 
 **目录级 ACL**（`--acl FILE`，需要 `--token`）
 
