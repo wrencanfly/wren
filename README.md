@@ -19,6 +19,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
+  <a href="#how-wren-compares">Compared</a> ·
   <a href="#for-agents-mcp">MCP</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="docs/principles.md">Scion principles</a> ·
@@ -94,6 +95,32 @@ principle and says where it still differs.
 | **Check out only what you read** | A want-only object protocol through same-RPC cache tiers. `--git` checkouts are stock git working trees with a sparse index, so `git status`, `commit` and `push` work. |
 | **Verified against git** | A seeded differential fuzz suite checks every answer against git itself. Server-made commits have the ids `git commit` would give them, rebases agree with `git merge-tree`, and all 85,545 commits of git/git round-trip through changesets. |
 
+## How Wren compares
+
+Several systems take work off the clients of large repositories. They
+differ in where the work runs, and in whether the repository stays git.
+
+| | **Wren** | **git + a forge's API** | **Scalar** | **Sapling, EdenFS, Mononoke** | **Scion** |
+|---|---|---|---|---|---|
+| What it is | A server, cache tiers and a CLI, in front of a git host or instead of one | A git host's REST or GraphQL API (GitHub, GitLab, …) | A git command that configures a clone for large repositories; ships with git | Meta's client, virtual filesystem and server | Anthropic's in-house system, described in an article |
+| Stays git: git's ids and objects; stock git clones and pushes | Yes | Yes | Yes | The client works on git repositories; EdenFS and Mononoke use Sapling's own protocol | No: its own client, repository format and protocols |
+| History without a local clone | Log by path, blame, diff, merge-base, `landed`, bisect, grep | Some of it, per forge and rate-limited: commits by path, compare, blame. No bisect | No: queries run on a local partial clone | Through Mononoke | Yes |
+| Commits, rebases and merges on the server | Yes, checked against git: same commit ids, same results as `git merge-tree` | Trees and commits through the Git Data API; merges through pull requests or a merge queue | No | Rebase on push (pushrebase), in Mononoke | Yes |
+| Fetch only what is read | Want-only objects; sparse checkouts; `wren mount` (Linux, macOS) | Partial clone and sparse checkout | Partial clone and sparse checkout, set up for you | EdenFS: FUSE on Linux, NFS on macOS, ProjFS on Windows | Yes, with virtualized checkouts |
+| Cache tiers with the server's RPCs | Region and node tiers, strict, content-addressed | No | No | Not documented for outside use | Yes |
+| Can you run it? | Open source (Apache-2.0); one binary | Hosted or self-hosted forge | Open source, part of git | Open source; Mononoke and EdenFS are "not yet supported for external usage" | No, in-house |
+
+The rows describe each system's documented features as of October 2026.
+Wren is new: it has not run at Meta's or Anthropic's scale, and its API is
+an unstable draft.
+
+**When plain git is the better choice.** Most repositories, with people
+cloning them a few times a week. A full Wren checkout still sends about
+25% more bytes than a git pack. If you only need large clones to be
+bearable, Scalar or partial clone plus sparse checkout is less to run.
+Wren pays off when clones are made and thrown away all day, by CI jobs and
+agents that mostly ask questions about history.
+
 > [!IMPORTANT]
 > **v0.1, experimental. Read this before you deploy.**
 > - **Writes are off by default.** They need `--write-token` on the server.
@@ -102,8 +129,9 @@ principle and says where it still differs.
 >   longer do: use `--protect` (no deletion, fast-forward only),
 >   `--policy-hook` (a webhook that allows or refuses each ref move) and the
 >   audit log (`/api/v1/repos/{repo}/audit`), and let only Wren push to the host.
-> - **One trust domain.** A token can read every repository on a server, and
->   the object store is shared across repositories. Run one Wren per trust
+> - **One trust domain.** A read token can read every repository on a server,
+>   and the object store is shared across repositories. Only tokens
+>   restricted to directories are kept to their grant. Run one Wren per trust
 >   domain.
 > - **Force-pushed content stays readable.** Objects removed from a branch
 >   remain in the store.
@@ -185,7 +213,7 @@ Linux needs fuse3, macOS nothing): every file is visible at once and fetched
 when read.
 
 ```sh
-wren mount ws --git          # ready in ~50 ms for git/git; Ctrl-C or `wren umount ws`
+wren mount ws --git          # ready in ~125 ms for git/git on macOS; Ctrl-C or `wren umount ws`
 cd ws && git status          # looks only at what you wrote
 ```
 
@@ -294,52 +322,74 @@ flowchart LR
 
 ## Benchmarks
 
-On [git/git](https://github.com/git/git) (85k commits, local machine),
-against git's *best* equivalent setup: a partial clone that really applies
-its filter, a commit-graph with Bloom filters, and `worktree add` on a warm
-node.
+On [git/git](https://github.com/git/git) (85k commits, an Apple silicon
+Mac, everything on localhost), against git's *best* equivalent setup: a
+partial clone that really applies its filter, a commit-graph with Bloom
+filters, and `worktree add` on a warm node. The script checks that both
+sides give the same answers.
 
-| Scenario | git | Wren | |
+**Getting started on a fresh machine**
+
+| | git | Wren | |
 |---|---:|---:|---:|
 | History to download before the first query | 5.5 s, 117 MiB | none | |
+| Full checkout at HEAD, cold node | 1466 ms | 650 ms | 2.3× |
 | Sparse checkout as a git repo, cold node | 709 ms | 269 ms | 2.6× |
 | Same, second job on the node | 248 ms | 100 ms | 2.5× |
+| Virtual checkout (`wren mount --git`, macOS) ready | n/a | 125 ms | |
+
+**Queries**
+
+| | git | Wren | |
+|---|---:|---:|---:|
 | "Which merge brought commit X into HEAD?" | 90 ms | 7 ms | 13× |
 | `log --first-parent -- <path>` | 50 ms | 15 ms | 3.3× |
+| `log --follow` across two renames¹ | 524 ms | 13 ms | |
 | `blame`, warm | 86 ms | 14 ms | 6× |
 | `blame`, first time for a file | 86 ms | 62 ms | 1.4× |
+| `merge-base --all HEAD HEAD~5000` | 35 ms | 35 ms | 1× |
 
-**Costs.** Wren's object store for git/git is 331 MiB, about the size of a git
-pack (it was 4.7 GB of loose objects before M3a). With delta frames (M3b), an
-incremental update from `HEAD~15` sends 13 KB, against 14 KB for a git thin
-pack (640 KB without deltas). A full checkout still sends about 25% more
-than a git pack. Full results, method, corrections and
-caveats are in [docs/benchmarks.md](docs/benchmarks.md).
+¹ Not like for like: git's `--follow` walks every parent, Wren's the first
+parent. Both list the same 270 commits.
+
+**Search and working in a mount**
+
+| | Without the index | Wren |
+|---|---:|---:|
+| Server-side grep at HEAD, six patterns | 25–29 ms (every file read) | 3.6–13 ms (indexed, same matches) |
+| `git status` in a mount, after the first | | 20 ms |
+| `ls -l` of a 1,200-file directory in a mount | | 10 ms, no blob fetched |
+
+**Costs**
+
+| | git | Wren | |
+|---|---:|---:|---:|
+| Object storage | 313 MiB (one pack) | 331 MiB (one segment) | 1.06× |
+| Bytes sent, full checkout at HEAD | 13.4 MB | 16.7 MB | 1.25× |
+| Bytes sent, update from `HEAD~15` | 14 KB (thin pack) | 13.0 KB (delta frames) | 0.93× |
+| Bytes sent, update from `HEAD~50` | 1.35 MB | 734 KB | 0.54× |
+
+git/git is small next to the repositories that motivated Scion. Wren's
+costs track what a job reads, and git's track the size of the repository,
+so the gap should widen on larger ones, but these numbers do not show
+that. Method, all results, corrections to an earlier version of this page,
+and caveats are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Roadmap
 
-The [migration plan](docs/design-scion-migration.md) has the details and the
-gates for each milestone.
+v0.1.0 completes the milestones of the
+[migration plan](docs/design-scion-migration.md), M1 to M7, and server-side
+merges. Next:
 
-- **M3, storage.** Done: immutable segments (M3a), delta frames on the wire
-  (M3b), Postgres metadata shared by stateless servers (M3c), segments in
-  object storage (M3d).
-- **M4, node daemon.** Done: a bounded per-node cache seeded from snapshots,
-  strict tiering, and simulation tests of the tiers with fault injection.
-- **M5, source of truth.** Done: a git protocol front end so stock git can clone,
-  fetch and push through Wren, with the git host as a downstream mirror.
-- **M6, indexes and permissions.** Done: path history through the
-  derived-data mechanism, rename and copy detection, path search, an indexed
-  content search, directory ACLs (queries and the object plane), per-client
-  rate limits.
 - **Upstream.** Send the [sparse/promisor report](docs/upstream/git-sparse-promisor.md)
-  to the git list, and refine the [draft git protocol v2 extensions](docs/upstream/git-protocol-v2-query.md).
-
-- **M7, virtual checkouts.** Done: `wren mount` on Linux (FUSE) and macOS
-  (a localhost NFS server, as EdenFS does there; FSKit would need a signed
-  app extension).
-- **Merges on the server.** Done: `wren merge`, checked against `git
-  merge-tree`.
+  to the git list, and refine the [draft git protocol v2 extensions](docs/upstream/git-protocol-v2-query.md)
+  so stock git can ask the queries too.
+- **Restricted tokens everywhere.** Through caches, the git front end and
+  `--git` checkouts.
+- **Measure at scale.** A larger repository, real network latency, and
+  server CPU per request.
+- **A stable API.** Freeze the [protocol](docs/spec/wren-protocol-v1.md)
+  for 1.0.
 
 Not planned: merge queues and code review.
 
